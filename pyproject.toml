@@ -17,7 +17,6 @@ keywords = ["nl2sql", "nl2graphql", "text2query", "llm", "graphql"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
-  "License :: OSI Approved :: Apache Software License",
   "Intended Audience :: Developers",
   "Topic :: Software Development :: Libraries"
 ]
