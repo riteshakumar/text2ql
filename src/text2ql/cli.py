@@ -6,12 +6,37 @@ from pathlib import Path
 from typing import Any
 
 from text2ql.core import Text2QL
+from text2ql.providers.base import LLMProvider
+from text2ql.providers.openai_compatible import OpenAICompatibleProvider
+from text2ql.providers.rule_based import RuleBasedProvider
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Text to Query Language CLI")
     parser.add_argument("text", help="Natural language request")
     parser.add_argument("--target", default="graphql", help="Target query language")
+    parser.add_argument(
+        "--mode",
+        default="deterministic",
+        choices=["deterministic", "llm"],
+        help="Generation mode",
+    )
+    parser.add_argument(
+        "--llm-provider",
+        default="openai-compatible",
+        choices=["openai-compatible", "rule-based"],
+        help="LLM provider adapter when --mode llm",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default="gpt-4o-mini",
+        help="LLM model name for openai-compatible provider",
+    )
+    parser.add_argument(
+        "--llm-base-url",
+        default="https://api.openai.com/v1",
+        help="Base URL for openai-compatible chat completions API",
+    )
     parser.add_argument(
         "--schema",
         default="",
@@ -61,10 +86,27 @@ def main() -> None:
 
     schema = _load_json_object(args.schema, args.schema_file)
     mapping = _load_json_object(args.mapping, args.mapping_file)
-    service = Text2QL()
-    result = service.generate(text=args.text, target=args.target, schema=schema, mapping=mapping)
+    service = Text2QL(provider=_build_provider(args))
+    result = service.generate(
+        text=args.text,
+        target=args.target,
+        schema=schema,
+        mapping=mapping,
+        context={"mode": args.mode},
+    )
 
     print(result.query)
+
+
+def _build_provider(args: argparse.Namespace) -> LLMProvider:
+    if args.mode != "llm":
+        return RuleBasedProvider()
+    if args.llm_provider == "rule-based":
+        return RuleBasedProvider()
+    return OpenAICompatibleProvider(
+        model=args.llm_model,
+        base_url=args.llm_base_url,
+    )
 
 
 if __name__ == "__main__":

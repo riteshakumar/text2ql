@@ -3,6 +3,9 @@ from __future__ import annotations
 import re
 from textwrap import dedent
 
+from text2ql.constrained import ConstrainedOutputError, parse_graphql_intent
+from text2ql.prompting import build_graphql_prompts, resolve_prompt_template
+from text2ql.providers.base import LLMProvider
 from text2ql.schema_config import NormalizedSchemaConfig, normalize_schema_config
 from text2ql.types import QueryRequest, QueryResult
 
@@ -17,9 +20,19 @@ class GraphQLEngine(QueryEngine):
     - Let LLM providers be optional, pluggable upgrades.
     """
 
+    def __init__(self, provider: LLMProvider | None = None) -> None:
+        self.provider = provider
+
     def generate(self, request: QueryRequest) -> QueryResult:
         prompt = request.text.strip()
         config = normalize_schema_config(request.schema, request.mapping)
+        mode = str(request.context.get("mode", "deterministic")).strip().lower()
+
+        if mode == "llm" and self.provider is not None:
+            llm_result = self._generate_with_llm(prompt, config, request.context)
+            if llm_result is not None:
+                return llm_result
+
         entity = self._detect_entity(prompt, config)
         fields = self._detect_fields(prompt, config, entity)
         filters = self._detect_filters(prompt, config)
@@ -39,7 +52,41 @@ class GraphQLEngine(QueryEngine):
             target="graphql",
             confidence=confidence,
             explanation=explanation,
-            metadata={"entity": entity, "fields": fields, "filters": filters},
+            metadata={
+                "entity": entity,
+                "fields": fields,
+                "filters": filters,
+                "mode": "deterministic",
+            },
+        )
+
+    def _generate_with_llm(
+        self,
+        prompt: str,
+        config: NormalizedSchemaConfig,
+        context: dict,
+    ) -> QueryResult | None:
+        template = resolve_prompt_template(context)
+        system_prompt, user_prompt = build_graphql_prompts(prompt, config, template)
+        raw = self.provider.complete(system_prompt=system_prompt, user_prompt=user_prompt)
+        try:
+            intent = parse_graphql_intent(raw, config)
+        except ConstrainedOutputError:
+            return None
+
+        query = self._build_query(intent.entity, intent.fields, intent.filters)
+        return QueryResult(
+            query=query,
+            target="graphql",
+            confidence=intent.confidence,
+            explanation=intent.explanation,
+            metadata={
+                "entity": intent.entity,
+                "fields": intent.fields,
+                "filters": intent.filters,
+                "mode": "llm",
+                "raw_completion": raw,
+            },
         )
 
     def _detect_entity(self, text: str, config: NormalizedSchemaConfig) -> str:

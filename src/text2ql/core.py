@@ -18,7 +18,7 @@ class Text2QL:
 
     def __post_init__(self) -> None:
         self._engines = {
-            "graphql": GraphQLEngine(),
+            "graphql": GraphQLEngine(provider=self.provider),
         }
 
     def register_engine(self, name: str, engine: object) -> None:

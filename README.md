@@ -48,6 +48,25 @@ print(result.query)
 print(result.explanation)
 ```
 
+## LLM mode (adapter-based)
+
+```python
+from text2ql import Text2QL
+from text2ql.providers.openai_compatible import OpenAICompatibleProvider
+
+service = Text2QL(
+    provider=OpenAICompatibleProvider(model="gpt-4o-mini")
+)
+
+result = service.generate(
+    text="show top 3 clients with mail state enabled",
+    target="graphql",
+    schema={"entities": ["customers"], "fields": ["id", "email", "status"]},
+    mapping={"entities": {"clients": "customers"}, "fields": {"mail": "email"}},
+    context={"mode": "llm"},
+)
+```
+
 ## CLI
 
 ```bash
@@ -63,6 +82,27 @@ You can also load JSON files:
 text2ql "show top 5 client records with mail state enabled" \
   --schema-file ./schema.json \
   --mapping-file ./mapping.json
+```
+
+LLM mode via CLI:
+
+```bash
+export OPENAI_API_KEY=...
+text2ql "show top 3 clients with mail state enabled" \
+  --mode llm \
+  --llm-provider openai-compatible \
+  --llm-model gpt-4o-mini
+```
+
+## Dataset + evaluation hooks
+
+```python
+from text2ql import Text2QL, ingest_dataset, generate_synthetic_examples, evaluate_examples
+
+examples = ingest_dataset("examples.jsonl")
+synthetic = generate_synthetic_examples(examples, variants_per_example=2)
+report = evaluate_examples(Text2QL(), synthetic)
+print(report.exact_match_accuracy, report.execution_accuracy)
 ```
 
 ## Testing
@@ -83,7 +123,7 @@ python3 -m pytest
 ## Roadmap
 
 1. Add `SQL`, `Cypher`, and `SPARQL` engines.
-2. Introduce prompt templates and constrained output validation.
-3. Add dataset ingestion and synthetic training data hooks.
-4. Add evaluation harness for exact match + execution accuracy.
+2. Expand prompts and constraints per target language.
+3. Add richer synthetic generation using domain-specific rewrite plugins.
+4. Add execution accuracy against real backends.
 5. Publish package to PyPI and add CI release workflow.
