@@ -208,6 +208,33 @@ python3 -m pytest -m e2e
 python3 -m pytest
 ```
 
+## Publish to PyPI
+
+Release workflow file:
+
+- `.github/workflows/release.yml`
+
+Publishing modes:
+
+1. `workflow_dispatch` -> TestPyPI (`publish_target=testpypi`)
+2. GitHub Release `published` -> PyPI
+3. `workflow_dispatch` -> PyPI (`publish_target=pypi`)
+
+Setup checklist:
+
+1. Replace placeholder URLs in `pyproject.toml` (`project.urls`).
+2. In PyPI and TestPyPI, configure Trusted Publishing for this GitHub repo/workflow.
+3. In GitHub repo settings, create environments `testpypi` and `pypi`.
+4. Protect `pypi` environment with required reviewers if desired.
+
+Local preflight before release:
+
+```bash
+python -m pip install --upgrade build twine
+python -m build
+python -m twine check dist/*
+```
+
 ## Current architecture
 
 - `text2ql.core.Text2QL`: orchestrator/facade.

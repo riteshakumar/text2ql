@@ -9,6 +9,7 @@ description = "Natural language to any query language, starting with GraphQL"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
+license-files = ["LICENSE"]
 authors = [
   {name = "text2ql contributors"}
 ]
@@ -21,6 +22,11 @@ classifiers = [
   "Topic :: Software Development :: Libraries"
 ]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/riteshakumar/text2ql"
+Repository = "https://github.com/riteshakumar/text2ql"
+Issues = "https://github.com/riteshakumar/text2ql/issues"
 
 [project.optional-dependencies]
 dev = [
