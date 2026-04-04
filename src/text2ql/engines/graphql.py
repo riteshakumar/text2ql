@@ -182,7 +182,8 @@ class GraphQLEngine(QueryEngine):
     def _build_query(self, entity: str, fields: list[str], filters: dict[str, str]) -> str:
         args = ""
         if filters:
-            args_str = ", ".join(f"{k}: {self._format_arg(v)}" for k, v in filters.items())
+            ordered_filters = self._order_filters(filters)
+            args_str = ", ".join(f"{k}: {self._format_arg(v)}" for k, v in ordered_filters)
             args = f"({args_str})"
 
         selection = "\n    ".join(fields)
@@ -227,3 +228,11 @@ class GraphQLEngine(QueryEngine):
             ordered.append(item)
             seen.add(item)
         return ordered
+
+    @staticmethod
+    def _order_filters(filters: dict[str, str]) -> list[tuple[str, str]]:
+        preferred_order = {"limit": 0, "status": 1}
+        return sorted(
+            filters.items(),
+            key=lambda kv: (preferred_order.get(kv[0], 100), kv[0]),
+        )
