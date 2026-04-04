@@ -13,6 +13,14 @@ Natural Language to Query Language framework.
 
 ## Install
 
+Install from PyPI:
+
+```bash
+pip install text2ql
+```
+
+Install from source (editable):
+
 ```bash
 pip install -e .
 ```
