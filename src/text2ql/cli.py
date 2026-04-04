@@ -38,6 +38,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Base URL for openai-compatible chat completions API",
     )
     parser.add_argument(
+        "--llm-max-retries",
+        type=int,
+        default=2,
+        help="Max retry attempts for provider request failures (429/network)",
+    )
+    parser.add_argument(
+        "--llm-retry-backoff",
+        type=float,
+        default=1.5,
+        help="Base backoff seconds between retries (used when Retry-After is absent)",
+    )
+    parser.add_argument(
         "--schema",
         default="",
         help="Schema as JSON string, e.g. '{\"entities\":[\"users\"],\"fields\":[\"id\",\"name\"]}'",
@@ -106,6 +118,8 @@ def _build_provider(args: argparse.Namespace) -> LLMProvider:
     return OpenAICompatibleProvider(
         model=args.llm_model,
         base_url=args.llm_base_url,
+        max_retries=args.llm_max_retries,
+        retry_backoff_seconds=args.llm_retry_backoff,
     )
 
 

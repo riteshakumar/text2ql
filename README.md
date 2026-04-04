@@ -113,7 +113,9 @@ export OPENAI_API_KEY=...
 text2ql "show top 3 clients with mail state enabled" \
   --mode llm \
   --llm-provider openai-compatible \
-  --llm-model gpt-4o-mini
+  --llm-model gpt-4o-mini \
+  --llm-max-retries 4 \
+  --llm-retry-backoff 2.0
 ```
 
 If you do not pass `--mode llm`, CLI runs deterministic mode.
