@@ -45,18 +45,18 @@ class GraphQLEngine(QueryEngine):
     def _detect_entity(self, text: str, config: NormalizedSchemaConfig) -> str:
         lowered = text.lower()
         for alias, canonical in self._sorted_alias_pairs(config.entity_aliases):
-            if self._contains_token(lowered, alias):
+            if self._contains_entity_token(lowered, alias):
                 return canonical
 
         for entity in config.entities:
-            if self._contains_token(lowered, entity.lower()):
+            if self._contains_entity_token(lowered, entity.lower()):
                 return entity
 
         if config.default_entity:
             return config.default_entity
 
         for entity in ["user", "customer", "order", "product", "movie", "person"]:
-            if self._contains_token(lowered, entity):
+            if self._contains_entity_token(lowered, entity):
                 return entity
 
         return "items"
@@ -138,6 +138,15 @@ class GraphQLEngine(QueryEngine):
     @staticmethod
     def _contains_token(text: str, token: str) -> bool:
         return re.search(rf"\b{re.escape(token)}\b", text) is not None
+
+    @staticmethod
+    def _contains_entity_token(text: str, token: str) -> bool:
+        """Match entity words with simple singular/plural tolerance."""
+        if GraphQLEngine._contains_token(text, token):
+            return True
+        if token.endswith("s"):
+            return False
+        return GraphQLEngine._contains_token(text, f"{token}s")
 
     @staticmethod
     def _sorted_alias_pairs(alias_map: dict[str, str]) -> list[tuple[str, str]]:
