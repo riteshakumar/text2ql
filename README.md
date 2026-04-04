@@ -71,7 +71,7 @@ result = service.generate(
     target="graphql",
     schema={"entities": ["customers"], "fields": ["id", "email", "status"]},
     mapping={"entities": {"clients": "customers"}, "fields": {"mail": "email"}},
-    context={"mode": "llm"},
+    context={"mode": "llm", "language": "english"},
 )
 ```
 
@@ -112,6 +112,7 @@ LLM mode via CLI:
 export OPENAI_API_KEY=...
 text2ql "show top 3 clients with mail state enabled" \
   --mode llm \
+  --language english \
   --llm-provider openai-compatible \
   --llm-model gpt-4o-mini \
   --llm-max-retries 4 \
@@ -141,6 +142,11 @@ Template placeholders:
 - `{fields}`
 - `{field_aliases}`
 - `{filter_aliases}`
+
+Language support:
+
+- `english` (default)
+- `en` (alias)
 
 ## Dataset + evaluation hooks
 

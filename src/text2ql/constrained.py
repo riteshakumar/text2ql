@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from text2ql.prompting import resolve_language
 from text2ql.schema_config import NormalizedSchemaConfig
 
 
@@ -20,7 +21,13 @@ class ConstrainedOutputError(ValueError):
     """Raised when LLM output fails schema validation."""
 
 
-def parse_graphql_intent(raw: str, config: NormalizedSchemaConfig) -> GraphQLIntent:
+def parse_graphql_intent(
+    raw: str, config: NormalizedSchemaConfig, language: str = "english"
+) -> GraphQLIntent:
+    resolved_language = resolve_language(language)
+    if resolved_language != "english":
+        raise ConstrainedOutputError(f"Unsupported constraint language '{language}'")
+
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:

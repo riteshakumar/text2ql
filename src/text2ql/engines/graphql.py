@@ -4,7 +4,7 @@ import re
 from textwrap import dedent
 
 from text2ql.constrained import ConstrainedOutputError, parse_graphql_intent
-from text2ql.prompting import build_graphql_prompts, resolve_prompt_template
+from text2ql.prompting import build_graphql_prompts, resolve_language, resolve_prompt_template
 from text2ql.providers.base import LLMProvider
 from text2ql.schema_config import NormalizedSchemaConfig, normalize_schema_config
 from text2ql.types import QueryRequest, QueryResult
@@ -70,13 +70,24 @@ class GraphQLEngine(QueryEngine):
         context: dict,
     ) -> QueryResult | None:
         template = resolve_prompt_template(context)
-        system_prompt, user_prompt = build_graphql_prompts(prompt, config, template)
+        language = str(context.get("language", "english"))
+        try:
+            resolved_language = resolve_language(language)
+        except ValueError:
+            return None
+
+        system_prompt, user_prompt = build_graphql_prompts(
+            prompt,
+            config,
+            template,
+            language=resolved_language,
+        )
         try:
             raw = self.provider.complete(system_prompt=system_prompt, user_prompt=user_prompt)
         except Exception:
             return None
         try:
-            intent = parse_graphql_intent(raw, config)
+            intent = parse_graphql_intent(raw, config, language=resolved_language)
         except ConstrainedOutputError:
             return None
 
@@ -91,6 +102,7 @@ class GraphQLEngine(QueryEngine):
                 "fields": intent.fields,
                 "filters": intent.filters,
                 "mode": "llm",
+                "language": resolved_language,
                 "raw_completion": raw,
             },
         )

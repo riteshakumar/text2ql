@@ -42,11 +42,12 @@ def test_llm_mode_uses_provider_with_constrained_output() -> None:
     result = service.generate(
         "show top 3 clients with mail state active",
         schema={"entities": ["customers"], "fields": ["id", "email", "status"]},
-        context={"mode": "llm"},
+        context={"mode": "llm", "language": "english"},
     )
 
     assert "customers(limit: 3, status: \"active\")" in result.query
     assert result.metadata["mode"] == "llm"
+    assert result.metadata["language"] == "english"
     assert result.confidence == pytest.approx(0.93)
 
 
@@ -66,4 +67,23 @@ def test_llm_mode_falls_back_to_deterministic_on_provider_error() -> None:
 
     assert result.metadata["mode"] == "deterministic"
     assert result.metadata["llm_error"] is not None
+    assert "user" in result.query
+
+
+def test_llm_mode_falls_back_to_deterministic_on_unsupported_language() -> None:
+    service = Text2QL(
+        provider=StubProvider(
+            {
+                "entity": "customers",
+                "fields": ["email"],
+                "filters": {},
+                "explanation": "Parsed by adapter.",
+                "confidence": 0.93,
+            }
+        )
+    )
+
+    result = service.generate("list users", context={"mode": "llm", "language": "spanish"})
+
+    assert result.metadata["mode"] == "deterministic"
     assert "user" in result.query

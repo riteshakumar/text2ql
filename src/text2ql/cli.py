@@ -22,6 +22,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Generation mode",
     )
     parser.add_argument(
+        "--language",
+        default="english",
+        help="Prompt/constraint language profile (currently: english, en)",
+    )
+    parser.add_argument(
         "--llm-provider",
         default="openai-compatible",
         choices=["openai-compatible", "rule-based"],
@@ -104,7 +109,7 @@ def main() -> None:
         target=args.target,
         schema=schema,
         mapping=mapping,
-        context={"mode": args.mode},
+        context={"mode": args.mode, "language": args.language},
     )
 
     print(result.query)
