@@ -24,12 +24,24 @@ from text2ql import Text2QL
 
 service = Text2QL()
 result = service.generate(
-    text="show top 5 customers with email status active",
+    text="show top 5 client records with mail state enabled",
     target="graphql",
     schema={
-        "entities": ["customers"],
-        "fields": ["id", "email", "status"]
-    }
+        "entities": [
+            {"name": "customers", "aliases": ["client", "clients"]}
+        ],
+        "fields": [
+            {"name": "id"},
+            {"name": "email", "aliases": ["mail"]},
+            {"name": "status", "aliases": ["state"]}
+        ],
+        "default_entity": "customers",
+        "default_fields": ["id", "email", "status"]
+    },
+    mapping={
+        "filters": {"state": "status"},
+        "filter_values": {"status": {"enabled": "active"}}
+    },
 )
 
 print(result.query)
@@ -39,7 +51,26 @@ print(result.explanation)
 ## CLI
 
 ```bash
-text2ql "show top 5 customers with email status active" --target graphql --schema '{"entities":["customers"],"fields":["id","email","status"]}'
+text2ql "show top 5 client records with mail state enabled" \
+  --target graphql \
+  --schema '{"entities":["customers"],"fields":["id","email","status"]}' \
+  --mapping '{"entities":{"client":"customers"},"fields":{"mail":"email"},"filters":{"state":"status"},"filter_values":{"status":{"enabled":"active"}}}'
+```
+
+You can also load JSON files:
+
+```bash
+text2ql "show top 5 client records with mail state enabled" \
+  --schema-file ./schema.json \
+  --mapping-file ./mapping.json
+```
+
+## Testing
+
+```bash
+python3 -m pytest -m unit
+python3 -m pytest -m e2e
+python3 -m pytest
 ```
 
 ## Current architecture

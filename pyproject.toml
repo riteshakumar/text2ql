@@ -39,3 +39,8 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 addopts = "-q"
+testpaths = ["tests"]
+markers = [
+  "unit: fast isolated unit tests",
+  "e2e: end-to-end integration-style tests",
+]

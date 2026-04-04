@@ -29,6 +29,7 @@ class Text2QL:
         text: str,
         target: str = "graphql",
         schema: dict | None = None,
+        mapping: dict | None = None,
         context: dict | None = None,
     ) -> QueryResult:
         normalized_target = target.lower().strip()
@@ -40,6 +41,7 @@ class Text2QL:
             text=text,
             target=normalized_target,
             schema=schema,
+            mapping=mapping,
             context=context or {},
         )
         return self._engines[normalized_target].generate(request)

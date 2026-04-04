@@ -11,6 +11,7 @@ class QueryRequest:
     text: str
     target: str = "graphql"
     schema: dict[str, Any] | None = None
+    mapping: dict[str, Any] | None = None
     context: dict[str, Any] = field(default_factory=dict)
 
 
