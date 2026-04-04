@@ -17,6 +17,12 @@ Natural Language to Query Language framework.
 pip install -e .
 ```
 
+For local development and tests:
+
+```bash
+pip install -e ".[dev]"
+```
+
 ## Quickstart
 
 ```python
@@ -48,6 +54,8 @@ print(result.query)
 print(result.explanation)
 ```
 
+Default mode is deterministic.
+
 ## LLM mode (adapter-based)
 
 ```python
@@ -66,6 +74,20 @@ result = service.generate(
     context={"mode": "llm"},
 )
 ```
+
+Required env var for `OpenAICompatibleProvider`:
+
+```bash
+export OPENAI_API_KEY=...
+```
+
+Fallback key name also supported:
+
+```bash
+export TEXT2QL_API_KEY=...
+```
+
+If LLM output fails constrained JSON validation, `text2ql` falls back to deterministic mode.
 
 ## CLI
 
@@ -94,6 +116,30 @@ text2ql "show top 3 clients with mail state enabled" \
   --llm-model gpt-4o-mini
 ```
 
+If you do not pass `--mode llm`, CLI runs deterministic mode.
+
+## Prompt templates
+
+LLM mode supports prompt template override through request context:
+
+```python
+result = service.generate(
+    text="list users",
+    context={
+        "mode": "llm",
+        "prompt_template": "Convert request to JSON intent. Request: {text}\\nEntities: {entities}\\nFields: {fields}"
+    },
+)
+```
+
+Template placeholders:
+
+- `{text}`
+- `{entities}`
+- `{fields}`
+- `{field_aliases}`
+- `{filter_aliases}`
+
 ## Dataset + evaluation hooks
 
 ```python
@@ -104,6 +150,46 @@ synthetic = generate_synthetic_examples(examples, variants_per_example=2)
 report = evaluate_examples(Text2QL(), synthetic)
 print(report.exact_match_accuracy, report.execution_accuracy)
 ```
+
+### Dataset format
+
+Supported file types:
+
+- `.jsonl`: one JSON object per line
+- `.json`: JSON array of objects
+
+Required fields per example:
+
+- `text` (string)
+- `expected_query` (string)
+
+Optional fields:
+
+- `target` (default: `"graphql"`)
+- `schema` (object)
+- `mapping` (object)
+- `context` (object)
+- `metadata` (object)
+
+Example `.jsonl` row:
+
+```json
+{"text":"list users","target":"graphql","expected_query":"query GeneratedQuery { user { id name } }"}
+```
+
+### Evaluation metrics
+
+- `exact_match_accuracy`: normalized string match (whitespace-insensitive).
+- `execution_accuracy`: structural GraphQL signature match (entity + filters + selected fields).
+
+Current execution accuracy is a static structural approximation, not live backend execution.
+
+## Troubleshooting
+
+- `Missing API key...`: set `OPENAI_API_KEY` (or `TEXT2QL_API_KEY`) before LLM mode.
+- `JSON file ... must contain an object`: schema/mapping files must be top-level JSON objects.
+- `Inline JSON value must contain an object`: `--schema`/`--mapping` payloads must be JSON objects.
+- Provider/network errors in LLM mode: verify API URL/model/key and retry.
 
 ## Testing
 
