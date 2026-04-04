@@ -217,7 +217,7 @@ python3 -m pytest
 
 ## Roadmap
 
-1. Add `SQL`, `Cypher`, and `SPARQL` engines.
+1. Add `SQL`, `Cypher`, `Jsonata`, `Jq` and `SPARQL` engines.
 2. Expand prompts and constraints per target language.
 3. Add richer synthetic generation using domain-specific rewrite plugins.
 4. Add execution accuracy against real backends.
