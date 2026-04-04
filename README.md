@@ -189,6 +189,7 @@ Current execution accuracy is a static structural approximation, not live backen
 - `Missing API key...`: set `OPENAI_API_KEY` (or `TEXT2QL_API_KEY`) before LLM mode.
 - `JSON file ... must contain an object`: schema/mapping files must be top-level JSON objects.
 - `Inline JSON value must contain an object`: `--schema`/`--mapping` payloads must be JSON objects.
+- `HTTP Error 429: Too Many Requests`: provider retries with backoff; if retries fail, engine falls back to deterministic mode.
 - Provider/network errors in LLM mode: verify API URL/model/key and retry.
 
 ## Testing

@@ -21,6 +21,11 @@ class InvalidProvider(LLMProvider):
         return "not-json"
 
 
+class ErrorProvider(LLMProvider):
+    def complete(self, system_prompt: str, user_prompt: str) -> str:
+        raise RuntimeError("HTTP Error 429: Too Many Requests")
+
+
 def test_llm_mode_uses_provider_with_constrained_output() -> None:
     service = Text2QL(
         provider=StubProvider(
@@ -51,4 +56,14 @@ def test_llm_mode_falls_back_to_deterministic_on_invalid_output() -> None:
     result = service.generate("list users", context={"mode": "llm"})
 
     assert result.metadata["mode"] == "deterministic"
+    assert "user" in result.query
+
+
+def test_llm_mode_falls_back_to_deterministic_on_provider_error() -> None:
+    service = Text2QL(provider=ErrorProvider())
+
+    result = service.generate("list users", context={"mode": "llm"})
+
+    assert result.metadata["mode"] == "deterministic"
+    assert result.metadata["llm_error"] is not None
     assert "user" in result.query

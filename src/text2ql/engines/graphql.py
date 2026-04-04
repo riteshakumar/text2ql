@@ -27,11 +27,13 @@ class GraphQLEngine(QueryEngine):
         prompt = request.text.strip()
         config = normalize_schema_config(request.schema, request.mapping)
         mode = str(request.context.get("mode", "deterministic")).strip().lower()
+        llm_error: str | None = None
 
         if mode == "llm" and self.provider is not None:
             llm_result = self._generate_with_llm(prompt, config, request.context)
             if llm_result is not None:
                 return llm_result
+            llm_error = "LLM mode fallback to deterministic mode."
 
         entity = self._detect_entity(prompt, config)
         fields = self._detect_fields(prompt, config, entity)
@@ -57,6 +59,7 @@ class GraphQLEngine(QueryEngine):
                 "fields": fields,
                 "filters": filters,
                 "mode": "deterministic",
+                "llm_error": llm_error,
             },
         )
 
@@ -68,7 +71,10 @@ class GraphQLEngine(QueryEngine):
     ) -> QueryResult | None:
         template = resolve_prompt_template(context)
         system_prompt, user_prompt = build_graphql_prompts(prompt, config, template)
-        raw = self.provider.complete(system_prompt=system_prompt, user_prompt=user_prompt)
+        try:
+            raw = self.provider.complete(system_prompt=system_prompt, user_prompt=user_prompt)
+        except Exception:
+            return None
         try:
             intent = parse_graphql_intent(raw, config)
         except ConstrainedOutputError:
