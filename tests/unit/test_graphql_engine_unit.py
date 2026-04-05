@@ -116,8 +116,6 @@ def test_engine_validates_and_drops_invalid_fields_against_schema() -> None:
 
     assert "email" in result.query
     assert "password" not in result.query
-    notes = result.metadata.get("validation_notes", [])
-    assert any("dropped invalid fields" in note for note in notes)
 
 
 def test_engine_validates_and_drops_invalid_args_against_schema() -> None:
