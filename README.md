@@ -156,6 +156,26 @@ Language support:
 - `english` (default)
 - `en` (alias)
 
+## Arbitrary JSON support
+
+`text2ql` can infer schema config from arbitrary nested JSON payloads and execute generated metadata against JSON data:
+
+```python
+from text2ql import Text2QL, infer_schema_from_json_payload, execute_query_result_on_json
+
+schema = infer_schema_from_json_payload(raw_json_payload)
+service = Text2QL()
+result = service.generate("how many qqq do I own", schema=schema)
+
+rows, note = execute_query_result_on_json(result, raw_json_payload)
+print(result.query)
+print(rows, note)
+```
+
+Deterministic parsing includes a built-in holdings pattern for prompts like:
+
+- `how many <asset> do I own`
+
 ## Nested GraphQL + schema validation
 
 You can define relation-aware schema config for nested query generation and strict validation.

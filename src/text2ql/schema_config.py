@@ -63,10 +63,24 @@ def normalize_schema_config(
     if isinstance(default_fields, list):
         config.default_fields = [str(v) for v in default_fields if str(v).strip()]
 
+    _infer_from_arbitrary_payload(config, schema)
+
     _apply_mapping_payload(config, schema.get("mapping"))
     _apply_mapping_payload(config, schema.get("mappings"))
     _apply_mapping_payload(config, mapping)
     return config
+
+
+def infer_schema_from_json_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Infer a text2ql-compatible schema object from arbitrary nested JSON payload."""
+    normalized = normalize_schema_config(payload)
+    return {
+        "entities": normalized.entities,
+        "fields": normalized.fields_by_entity or normalized.fields,
+        "args": normalized.args_by_entity,
+        "default_entity": normalized.default_entity,
+        "default_fields": normalized.default_fields,
+    }
 
 
 def _apply_mapping_payload(config: NormalizedSchemaConfig, payload: Any) -> None:
@@ -381,3 +395,103 @@ def _coerce_aliases(payload: Any) -> list[str]:
     if isinstance(payload, list):
         return [str(v).strip() for v in payload if str(v).strip()]
     return []
+
+
+def _infer_from_arbitrary_payload(config: NormalizedSchemaConfig, payload: dict[str, Any]) -> None:
+    if config.entities or config.fields or config.fields_by_entity:
+        return
+    if not isinstance(payload, dict) or not payload:
+        return
+
+    entities_to_fields = _collect_entities_and_fields(payload)
+    if not entities_to_fields:
+        return
+
+    config.entities = sorted(entities_to_fields.keys())
+    config.fields_by_entity = {
+        entity: sorted(fields) for entity, fields in entities_to_fields.items() if fields
+    }
+    if config.fields_by_entity:
+        all_fields: list[str] = []
+        seen: set[str] = set()
+        for fields in config.fields_by_entity.values():
+            for field in fields:
+                if field in seen:
+                    continue
+                seen.add(field)
+                all_fields.append(field)
+        config.fields = all_fields
+
+    if not config.default_entity and config.entities:
+        config.default_entity = "accounts" if "accounts" in config.entities else config.entities[0]
+    if not config.default_fields and config.default_entity:
+        config.default_fields = config.fields_by_entity.get(config.default_entity, [])[:5]
+    if not config.args_by_entity:
+        config.args_by_entity = _build_generic_args(config.fields_by_entity)
+
+
+def _collect_entities_and_fields(payload: dict[str, Any]) -> dict[str, set[str]]:
+    ignored_root_keys = {
+        "entities",
+        "fields",
+        "args",
+        "relations",
+        "introspection",
+        "mapping",
+        "mappings",
+        "default_entity",
+        "default_fields",
+    }
+    out: dict[str, set[str]] = {}
+
+    def walk(node: Any, entity_hint: str | None) -> None:
+        if isinstance(node, dict):
+            if entity_hint:
+                out.setdefault(entity_hint, set()).update(str(k) for k in node.keys())
+            for key, value in node.items():
+                if entity_hint is None and key in ignored_root_keys:
+                    continue
+                if isinstance(value, dict):
+                    if entity_hint:
+                        out.setdefault(entity_hint, set()).update(str(k) for k in value.keys())
+                    walk(value, str(key))
+                    continue
+                if isinstance(value, list):
+                    first = _first_dict(value)
+                    if first is not None:
+                        if entity_hint:
+                            out.setdefault(entity_hint, set()).update(str(k) for k in first.keys())
+                        walk(first, str(key))
+                    elif entity_hint:
+                        out.setdefault(entity_hint, set()).add(str(key))
+                    continue
+                if entity_hint:
+                    out.setdefault(entity_hint, set()).add(str(key))
+            return
+
+        if isinstance(node, list):
+            first = _first_dict(node)
+            if first is not None:
+                walk(first, entity_hint)
+
+    walk(payload, None)
+    return out
+
+
+def _first_dict(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, list):
+        return None
+    for item in value:
+        if isinstance(item, dict):
+            return item
+    return None
+
+
+def _build_generic_args(fields_by_entity: dict[str, list[str]]) -> dict[str, list[str]]:
+    args_by_entity: dict[str, list[str]] = {}
+    for entity, fields in fields_by_entity.items():
+        args = {"limit", "status"}
+        for field in fields:
+            args.update({field, f"{field}_gte", f"{field}_lte", f"{field}_in"})
+        args_by_entity[entity] = sorted(args)
+    return args_by_entity

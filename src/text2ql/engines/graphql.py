@@ -42,7 +42,7 @@ class GraphQLEngine(QueryEngine):
 
         entity = self._detect_entity(prompt, config)
         fields = self._detect_fields(prompt, config, entity)
-        filters = self._detect_filters(prompt, config)
+        filters = self._detect_filters(prompt, config, entity)
         aggregations = self._detect_aggregations(prompt, config, entity)
         nested = self._detect_nested(prompt, config, entity)
         entity, fields, filters, aggregations, nested, validation_notes = self._validate_components(
@@ -137,6 +137,46 @@ class GraphQLEngine(QueryEngine):
 
     def _detect_entity(self, text: str, config: NormalizedSchemaConfig) -> str:
         lowered = text.lower()
+        owned_asset = self._detect_owned_asset(lowered)
+        holdings_entity = self._resolve_holdings_entity(config)
+        if owned_asset and holdings_entity:
+            return holdings_entity
+        if ("transaction" in lowered or "transactions" in lowered) and "as of date" in lowered:
+            summary_entity = self._find_entity_with_field(
+                config,
+                candidate_fields=["asOfDate", "asOfDateTime"],
+                preferred_entity_names=["transactionsSummary"],
+            )
+            if summary_entity is not None:
+                return summary_entity
+        if "dividend" in lowered:
+            dividend_entity = self._find_entity_by_name(config, "transactions")
+            if dividend_entity is not None:
+                return dividend_entity
+        if "net worth" in lowered:
+            net_worth_entity = self._find_entity_with_field(
+                config,
+                candidate_fields=["netWorth", "regulatoryNetWorth"],
+            )
+            if net_worth_entity is not None:
+                return net_worth_entity
+        if "available" in lowered and "withdraw" in lowered:
+            withdraw_entity = self._find_entity_with_field(
+                config,
+                candidate_fields=["cashOnly", "cashWithMargin", "availBorr"],
+                preferred_entity_names=["availableToWithdrawDetail"],
+            )
+            if withdraw_entity is not None:
+                return withdraw_entity
+        if "buying power" in lowered:
+            buying_power_entity = self._find_entity_with_field(
+                config,
+                candidate_fields=["cash", "margin", "withoutMarginImpact"],
+                preferred_entity_names=["buyingPowerDetail"],
+            )
+            if buying_power_entity is not None:
+                return buying_power_entity
+
         for alias, canonical in self._sorted_alias_pairs(config.entity_aliases):
             if self._contains_entity_token(lowered, alias):
                 return canonical
@@ -144,6 +184,10 @@ class GraphQLEngine(QueryEngine):
         for entity in config.entities:
             if self._contains_entity_token(lowered, entity.lower()):
                 return entity
+
+        semantic_entity = self._resolve_entity_by_semantic_field_match(lowered, config)
+        if semantic_entity is not None:
+            return semantic_entity
 
         if config.default_entity:
             return config.default_entity
@@ -160,7 +204,13 @@ class GraphQLEngine(QueryEngine):
         lowered = text.lower()
         common = ["id", "name", "title", "email", "createdAt", "status", "price"]
 
-        schema_fields = config.fields_by_entity.get(entity, config.fields)
+        schema_fields = self._fields_for_entity(config, entity)
+        owned_asset = self._detect_owned_asset(lowered)
+        if owned_asset and self._entity_looks_like_holdings(entity, schema_fields):
+            owned_fields = self._resolve_holdings_fields(schema_fields)
+            if owned_fields:
+                return owned_fields
+
         selected: list[str] = []
         for field in schema_fields:
             if self._contains_token(lowered, field.lower()):
@@ -176,6 +226,13 @@ class GraphQLEngine(QueryEngine):
             unique_selected = self._unique_in_order(selected)
             if unique_selected:
                 return unique_selected
+            if self._entity_looks_like_holdings(entity, schema_fields):
+                contextual = self._resolve_holdings_context_fields(lowered, schema_fields)
+                if contextual:
+                    return contextual
+            semantic_fields = self._resolve_fields_by_semantic_match(lowered, schema_fields)
+            if semantic_fields:
+                return semantic_fields
             if config.default_fields:
                 return config.default_fields
             return schema_fields[:3]
@@ -183,9 +240,17 @@ class GraphQLEngine(QueryEngine):
         selected = [f for f in common if self._contains_token(lowered, f.lower())]
         return selected or ["id", "name"]
 
-    def _detect_filters(self, text: str, config: NormalizedSchemaConfig) -> dict[str, Any]:
+    def _detect_filters(
+        self,
+        text: str,
+        config: NormalizedSchemaConfig,
+        entity: str,
+    ) -> dict[str, Any]:
         filters: dict[str, Any] = {}
         lowered = text.lower()
+        where_clause = self._extract_where_clause(lowered)
+        if "most recent" in lowered or "latest" in lowered:
+            filters["limit"] = "1"
 
         limit_match = re.search(r"(?:top|first|limit)\s+(\d+)", lowered)
         if limit_match:
@@ -195,15 +260,41 @@ class GraphQLEngine(QueryEngine):
         filter_key_aliases.update(config.filter_key_aliases)
 
         for alias, canonical in self._sorted_alias_pairs(filter_key_aliases):
-            key_pattern = re.escape(alias)
-            match = re.search(rf"\b{key_pattern}\b\s+(?:is\s+)?([a-zA-Z_]+)", lowered)
-            if not match:
+            value = self._extract_filter_value(alias=alias, text=where_clause or lowered)
+            if value is None and where_clause is not None:
+                value = self._extract_filter_value(alias=alias, text=lowered)
+            if value is None:
                 continue
-            value = match.group(1)
+            resolved_canonical = self._resolve_filter_key_for_entity(config, entity, canonical)
             mapped_value = (
-                config.filter_value_aliases.get(canonical.lower(), {}).get(value.lower(), value)
+                config.filter_value_aliases.get(str(resolved_canonical).lower(), {}).get(value.lower(), value)
             )
-            filters[canonical] = mapped_value
+            filters[str(resolved_canonical)] = mapped_value
+
+        for canonical, alias_map in config.filter_value_aliases.items():
+            resolved_canonical = self._resolve_filter_key_for_entity(config, entity, canonical)
+            if str(resolved_canonical) in filters or not isinstance(alias_map, dict):
+                continue
+            for alias, mapped_value in alias_map.items():
+                if self._contains_token(lowered, str(alias).lower()):
+                    filters[str(resolved_canonical)] = mapped_value
+                    break
+
+        owned_asset = self._detect_owned_asset(lowered)
+        if owned_asset is not None:
+            identifier_key = self._resolve_identifier_filter_key(
+                config=config,
+                entity=entity,
+                filter_key_aliases=filter_key_aliases,
+            )
+            if identifier_key is not None:
+                mapped_value = (
+                    config.filter_value_aliases.get(identifier_key.lower(), {}).get(
+                        owned_asset.lower(),
+                        owned_asset.upper(),
+                    )
+                )
+                filters[identifier_key] = mapped_value
 
         range_filters = self._detect_between_filters(lowered)
         in_filters = self._detect_in_filters(lowered)
@@ -262,6 +353,263 @@ class GraphQLEngine(QueryEngine):
             return {"and": simple_conditions}
         return {}
 
+    @staticmethod
+    def _extract_where_clause(lowered: str) -> str | None:
+        parts = lowered.split(" where ", maxsplit=1)
+        if len(parts) == 2:
+            return parts[1].strip()
+        return None
+
+    @staticmethod
+    def _extract_filter_value(alias: str, text: str) -> str | None:
+        key_pattern = re.escape(alias)
+        matches = list(re.finditer(rf"\b{key_pattern}\b\s+(?:is\s+)?([a-zA-Z0-9_]+)", text))
+        if not matches:
+            return None
+        return matches[-1].group(1)
+
+    @staticmethod
+    def _detect_owned_asset(lowered: str) -> str | None:
+        match = re.search(r"\bhow many\s+([a-z0-9_]+)\s+do i own\b", lowered)
+        if match is not None:
+            return match.group(1)
+        match = re.search(r"\bhow many\s+([a-z0-9_]+)\s+i own\b", lowered)
+        if match is not None:
+            return match.group(1)
+        return None
+
+    def _resolve_identifier_filter_key(
+        self,
+        config: NormalizedSchemaConfig,
+        entity: str,
+        filter_key_aliases: dict[str, str],
+    ) -> str | None:
+        for candidate in self._identifier_field_candidates():
+            canonical = filter_key_aliases.get(candidate)
+            if isinstance(canonical, str) and canonical:
+                return canonical
+        schema_fields = self._fields_for_entity(config, entity)
+        for field in schema_fields:
+            if field.lower() in self._identifier_field_candidates():
+                return field
+        return None
+
+    def _resolve_filter_key_for_entity(
+        self,
+        config: NormalizedSchemaConfig,
+        entity: str,
+        candidate_key: str,
+    ) -> str:
+        entity_args = config.args_by_entity.get(entity, [])
+        for arg in entity_args:
+            if arg.lower() == candidate_key.lower():
+                return arg
+        schema_fields = self._fields_for_entity(config, entity)
+        for field in schema_fields:
+            if field.lower() == candidate_key.lower():
+                return field
+        return candidate_key
+
+    @staticmethod
+    def _find_entity_by_name(config: NormalizedSchemaConfig, expected: str) -> str | None:
+        lowered_expected = expected.lower()
+        for entity in config.entities:
+            if entity.lower() == lowered_expected:
+                return entity
+        return None
+
+    def _find_entity_with_field(
+        self,
+        config: NormalizedSchemaConfig,
+        candidate_fields: list[str],
+        preferred_entity_names: list[str] | None = None,
+    ) -> str | None:
+        lowered_candidates = {field.lower() for field in candidate_fields}
+        preferred = {name.lower() for name in (preferred_entity_names or [])}
+
+        best_entity: str | None = None
+        best_score = -1
+        for entity in config.entities:
+            fields = self._fields_for_entity(config, entity)
+            if not fields:
+                continue
+            lowered_fields = {field.lower() for field in fields}
+            score = len(lowered_candidates.intersection(lowered_fields))
+            if score == 0:
+                continue
+            if preferred and entity.lower() in preferred:
+                score += 2
+            if score > best_score:
+                best_score = score
+                best_entity = entity
+        return best_entity
+
+    def _resolve_holdings_entity(self, config: NormalizedSchemaConfig) -> str | None:
+        best_entity: str | None = None
+        best_score = 0
+        for entity in config.entities:
+            fields = self._fields_for_entity(config, entity)
+            if not fields:
+                continue
+            score = self._score_holdings_entity(entity, fields)
+            if score > best_score:
+                best_score = score
+                best_entity = entity
+        return best_entity if best_score > 0 else None
+
+    def _score_holdings_entity(self, entity: str, fields: list[str]) -> int:
+        lowered_entity = entity.lower()
+        lowered_fields = {field.lower() for field in fields}
+        has_identifier = any(candidate in lowered_fields for candidate in self._identifier_field_candidates())
+        has_quantity = any(candidate in lowered_fields for candidate in self._quantity_field_candidates())
+        if not (has_identifier and has_quantity):
+            return 0
+        score = 1
+        if lowered_entity in {"positions", "holdings", "assets"}:
+            score += 4
+        if {"symbol", "securitytype"}.intersection(lowered_fields):
+            score += 1
+        if {"acctnum", "acctname", "accountpositioncount"}.intersection(lowered_fields):
+            score -= 3
+        return score
+
+    def _resolve_entity_by_semantic_field_match(
+        self,
+        lowered: str,
+        config: NormalizedSchemaConfig,
+    ) -> str | None:
+        best_entity: str | None = None
+        best_score = 0.0
+        for entity in config.entities:
+            fields = self._fields_for_entity(config, entity)
+            if not fields:
+                continue
+            score = (1.6 * self._score_fields_for_prompt(lowered, fields)) + (
+                1.0 * self._score_entity_name_for_prompt(lowered, entity)
+            )
+            if score > best_score:
+                best_score = score
+                best_entity = entity
+        return best_entity if best_score >= 0.6 else None
+
+    def _entity_looks_like_holdings(self, entity: str, fields: list[str]) -> bool:
+        return self._score_holdings_entity(entity, fields) > 0
+
+    def _resolve_holdings_fields(self, fields: list[str]) -> list[str]:
+        lowered_to_original = {field.lower(): field for field in fields}
+        selection: list[str] = []
+        for candidate in self._quantity_field_candidates():
+            field = lowered_to_original.get(candidate)
+            if field is not None:
+                selection.append(field)
+                break
+        for candidate in self._identifier_field_candidates():
+            field = lowered_to_original.get(candidate)
+            if field is not None and field not in selection:
+                selection.append(field)
+                break
+        return selection
+
+    def _resolve_holdings_context_fields(self, lowered: str, fields: list[str]) -> list[str]:
+        selected = self._resolve_holdings_fields(fields)
+        lowered_to_original = {field.lower(): field for field in fields}
+        optional_candidates = [
+            ("traded", "tradeMarket"),
+            ("market", "tradeMarket"),
+            ("core", "securityType"),
+            ("type", "securityType"),
+        ]
+        for token, candidate_field in optional_candidates:
+            if token not in lowered:
+                continue
+            match = lowered_to_original.get(candidate_field.lower())
+            if match is not None and match not in selected:
+                selected.append(match)
+        return selected
+
+    @staticmethod
+    def _quantity_field_candidates() -> tuple[str, ...]:
+        return ("quantity", "qty", "shares", "units", "amount", "holding")
+
+    @staticmethod
+    def _identifier_field_candidates() -> tuple[str, ...]:
+        return ("symbol", "ticker", "stock", "asset", "security", "code", "name")
+
+    def _resolve_fields_by_semantic_match(
+        self,
+        lowered: str,
+        fields: list[str],
+        max_fields: int = 3,
+    ) -> list[str]:
+        scored: list[tuple[float, str]] = []
+        for field in fields:
+            score = self._score_field_for_prompt(lowered, field)
+            if score > 0:
+                scored.append((score, field))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [field for _, field in scored[:max_fields]]
+
+    def _score_fields_for_prompt(self, lowered: str, fields: list[str]) -> float:
+        if not fields:
+            return 0.0
+        return max(self._score_field_for_prompt(lowered, field) for field in fields)
+
+    def _score_entity_name_for_prompt(self, lowered: str, entity: str) -> float:
+        prompt_tokens = self._expanded_tokens(self._tokenize(lowered))
+        entity_tokens = self._expanded_tokens(self._tokenize(entity))
+        if not entity_tokens:
+            return 0.0
+        overlap = len(prompt_tokens.intersection(entity_tokens))
+        if overlap == 0:
+            return 0.0
+        return overlap / max(1, len(entity_tokens))
+
+    def _score_field_for_prompt(self, lowered: str, field: str) -> float:
+        prompt_tokens = self._expanded_tokens(self._tokenize(lowered))
+        field_tokens = self._expanded_tokens(self._tokenize(field))
+        if not field_tokens:
+            return 0.0
+        overlap = len(prompt_tokens.intersection(field_tokens))
+        if overlap == 0:
+            return 0.0
+        return overlap / max(1, len(field_tokens))
+
+    def _fields_for_entity(self, config: NormalizedSchemaConfig, entity: str) -> list[str]:
+        if config.fields_by_entity:
+            return config.fields_by_entity.get(entity, [])
+        return config.fields
+
+    @staticmethod
+    def _tokenize(text: str) -> set[str]:
+        with_spaces = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
+        with_spaces = with_spaces.replace("_", " ")
+        return {token for token in re.findall(r"[a-z0-9]+", with_spaces.lower()) if token}
+
+    @staticmethod
+    def _expanded_tokens(tokens: set[str]) -> set[str]:
+        expanded = set(tokens)
+        synonyms = {
+            "val": "value",
+            "value": "val",
+            "mkt": "market",
+            "market": "mkt",
+            "pct": "percent",
+            "percent": "pct",
+            "chg": "change",
+            "change": "chg",
+            "txn": "transaction",
+            "transaction": "txn",
+            "acct": "account",
+            "account": "acct",
+            "todays": "today",
+            "today": "todays",
+        }
+        for token in list(tokens):
+            mapped = synonyms.get(token)
+            if mapped:
+                expanded.add(mapped)
+        return expanded
+
     def _detect_aggregations(
         self,
         text: str,
@@ -270,9 +618,11 @@ class GraphQLEngine(QueryEngine):
     ) -> list[dict[str, str]]:
         lowered = text.lower()
         aggregations: list[dict[str, str]] = []
-        candidate_fields = config.fields_by_entity.get(entity, config.fields)
+        candidate_fields = self._fields_for_entity(config, entity)
 
-        if re.search(r"\bcount\b", lowered):
+        if re.search(r"\bcount\b", lowered) or (
+            re.search(r"\bhow many\b", lowered) and self._detect_owned_asset(lowered) is None
+        ):
             aggregations.append({"function": "count", "field": ""})
 
         for fn_name in ["sum", "avg", "min", "max"]:

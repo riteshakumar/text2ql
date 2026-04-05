@@ -1,6 +1,6 @@
 import pytest
 
-from text2ql.schema_config import normalize_schema_config
+from text2ql.schema_config import infer_schema_from_json_payload, normalize_schema_config
 
 pytestmark = pytest.mark.unit
 
@@ -63,3 +63,44 @@ def test_normalize_schema_config_supports_fields_by_entity() -> None:
     assert config.fields_by_entity["customers"] == ["id", "email"]
     assert config.fields_by_entity["orders"] == ["id", "status"]
     assert "status" in config.fields
+
+
+def test_normalize_schema_config_infers_structure_from_arbitrary_nested_json() -> None:
+    schema = {
+        "portfolio_data": {
+            "accounts": [
+                {
+                    "acctNum": "X123",
+                    "positions": [{"symbol": "QQQ", "quantity": 100.104}],
+                }
+            ],
+            "positionsSummary": {"portfolioPositionCount": 1},
+        }
+    }
+
+    config = normalize_schema_config(schema)
+
+    assert "accounts" in config.entities
+    assert "positions" in config.entities
+    assert "acctNum" in config.fields_by_entity["accounts"]
+    assert "symbol" in config.fields_by_entity["positions"]
+    assert "quantity" in config.fields_by_entity["positions"]
+    assert config.default_entity in {"accounts", "portfolio_data"}
+
+
+def test_infer_schema_from_json_payload_returns_text2ql_shape() -> None:
+    payload = {
+        "accounts": [
+            {
+                "acctNum": "X123",
+                "positions": [{"symbol": "QQQ", "quantity": 100.104}],
+            }
+        ]
+    }
+
+    inferred = infer_schema_from_json_payload(payload)
+
+    assert "entities" in inferred
+    assert "fields" in inferred
+    assert "args" in inferred
+    assert "default_entity" in inferred

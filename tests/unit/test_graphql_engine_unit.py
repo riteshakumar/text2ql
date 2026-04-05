@@ -208,3 +208,108 @@ def test_engine_uses_introspection_for_post_generation_validation() -> None:
     assert any("post-validation" in note for note in notes) or any(
         "dropped invalid args" in note for note in notes
     )
+
+
+def test_engine_handles_how_many_ticker_owned_intent() -> None:
+    engine = GraphQLEngine()
+    request = QueryRequest(
+        text="how many qqq do I own",
+        target="graphql",
+        schema={
+            "entities": ["positions"],
+            "fields": {"positions": ["symbol", "quantity"]},
+            "args": {"positions": ["symbol"]},
+            "default_entity": "positions",
+        },
+        mapping={
+            "filters": {"ticker": "symbol", "symbol": "symbol"},
+            "filter_values": {"symbol": {"qqq": "QQQ"}},
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert "positions(symbol: \"QQQ\")" in result.query
+    assert "quantity" in result.query
+    assert result.metadata.get("entity") == "positions"
+    assert result.metadata.get("filters", {}).get("symbol") == "QQQ"
+
+
+def test_engine_prefers_where_clause_filter_match_over_earlier_mentions() -> None:
+    engine = GraphQLEngine()
+    request = QueryRequest(
+        text="show positions with symbol quantity where symbol qqq",
+        target="graphql",
+        schema={
+            "entities": ["positions"],
+            "fields": {"positions": ["symbol", "quantity"]},
+            "args": {"positions": ["symbol"]},
+        },
+        mapping={
+            "filters": {"symbol": "symbol"},
+            "filter_values": {"symbol": {"qqq": "QQQ"}},
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert "positions(symbol: \"QQQ\")" in result.query
+    assert result.metadata.get("filters", {}).get("symbol") == "QQQ"
+
+
+def test_engine_generalizes_how_many_owned_for_ticker_field() -> None:
+    engine = GraphQLEngine()
+    request = QueryRequest(
+        text="how many tsla do I own",
+        target="graphql",
+        schema={
+            "entities": ["holdings"],
+            "fields": {"holdings": ["ticker", "shares"]},
+            "args": {"holdings": ["ticker"]},
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert "holdings(ticker: \"TSLA\")" in result.query
+    assert "shares" in result.query
+
+
+def test_engine_maps_how_many_positions_to_count_aggregation() -> None:
+    engine = GraphQLEngine()
+    request = QueryRequest(
+        text="how many positions do i have",
+        target="graphql",
+        schema={
+            "entities": ["positions"],
+            "fields": {"positions": ["symbol", "quantity"]},
+            "args": {"positions": ["limit"]},
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert any(agg.get("function") == "count" for agg in result.metadata.get("aggregations", []))
+    assert "count" in result.query
+
+
+def test_engine_uses_semantic_field_match_for_metric_prompt() -> None:
+    engine = GraphQLEngine()
+    request = QueryRequest(
+        text="what is my total market value",
+        target="graphql",
+        schema={
+            "entities": ["accounts", "gainLossBalanceDetail"],
+            "fields": {
+                "accounts": ["acctNum", "acctName"],
+                "gainLossBalanceDetail": ["totalMarketVal", "totalGainLoss"],
+            },
+            "default_entity": "accounts",
+            "default_fields": ["acctNum"],
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert result.metadata.get("entity") == "gainLossBalanceDetail"
+    assert "totalMarketVal" in result.query
