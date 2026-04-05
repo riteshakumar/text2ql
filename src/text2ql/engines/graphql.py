@@ -152,49 +152,13 @@ class GraphQLEngine(QueryEngine):
         holdings_entity = self._resolve_holdings_entity(config)
         if owned_asset and holdings_entity:
             return holdings_entity
-        if ("transaction" in lowered or "transactions" in lowered) and "as of date" in lowered:
-            summary_entity = self._find_entity_with_field(
-                config,
-                candidate_fields=["asOfDate", "asOfDateTime"],
-                preferred_entity_names=["transactionsSummary"],
-            )
-            if summary_entity is not None:
-                return summary_entity
-        if "dividend" in lowered:
-            dividend_entity = self._find_entity_by_name(config, "transactions")
-            if dividend_entity is not None:
-                return dividend_entity
-        if "net worth" in lowered:
-            net_worth_entity = self._find_entity_with_field(
-                config,
-                candidate_fields=["netWorth", "regulatoryNetWorth"],
-            )
-            if net_worth_entity is not None:
-                return net_worth_entity
-        if "available" in lowered and "withdraw" in lowered:
-            withdraw_entity = self._find_entity_with_field(
-                config,
-                candidate_fields=["cashOnly", "cashWithMargin", "availBorr"],
-                preferred_entity_names=["availableToWithdrawDetail"],
-            )
-            if withdraw_entity is not None:
-                return withdraw_entity
-        if "buying power" in lowered:
-            buying_power_entity = self._find_entity_with_field(
-                config,
-                candidate_fields=["cash", "margin", "withoutMarginImpact"],
-                preferred_entity_names=["buyingPowerDetail"],
-            )
-            if buying_power_entity is not None:
-                return buying_power_entity
+        special_entity = self._resolve_special_entity(lowered, config)
+        if special_entity is not None:
+            return special_entity
 
-        for alias, canonical in self._sorted_alias_pairs(config.entity_aliases):
-            if self._contains_entity_token(lowered, alias):
-                return canonical
-
-        for entity in config.entities:
-            if self._contains_entity_token(lowered, entity.lower()):
-                return entity
+        alias_or_name_entity = self._resolve_entity_by_alias_or_name(lowered, config)
+        if alias_or_name_entity is not None:
+            return alias_or_name_entity
 
         semantic_entity = self._resolve_entity_by_semantic_field_match(lowered, config)
         if semantic_entity is not None:
@@ -209,6 +173,47 @@ class GraphQLEngine(QueryEngine):
 
         return "items"
 
+    def _resolve_special_entity(self, lowered: str, config: NormalizedSchemaConfig) -> str | None:
+        if ("transaction" in lowered or "transactions" in lowered) and "as of date" in lowered:
+            return self._find_entity_with_field(
+                config,
+                candidate_fields=["asOfDate", "asOfDateTime"],
+                preferred_entity_names=["transactionsSummary"],
+            )
+        if "dividend" in lowered:
+            return self._find_entity_by_name(config, "transactions")
+        if "net worth" in lowered:
+            return self._find_entity_with_field(
+                config,
+                candidate_fields=["netWorth", "regulatoryNetWorth"],
+            )
+        if "available" in lowered and "withdraw" in lowered:
+            return self._find_entity_with_field(
+                config,
+                candidate_fields=["cashOnly", "cashWithMargin", "availBorr"],
+                preferred_entity_names=["availableToWithdrawDetail"],
+            )
+        if "buying power" in lowered:
+            return self._find_entity_with_field(
+                config,
+                candidate_fields=["cash", "margin", "withoutMarginImpact"],
+                preferred_entity_names=["buyingPowerDetail"],
+            )
+        return None
+
+    def _resolve_entity_by_alias_or_name(
+        self,
+        lowered: str,
+        config: NormalizedSchemaConfig,
+    ) -> str | None:
+        for alias, canonical in self._sorted_alias_pairs(config.entity_aliases):
+            if self._contains_entity_token(lowered, alias):
+                return canonical
+        for entity in config.entities:
+            if self._contains_entity_token(lowered, entity.lower()):
+                return entity
+        return None
+
     def _detect_fields(
         self, text: str, config: NormalizedSchemaConfig, entity: str
     ) -> list[str]:
@@ -222,34 +227,39 @@ class GraphQLEngine(QueryEngine):
             if owned_fields:
                 return owned_fields
 
+        if not schema_fields:
+            return self._detect_common_fields(lowered, common)
+
+        selected = self._select_fields_from_schema(lowered, schema_fields, config)
+        if selected:
+            return selected
+        if self._entity_looks_like_holdings(entity, schema_fields):
+            contextual = self._resolve_holdings_context_fields(lowered, schema_fields)
+            if contextual:
+                return contextual
+        semantic_fields = self._resolve_fields_by_semantic_match(lowered, schema_fields)
+        if semantic_fields:
+            return semantic_fields
+        return config.default_fields or schema_fields[:3]
+
+    def _detect_common_fields(self, lowered: str, common_fields: list[str]) -> list[str]:
+        selected = [field for field in common_fields if self._contains_token(lowered, field.lower())]
+        return selected or ["id", "name"]
+
+    def _select_fields_from_schema(
+        self,
+        lowered: str,
+        schema_fields: list[str],
+        config: NormalizedSchemaConfig,
+    ) -> list[str]:
         selected: list[str] = []
         for field in schema_fields:
             if self._contains_token(lowered, field.lower()):
                 selected.append(field)
-
         for alias, canonical in self._sorted_alias_pairs(config.field_aliases):
-            if canonical not in schema_fields:
-                continue
-            if self._contains_token(lowered, alias):
+            if canonical in schema_fields and self._contains_token(lowered, alias):
                 selected.append(canonical)
-
-        if schema_fields:
-            unique_selected = self._unique_in_order(selected)
-            if unique_selected:
-                return unique_selected
-            if self._entity_looks_like_holdings(entity, schema_fields):
-                contextual = self._resolve_holdings_context_fields(lowered, schema_fields)
-                if contextual:
-                    return contextual
-            semantic_fields = self._resolve_fields_by_semantic_match(lowered, schema_fields)
-            if semantic_fields:
-                return semantic_fields
-            if config.default_fields:
-                return config.default_fields
-            return schema_fields[:3]
-
-        selected = [f for f in common if self._contains_token(lowered, f.lower())]
-        return selected or ["id", "name"]
+        return self._unique_in_order(selected)
 
     def _detect_filters(
         self,
@@ -257,19 +267,56 @@ class GraphQLEngine(QueryEngine):
         config: NormalizedSchemaConfig,
         entity: str,
     ) -> dict[str, Any]:
-        filters: dict[str, Any] = {}
         lowered = text.lower()
         where_clause = self._extract_where_clause(lowered)
-        if "most recent" in lowered:
-            filters["limit"] = "1"
-
-        limit_match = re.search(r"(?:top|first|limit)\s+(\d+)", lowered)
-        if limit_match:
-            filters["limit"] = limit_match.group(1)
+        filters = self._extract_limit_filters(lowered)
 
         filter_key_aliases = {"status": "status"}
         filter_key_aliases.update(config.filter_key_aliases)
 
+        self._apply_alias_key_filters(
+            filters=filters,
+            lowered=lowered,
+            where_clause=where_clause,
+            config=config,
+            entity=entity,
+            filter_key_aliases=filter_key_aliases,
+        )
+        self._apply_alias_value_filters(
+            filters=filters,
+            lowered=lowered,
+            config=config,
+            entity=entity,
+        )
+        self._apply_owned_asset_filter(
+            filters=filters,
+            lowered=lowered,
+            config=config,
+            entity=entity,
+            filter_key_aliases=filter_key_aliases,
+        )
+        self._apply_advanced_filters(filters=filters, lowered=lowered)
+        return filters
+
+    @staticmethod
+    def _extract_limit_filters(lowered: str) -> dict[str, Any]:
+        filters: dict[str, Any] = {}
+        if "most recent" in lowered:
+            filters["limit"] = "1"
+        limit_match = re.search(r"(?:top|first|limit)\s+(\d+)", lowered)
+        if limit_match:
+            filters["limit"] = limit_match.group(1)
+        return filters
+
+    def _apply_alias_key_filters(
+        self,
+        filters: dict[str, Any],
+        lowered: str,
+        where_clause: str | None,
+        config: NormalizedSchemaConfig,
+        entity: str,
+        filter_key_aliases: dict[str, str],
+    ) -> None:
         for alias, canonical in self._sorted_alias_pairs(filter_key_aliases):
             value = self._extract_filter_value(alias=alias, text=where_clause or lowered)
             if value is None and where_clause is not None:
@@ -282,6 +329,13 @@ class GraphQLEngine(QueryEngine):
             )
             filters[str(resolved_canonical)] = mapped_value
 
+    def _apply_alias_value_filters(
+        self,
+        filters: dict[str, Any],
+        lowered: str,
+        config: NormalizedSchemaConfig,
+        entity: str,
+    ) -> None:
         for canonical, alias_map in config.filter_value_aliases.items():
             resolved_canonical = self._resolve_filter_key_for_entity(config, entity, canonical)
             if str(resolved_canonical) in filters or not isinstance(alias_map, dict):
@@ -291,6 +345,14 @@ class GraphQLEngine(QueryEngine):
                     filters[str(resolved_canonical)] = mapped_value
                     break
 
+    def _apply_owned_asset_filter(
+        self,
+        filters: dict[str, Any],
+        lowered: str,
+        config: NormalizedSchemaConfig,
+        entity: str,
+        filter_key_aliases: dict[str, str],
+    ) -> None:
         owned_asset = self._detect_owned_asset(lowered)
         if owned_asset is not None:
             identifier_key = self._resolve_identifier_filter_key(
@@ -307,6 +369,7 @@ class GraphQLEngine(QueryEngine):
                 )
                 filters[identifier_key] = mapped_value
 
+    def _apply_advanced_filters(self, filters: dict[str, Any], lowered: str) -> None:
         range_filters = self._detect_between_filters(lowered)
         in_filters = self._detect_in_filters(lowered)
         grouped_filters = self._detect_grouped_filters(lowered, range_filters, in_filters)
@@ -315,8 +378,6 @@ class GraphQLEngine(QueryEngine):
         filters.update(in_filters)
         if grouped_filters:
             filters.update(grouped_filters)
-
-        return filters
 
     def _detect_between_filters(self, lowered: str) -> dict[str, Any]:
         filters: dict[str, Any] = {}
@@ -615,7 +676,7 @@ class GraphQLEngine(QueryEngine):
             "todays": "today",
             "today": "todays",
         }
-        for token in list(tokens):
+        for token in tokens:
             mapped = synonyms.get(token)
             if mapped:
                 expanded.add(mapped)

@@ -81,14 +81,14 @@ def graphql_execution_match(predicted_query: str, expected_query: str) -> bool:
 
 
 def _parse_graphql_signature(query: str) -> tuple[str, tuple[str, ...], tuple[tuple[str, str], ...]] | None:
-    entity_match = re.search(r"\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*(\([^)]*\))?\s*\{", query)
+    entity_match = re.search(r"\{\s*([A-Za-z_]\w*)\s*(\([^)]*\))?\s*\{", query)
     if not entity_match:
         return None
 
     entity = entity_match.group(1)
     args_blob = entity_match.group(2) or ""
 
-    block_match = re.search(r"\{\s*[A-Za-z_][A-Za-z0-9_]*\s*(?:\([^)]*\))?\s*\{(.*?)\}\s*\}", query, re.S)
+    block_match = re.search(r"\{\s*[A-Za-z_]\w*\s*(?:\([^)]*\))?\s*\{(.*?)\}\s*\}", query, re.S)
     if not block_match:
         return None
 
@@ -98,7 +98,7 @@ def _parse_graphql_signature(query: str) -> tuple[str, tuple[str, ...], tuple[tu
 
 
 def _extract_fields(selection_block: str) -> list[str]:
-    fields = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", selection_block)
+    fields = re.findall(r"[A-Za-z_]\w*", selection_block)
     return _dedupe(fields)
 
 
