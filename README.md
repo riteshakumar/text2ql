@@ -158,14 +158,20 @@ Language support:
 
 ## Arbitrary JSON support
 
-`text2ql` can infer schema config from arbitrary nested JSON payloads and execute generated metadata against JSON data:
+`text2ql` can infer schema config from arbitrary nested JSON payloads, generate hybrid mappings (auto + overrides), and execute generated metadata against JSON data:
 
 ```python
-from text2ql import Text2QL, infer_schema_from_json_payload, execute_query_result_on_json
+from text2ql import (
+    Text2QL,
+    execute_query_result_on_json,
+    generate_hybrid_mapping,
+    infer_schema_from_json_payload,
+)
 
 schema = infer_schema_from_json_payload(raw_json_payload)
+mapping = generate_hybrid_mapping(schema_payload=schema, data_payload=raw_json_payload)
 service = Text2QL()
-result = service.generate("how many qqq do I own", schema=schema)
+result = service.generate("how many qqq do I own", schema=schema, mapping=mapping)
 
 rows, note = execute_query_result_on_json(result, raw_json_payload)
 print(result.query)
