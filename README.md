@@ -79,7 +79,11 @@ result = service.generate(
     target="graphql",
     schema={"entities": ["customers"], "fields": ["id", "email", "status"]},
     mapping={"entities": {"clients": "customers"}, "fields": {"mail": "email"}},
-    context={"mode": "llm", "language": "english"},
+    context={
+        "mode": "llm",
+        "language": "english",
+        "system_context": "Prefer customer/account semantics and preserve canonical field names.",
+    },
 )
 ```
 
@@ -121,6 +125,7 @@ export OPENAI_API_KEY=...
 text2ql "show top 3 clients with mail state enabled" \
   --mode llm \
   --language english \
+  --system-context "Prefer customer/account semantics and preserve canonical field names." \
   --llm-provider openai-compatible \
   --llm-model gpt-4o-mini \
   --llm-max-retries 4 \
@@ -128,6 +133,7 @@ text2ql "show top 3 clients with mail state enabled" \
 ```
 
 If you do not pass `--mode llm`, CLI runs deterministic mode.
+`--system-context` is consumed in LLM mode and ignored in deterministic mode.
 
 ## Prompt templates
 

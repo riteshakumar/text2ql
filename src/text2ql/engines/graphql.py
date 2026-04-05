@@ -96,6 +96,7 @@ class GraphQLEngine(QueryEngine):
             template,
             language=resolved_language,
         )
+        system_prompt = self._apply_system_context(system_prompt, context)
         try:
             raw = self.provider.complete(system_prompt=system_prompt, user_prompt=user_prompt)
         except (RuntimeError, ValueError, TypeError):
@@ -134,6 +135,16 @@ class GraphQLEngine(QueryEngine):
                 "validation_notes": validation_notes,
             },
         )
+
+    @staticmethod
+    def _apply_system_context(system_prompt: str, context: dict[str, Any]) -> str:
+        extra = context.get("system_context")
+        if not isinstance(extra, str):
+            return system_prompt
+        cleaned = extra.strip()
+        if not cleaned:
+            return system_prompt
+        return f"{system_prompt}\n\nAdditional system context:\n{cleaned}"
 
     def _detect_entity(self, text: str, config: NormalizedSchemaConfig) -> str:
         lowered = text.lower()
