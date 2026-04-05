@@ -65,6 +65,7 @@ class SQLEngine(QueryEngine):
             order_dir=order_dir,
             config=config,
         )
+        exact_filter_keys = self._allowed_filter_keys(config, table, set(columns))
 
         query = self._build_sql(
             table=table,
@@ -75,6 +76,7 @@ class SQLEngine(QueryEngine):
             order_dir=order_dir,
             limit=limit,
             offset=offset,
+            exact_filter_keys=exact_filter_keys,
         )
         return QueryResult(
             query=query,
@@ -155,6 +157,7 @@ class SQLEngine(QueryEngine):
             order_dir=order_dir,
             config=config,
         )
+        exact_filter_keys = self._allowed_filter_keys(config, table, set(columns))
         query = self._build_sql(
             table=table,
             columns=columns,
@@ -164,6 +167,7 @@ class SQLEngine(QueryEngine):
             order_dir=order_dir,
             limit=limit,
             offset=offset,
+            exact_filter_keys=exact_filter_keys,
         )
         return QueryResult(
             query=query,
@@ -470,7 +474,7 @@ class SQLEngine(QueryEngine):
         columns = [column for column in columns if column in allowed_columns] or list(allowed_columns)[:2] or ["id"]
         allowed_filter_keys = self._allowed_filter_keys(config, table, allowed_columns)
         filters = self._validate_filters(filters, allowed_filter_keys, notes)
-        self._coerce_filter_values(filters, config, table, notes)
+        self._coerce_filter_values(filters, config, table, notes, known_filter_keys=allowed_filter_keys)
 
         if order_by and order_by not in allowed_columns:
             notes.append(f"dropped invalid orderBy '{order_by}' for '{table}'")
@@ -540,15 +544,22 @@ class SQLEngine(QueryEngine):
         config: Any,
         table: str,
         notes: list[str],
+        known_filter_keys: set[str] | None = None,
     ) -> None:
         arg_types = config.introspection_query_args.get(table, {})
         for key, value in list(filters.items()):
             if key in {"and", "or", "not"} and isinstance(value, list):
                 for child in value:
                     if isinstance(child, dict):
-                        self._coerce_filter_values(child, config, table, notes)
+                        self._coerce_filter_values(
+                            child,
+                            config,
+                            table,
+                            notes,
+                            known_filter_keys=known_filter_keys,
+                        )
                 continue
-            base_key = self._base_filter_key(key)
+            base_key = self._base_filter_key(key, known_keys=known_filter_keys or set(arg_types.keys()))
             arg_type = arg_types.get(base_key)
             coerced = self._coerce_value(value, arg_type)
             enum_values = self._enum_values_for_type(arg_type, config) if arg_type else set()
@@ -562,7 +573,9 @@ class SQLEngine(QueryEngine):
             filters[key] = coerced
 
     @staticmethod
-    def _base_filter_key(key: str) -> str:
+    def _base_filter_key(key: str, known_keys: set[str] | None = None) -> str:
+        if known_keys and key in known_keys:
+            return key
         for suffix in ("_gte", "_lte", "_gt", "_lt", "_ne", "_in", "_nin"):
             if key.endswith(suffix):
                 return key[: -len(suffix)]
@@ -638,10 +651,11 @@ class SQLEngine(QueryEngine):
         order_dir: str | None,
         limit: int | None,
         offset: int | None,
+        exact_filter_keys: set[str] | None = None,
     ) -> str:
         select_columns = [f"{table}.{column}" for column in columns]
         join_sql: list[str] = []
-        where_parts = self._build_where_parts(filters, table)
+        where_parts = self._build_where_parts(filters, table, exact_filter_keys=exact_filter_keys)
 
         for join in joins:
             join_sql.append(f"LEFT JOIN {join.target} {join.alias} ON {join.on_clause}")
@@ -661,21 +675,35 @@ class SQLEngine(QueryEngine):
             sql += f" OFFSET {offset}"
         return sql + ";"
 
-    def _build_where_parts(self, filters: dict[str, Any], alias: str) -> list[str]:
+    def _build_where_parts(
+        self,
+        filters: dict[str, Any],
+        alias: str,
+        exact_filter_keys: set[str] | None = None,
+    ) -> list[str]:
         parts: list[str] = []
         for key, value in filters.items():
             if key in {"and", "or", "not"} and isinstance(value, list):
-                group_sql = self._build_group_expression(key, value, alias)
+                group_sql = self._build_group_expression(key, value, alias, exact_filter_keys=exact_filter_keys)
                 if group_sql:
                     parts.append(group_sql)
                 continue
-            parts.append(self._sql_condition(alias, key, value))
+            parts.append(self._sql_condition(alias, key, value, exact_filter_keys=exact_filter_keys))
         return parts
 
-    def _build_group_expression(self, key: str, nodes: list[dict[str, Any]], alias: str) -> str | None:
+    def _build_group_expression(
+        self,
+        key: str,
+        nodes: list[dict[str, Any]],
+        alias: str,
+        exact_filter_keys: set[str] | None = None,
+    ) -> str | None:
         expressions: list[str] = []
         for node in nodes:
-            atom = [self._sql_condition(alias, n_key, n_value) for n_key, n_value in node.items()]
+            atom = [
+                self._sql_condition(alias, n_key, n_value, exact_filter_keys=exact_filter_keys)
+                for n_key, n_value in node.items()
+            ]
             if atom:
                 expressions.append(" AND ".join(atom))
         if not expressions:
@@ -686,7 +714,17 @@ class SQLEngine(QueryEngine):
             return "NOT (" + " AND ".join(expressions) + ")"
         return "(" + " OR ".join(expressions) + ")"
 
-    def _sql_condition(self, alias: str, key: str, value: Any) -> str:
+    def _sql_condition(
+        self,
+        alias: str,
+        key: str,
+        value: Any,
+        exact_filter_keys: set[str] | None = None,
+    ) -> str:
+        if exact_filter_keys and key in exact_filter_keys:
+            if value is None:
+                return f"{alias}.{key} IS NULL"
+            return f"{alias}.{key} = {self._sql_literal(value)}"
         mapping = {
             "_gte": ">=",
             "_lte": "<=",
