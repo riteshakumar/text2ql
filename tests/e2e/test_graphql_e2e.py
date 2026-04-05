@@ -10,7 +10,7 @@ from text2ql.cli import main
 pytestmark = pytest.mark.e2e
 
 
-def test_text2ql_generate_with_schema_mapping_e2e() -> None:
+def test_graphql_generate_with_schema_mapping_e2e() -> None:
     service = Text2QL()
 
     result = service.generate(
@@ -30,14 +30,10 @@ def test_text2ql_generate_with_schema_mapping_e2e() -> None:
     assert result.metadata["entity"] == "customers"
 
 
-def test_text2ql_generate_unsupported_target_raises() -> None:
-    service = Text2QL()
-
-    with pytest.raises(ValueError, match="Unsupported target"):
-        service.generate("show customers", target="sql")
-
-
-def test_cli_main_supports_schema_and_mapping_files(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_graphql_cli_supports_schema_and_mapping_files(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     schema_path = tmp_path / "schema.json"
     mapping_path = tmp_path / "mapping.json"
 

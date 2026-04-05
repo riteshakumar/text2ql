@@ -57,7 +57,7 @@ def evaluate_examples(
         execution_mode = "structural"
         backend_error: str | None = None
         if execution_backend is None:
-            execution_match = graphql_execution_match(predicted, expected)
+            execution_match = structural_execution_match(example.target, predicted, expected)
         else:
             execution_mode = "backend"
             try:
@@ -135,6 +135,61 @@ def graphql_execution_match(predicted_query: str, expected_query: str) -> bool:
     pred = _parse_graphql_signature(predicted_query)
     exp = _parse_graphql_signature(expected_query)
     return pred == exp and pred is not None
+
+
+def structural_execution_match(target: str, predicted_query: str, expected_query: str) -> bool:
+    normalized_target = str(target).strip().lower()
+    if normalized_target == "sql":
+        return sql_execution_match(predicted_query, expected_query)
+    return graphql_execution_match(predicted_query, expected_query)
+
+
+def sql_execution_match(predicted_query: str, expected_query: str) -> bool:
+    pred = _parse_sql_signature(predicted_query)
+    exp = _parse_sql_signature(expected_query)
+    return pred == exp and pred is not None
+
+
+def _parse_sql_signature(
+    query: str,
+) -> tuple[str, tuple[str, ...], tuple[tuple[str, str], ...], tuple[str, ...]] | None:
+    table_match = re.search(r"\bfrom\s+([A-Za-z_]\w*)\b", query, re.I)
+    if not table_match:
+        return None
+    table = table_match.group(1).lower()
+
+    select_match = re.search(r"\bselect\s+(.*?)\s+\bfrom\b", query, re.I | re.S)
+    if not select_match:
+        return None
+    fields = tuple(
+        sorted(
+            _dedupe(
+                [segment.strip().lower() for segment in select_match.group(1).split(",") if segment.strip()]
+            )
+        )
+    )
+
+    where_match = re.search(r"\bwhere\s+(.*?)(?:\border by\b|\blimit\b|\boffset\b|;|$)", query, re.I | re.S)
+    filters: dict[str, str] = {}
+    if where_match:
+        for condition in re.split(r"\s+and\s+", where_match.group(1), flags=re.I):
+            condition = condition.strip()
+            if not condition:
+                continue
+            parts = re.split(r"\s*(>=|<=|!=|=|>|<|in|not in|is null|is not null)\s*", condition, maxsplit=1, flags=re.I)
+            if len(parts) >= 2:
+                key = parts[0].strip().lower()
+                op = parts[1].strip().lower()
+                value = parts[2].strip().lower() if len(parts) > 2 else ""
+                filters[f"{key} {op}"] = value
+
+    order_match = re.search(r"\border by\s+([A-Za-z_][\w.]*)\s*(asc|desc)?\b", query, re.I)
+    ordering: list[str] = []
+    if order_match:
+        direction = (order_match.group(2) or "asc").lower()
+        ordering.append(f"{order_match.group(1).lower()} {direction}")
+
+    return (table, fields, tuple(sorted(filters.items())), tuple(ordering))
 
 
 def _parse_graphql_signature(query: str) -> tuple[str, tuple[str, ...], tuple[tuple[str, str], ...]] | None:

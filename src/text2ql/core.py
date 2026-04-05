@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from text2ql.engines.graphql import GraphQLEngine
+from text2ql.engines.sql import SQLEngine
 from text2ql.providers.base import LLMProvider
 from text2ql.providers.rule_based import RuleBasedProvider
 from text2ql.types import QueryRequest, QueryResult
@@ -19,6 +20,7 @@ class Text2QL:
     def __post_init__(self) -> None:
         self._engines = {
             "graphql": GraphQLEngine(provider=self.provider),
+            "sql": SQLEngine(provider=self.provider),
         }
 
     def register_engine(self, name: str, engine: object) -> None:

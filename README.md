@@ -2,14 +2,15 @@
 
 Natural Language to Query Language framework.
 
-`text2ql` is designed as a **pip-installable package** for converting natural language into query languages with a plugin architecture. The first implemented target is **GraphQL**.
+`text2ql` is designed as a **pip-installable package** for converting natural language into query languages with a plugin architecture. 
 
 ## Project goals
 
 - Build a reusable core abstraction (`Text2QL`) for `text -> query` conversion.
-- Support multiple target query languages (GraphQL first; SQL/Cypher/SPARQL next).
+- Support multiple target query languages (GraphQL, SQL first; Cypher/SPARQL/JQ/Jsonata next).
 - Keep provider integrations optional (deterministic local mode, LLM mode as adapters).
-- Encourage benchmark/data generation workflows inspired by graph-centric datasets.
+- Provide a CLI for quick experimentation and batch evaluation.
+- Include dataset ingestion, synthetic variant generation, and evaluation hooks for benchmarking.
 
 ## Install
 
@@ -42,6 +43,167 @@ For local development and tests:
 
 ```bash
 pip install -e ".[dev]"
+```
+
+## Getting Started
+
+Install + verify:
+
+```bash
+pip install text2ql
+python -c "from text2ql import Text2QL; print(Text2QL().generate(text='list users').query)"
+text2ql --help
+```
+
+Four copy-paste starter commands:
+
+```bash
+# 1) GraphQL deterministic
+text2ql "show top 5 client records with mail state enabled" \
+  --target graphql \
+  --schema '{"entities":["customers"],"fields":["id","email","status"]}' \
+  --mapping '{"entities":{"client":"customers"},"fields":{"mail":"email"},"filters":{"state":"status"},"filter_values":{"status":{"enabled":"active"}}}'
+
+# 2) SQL deterministic
+text2ql "show customers highest total first 5 offset 10" \
+  --target sql \
+  --schema '{"entities":["customers"],"fields":{"customers":["id","total","status"]}}'
+
+# 3) LLM mode (GraphQL)
+export OPENAI_API_KEY=...
+text2ql "show latest 5 orders with status active" \
+  --target graphql \
+  --mode llm \
+  --schema '{"entities":["orders"],"fields":{"orders":["id","status","createdAt"]},"args":{"orders":["status","limit","orderBy","orderDirection"]}}'
+
+# 4) LLM mode (SQL)
+export OPENAI_API_KEY=...
+text2ql "show latest 5 orders with status active" \
+  --target sql \
+  --mode llm \
+  --schema '{"entities":["orders"],"fields":{"orders":["id","status","createdAt"]}}'
+```
+
+## Production Setup
+
+Recommended file layout:
+
+```text
+project/
+  schema.json
+  mapping.json
+  data.json
+  expected_query.graphql
+  expected_rows.json
+```
+
+Create minimal files:
+
+```bash
+cat > schema.json <<'JSON'
+{
+  "entities": ["positions"],
+  "fields": {"positions": ["symbol", "quantity", "status"]},
+  "args": {"positions": ["symbol", "status", "limit", "offset", "orderBy", "orderDirection"]}
+}
+JSON
+
+cat > mapping.json <<'JSON'
+{
+  "filters": {"ticker": "symbol"},
+  "filter_values": {"symbol": {"qqq": "QQQ"}}
+}
+JSON
+
+cat > data.json <<'JSON'
+{
+  "portfolio_data": {
+    "positions": [
+      {"symbol": "QQQ", "quantity": 100.104, "status": "active"},
+      {"symbol": "AAPL", "quantity": 12, "status": "active"}
+    ]
+  }
+}
+JSON
+```
+
+Run with synthetic variants + execution evaluation:
+
+```bash
+text2ql "how many qqq do i own" \
+  --target graphql \
+  --schema-file ./schema.json \
+  --mapping-file ./mapping.json \
+  --data-file ./data.json \
+  --variants-per-example 3 \
+  --rewrite-plugins generic,portfolio \
+  --domain portfolio \
+  --expected-execution-file ./expected_rows.json
+```
+
+Operational notes:
+
+- Set `OPENAI_API_KEY` (or `TEXT2QL_API_KEY`) for `--mode llm`.
+- `--expected-query` / `--expected-query-file` / `--expected-execution-file` require `--data-file`.
+- If expected query execution cannot be derived from payload JSON, CLI emits an eval warning and skips that item from accuracy denominator.
+
+## Feature Matrix
+
+| Capability | GraphQL | SQL |
+|---|---|---|
+| Deterministic generation | Yes | Yes |
+| LLM mode + constrained parsing | Yes | Yes |
+| Schema/introspection validation | Yes | Yes |
+| Enum/type coercion | Yes | Yes |
+| Advanced filters (`not`, `!=`, ranges, grouped precedence) | Yes | Yes |
+| Order parsing (`latest/highest/lowest`) | Yes | Yes |
+| Pagination (`limit`, `offset`, `first`, `after`) | Yes | Yes |
+| Nested/relation safety | Yes | Yes |
+| Structural execution match (no backend) | Yes | Yes |
+| Real backend execution accuracy hook | Yes | Yes (via `evaluate_examples(..., execution_backend=...)`) |
+| Synthetic rewrite plugins | Yes | Yes (target-agnostic dataset API) |
+
+## CLI-First Workflow
+
+1) Generate hybrid mapping from schema + data:
+
+```bash
+text2ql --generate-hybrid-mapping \
+  --schema-file ./schema.json \
+  --data-file ./data.json \
+  --mapping-output-file ./mapping.generated.json
+```
+
+2) Generate query (GraphQL):
+
+```bash
+text2ql "how many qqq do i own" \
+  --target graphql \
+  --schema-file ./schema.json \
+  --mapping-file ./mapping.generated.json
+```
+
+3) Generate query (SQL):
+
+```bash
+text2ql "show latest 5 positions by quantity" \
+  --target sql \
+  --schema-file ./schema.json \
+  --mapping-file ./mapping.generated.json
+```
+
+4) Batch prompt variants + execution eval in one CLI run:
+
+```bash
+text2ql "how many qqq do i own" \
+  --target graphql \
+  --schema-file ./schema.json \
+  --mapping-file ./mapping.generated.json \
+  --data-file ./data.json \
+  --variants-per-example 5 \
+  --rewrite-plugins generic,portfolio \
+  --domain portfolio \
+  --expected-query-file ./expected_query.graphql
 ```
 
 ## Quickstart
@@ -123,6 +285,14 @@ text2ql "show top 5 client records with mail state enabled" \
   --mapping '{"entities":{"client":"customers"},"fields":{"mail":"email"},"filters":{"state":"status"},"filter_values":{"status":{"enabled":"active"}}}'
 ```
 
+SQL target via CLI:
+
+```bash
+text2ql "show customers highest total first 5 offset 10" \
+  --target sql \
+  --schema '{"entities":["customers"],"fields":{"customers":["id","total","status"]}}'
+```
+
 You can also load JSON files:
 
 ```bash
@@ -143,6 +313,16 @@ text2ql "show top 3 clients with mail state enabled" \
   --llm-model gpt-4o-mini \
   --llm-max-retries 4 \
   --llm-retry-backoff 2.0
+```
+
+SQL in LLM mode:
+
+```bash
+export OPENAI_API_KEY=...
+text2ql "show latest 5 orders with status active" \
+  --target sql \
+  --mode llm \
+  --schema '{"entities":["orders"],"fields":{"orders":["id","status","createdAt"]}}'
 ```
 
 If you do not pass `--mode llm`, CLI runs deterministic mode.
@@ -299,6 +479,21 @@ Additional GraphQL intent support:
   - supply `schema["introspection"]` with `query` and `types`
   - engine validates generated entity/args/fields against introspection metadata
 
+## SQL support
+
+SQL engine supports deterministic generation with:
+
+- strict schema/table/column validation
+- sort/order parsing (`latest`, `highest`, `lowest`) -> `ORDER BY ... ASC|DESC`
+- pagination (`limit`, `offset`, `first`, `after`)
+- robust filter parsing:
+  - negation (`not`, `!=`, `is not`)
+  - comparative operators (`>`, `<`, `>=`, `<=`)
+  - ranges (`between`, date ranges)
+  - grouped precedence (`AND`/`OR` groups)
+- type coercion (`int`, `float`, `bool`, `null`, date-like literals, enums via introspection)
+- relation-safe joins from schema `relations` with local relation filter extraction
+
 ## Dataset + evaluation hooks
 
 ```python
@@ -433,7 +628,7 @@ Example `.jsonl` row:
 - `exact_match_accuracy`: normalized string match (whitespace-insensitive).
 - `execution_accuracy`:
   - with `execution_backend`: compares real backend execution outputs for predicted vs expected queries.
-  - without `execution_backend`: structural GraphQL signature match (entity + filters + selected fields).
+  - without `execution_backend`: structural signature match (`graphql` + `sql` supported).
 
 For precomputed gold execution output, set `example.metadata["expected_execution_result"]`.
 
@@ -489,6 +684,11 @@ python -m twine check dist/*
 
 ## Roadmap
 
-1. Add `SQL`, `Cypher`, `Jsonata`, `Jq` and `SPARQL` engines.
+1. Add `Cypher`, `Jsonata`, `Jq` and `SPARQL` engines.  
 2. Expand prompts and constraints per target language.
 3. Add richer synthetic generation using domain-specific rewrite plugins.
+4. Add execution evaluation hooks for real backends (e.g. GraphQL endpoint, SQL database).
+5. Add more provider adapters and support for provider-specific features (e.g. function calling).
+6. Add few-shot example support in LLM mode with dynamic example retrieval based on schema/mapping similarity.
+7. Add a playground interface for interactive experimentation and debugging.
+    

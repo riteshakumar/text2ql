@@ -15,8 +15,8 @@ def execute_query_result_on_json(
     if root_key and isinstance(payload, dict):
         root = payload.get(root_key, payload)
 
-    entity = str(result.metadata.get("entity", ""))
-    fields = [str(field) for field in result.metadata.get("fields", [])]
+    entity = str(result.metadata.get("entity") or result.metadata.get("table") or "")
+    fields = [str(field) for field in (result.metadata.get("fields") or result.metadata.get("columns") or [])]
     filters = result.metadata.get("filters", {})
     aggregations = result.metadata.get("aggregations", [])
     if not isinstance(filters, dict):
@@ -28,7 +28,8 @@ def execute_query_result_on_json(
     if not nodes:
         return [], f"Entity '{entity}' not found in payload."
 
-    limit = _coerce_limit(filters)
+    limit = _coerce_limit(filters, result.metadata)
+    offset = _coerce_offset(filters, result.metadata)
     rows: list[Any] = []
     for node in nodes:
         if isinstance(node, list):
@@ -40,6 +41,8 @@ def execute_query_result_on_json(
             continue
         rows.append(node)
 
+    if offset is not None:
+        rows = rows[offset:]
     if limit is not None:
         rows = rows[:limit]
     if not rows:
@@ -125,8 +128,26 @@ def _plural(entity: str) -> str:
     return entity if entity.endswith("s") else f"{entity}s"
 
 
-def _coerce_limit(filters: dict[str, Any]) -> int | None:
+def _coerce_limit(filters: dict[str, Any], metadata: dict[str, Any] | None = None) -> int | None:
     value = filters.get("limit")
+    if value is None:
+        value = filters.get("first")
+    if value is None:
+        value = (metadata or {}).get("limit")
+    if value is None:
+        return None
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_offset(filters: dict[str, Any], metadata: dict[str, Any] | None = None) -> int | None:
+    value = filters.get("offset")
+    if value is None:
+        value = filters.get("after")
+    if value is None:
+        value = (metadata or {}).get("offset")
     if value is None:
         return None
     try:
@@ -145,15 +166,17 @@ def _matches_filters(row: Any, filters: dict[str, Any]) -> bool:
     if not isinstance(row, dict):
         return True
     for key, expected in filters.items():
-        if key == "limit":
+        if key in {"limit", "offset", "first", "after", "orderBy", "orderDirection", "orderDir"}:
             continue
-        if key in {"and", "or"} and isinstance(expected, list):
+        if key in {"and", "or", "not"} and isinstance(expected, list):
             clauses = [item for item in expected if isinstance(item, dict)]
             if not clauses:
                 continue
             if key == "and" and not all(_matches_filters(row, clause) for clause in clauses):
                 return False
             if key == "or" and not any(_matches_filters(row, clause) for clause in clauses):
+                return False
+            if key == "not" and any(_matches_filters(row, clause) for clause in clauses):
                 return False
             continue
         if key.endswith("_gte"):
@@ -172,12 +195,38 @@ def _matches_filters(row: Any, filters: dict[str, Any]) -> bool:
             except (TypeError, ValueError):
                 return False
             continue
-        if key.endswith("_in") and isinstance(expected, list):
+        if key.endswith("_gt"):
             field = key[:-3]
-            if str(_lookup_field_value(row, field)) not in {str(item) for item in expected}:
+            try:
+                if float(_lookup_field_value(row, field)) <= float(expected):
+                    return False
+            except (TypeError, ValueError):
                 return False
             continue
-        if _lookup_field_value(row, key) != expected:
+        if key.endswith("_lt"):
+            field = key[:-3]
+            try:
+                if float(_lookup_field_value(row, field)) >= float(expected):
+                    return False
+            except (TypeError, ValueError):
+                return False
+            continue
+        if key.endswith("_ne"):
+            field = key[:-3]
+            if _stringify(_lookup_field_value(row, field)) == _stringify(expected):
+                return False
+            continue
+        if key.endswith("_in") and isinstance(expected, list):
+            field = key[:-3]
+            if _stringify(_lookup_field_value(row, field)) not in {_stringify(item) for item in expected}:
+                return False
+            continue
+        if key.endswith("_nin") and isinstance(expected, list):
+            field = key[:-4]
+            if _stringify(_lookup_field_value(row, field)) in {_stringify(item) for item in expected}:
+                return False
+            continue
+        if _stringify(_lookup_field_value(row, key)) != _stringify(expected):
             return False
     return True
 
@@ -193,3 +242,11 @@ def _lookup_field_value(row: Any, key: str) -> Any:
             if nested is not None:
                 return nested
     return None
+
+
+def _stringify(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    return str(value)

@@ -87,3 +87,36 @@ def test_llm_mode_falls_back_to_deterministic_on_unsupported_language() -> None:
 
     assert result.metadata["mode"] == "deterministic"
     assert "user" in result.query
+
+
+def test_sql_llm_mode_uses_provider_with_constrained_output() -> None:
+    service = Text2QL(
+        provider=StubProvider(
+            {
+                "table": "orders",
+                "columns": ["id", "status"],
+                "filters": {"status": "active"},
+                "joins": [],
+                "order_by": "createdAt",
+                "order_dir": "DESC",
+                "limit": 5,
+                "offset": 0,
+                "explanation": "Parsed SQL by adapter.",
+                "confidence": 0.91,
+            }
+        )
+    )
+
+    result = service.generate(
+        "show top 5 latest orders with status active",
+        target="sql",
+        schema={"entities": ["orders"], "fields": {"orders": ["id", "status", "createdAt"]}},
+        context={"mode": "llm", "language": "english"},
+    )
+
+    assert result.target == "sql"
+    assert "FROM orders" in result.query
+    assert "ORDER BY orders.createdAt DESC" in result.query
+    assert "LIMIT 5" in result.query
+    assert result.metadata["mode"] == "llm"
+    assert result.confidence == pytest.approx(0.91)

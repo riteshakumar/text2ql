@@ -11,6 +11,13 @@ ENGLISH_GRAPHQL_SYSTEM_PROMPT = (
     "explanation (string), confidence (number in [0,1])."
 )
 
+ENGLISH_SQL_SYSTEM_PROMPT = (
+    "You are a SQL intent extractor. Return only valid JSON with keys: "
+    "table (string), columns (array of strings), filters (object), joins (array), "
+    "order_by (string|null), order_dir (ASC|DESC|null), limit (number|null), "
+    "offset (number|null), explanation (string), confidence (number in [0,1])."
+)
+
 ENGLISH_GRAPHQL_USER_TEMPLATE = """Convert this request into GraphQL intent JSON.
 
 Request:
@@ -20,6 +27,24 @@ Available entities:
 {entities}
 
 Available fields:
+{fields}
+
+Field mapping aliases:
+{field_aliases}
+
+Filter mapping aliases:
+{filter_aliases}
+"""
+
+ENGLISH_SQL_USER_TEMPLATE = """Convert this request into SQL intent JSON.
+
+Request:
+{text}
+
+Available tables:
+{entities}
+
+Available columns:
 {fields}
 
 Field mapping aliases:
@@ -57,6 +82,28 @@ def build_graphql_prompts(
         # Future extension point once additional languages are introduced.
         raise ValueError(f"Unsupported prompt language '{language}'")
     return ENGLISH_GRAPHQL_SYSTEM_PROMPT, user_prompt
+
+
+def build_sql_prompts(
+    text: str,
+    config: NormalizedSchemaConfig,
+    template: str | None = None,
+    language: str = "english",
+) -> tuple[str, str]:
+    resolved_language = resolve_language(language)
+    entities = config.entities or ["users", "customers", "orders", "products", "items"]
+    fields = config.fields or ["id", "name", "createdAt", "status", "price", "amount"]
+    user_template = template or ENGLISH_SQL_USER_TEMPLATE
+    user_prompt = user_template.format(
+        text=text.strip(),
+        entities=json.dumps(entities),
+        fields=json.dumps(fields),
+        field_aliases=json.dumps(config.field_aliases),
+        filter_aliases=json.dumps(config.filter_key_aliases),
+    )
+    if resolved_language != "english":
+        raise ValueError(f"Unsupported prompt language '{language}'")
+    return ENGLISH_SQL_SYSTEM_PROMPT, user_prompt
 
 
 def resolve_prompt_template(context: dict[str, Any]) -> str | None:

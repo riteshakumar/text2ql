@@ -404,3 +404,20 @@ def test_ingest_dataset_rejects_non_object_example(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="must be an object"):
         ingest_dataset(dataset_path)
+
+
+def test_evaluate_examples_structural_execution_for_sql() -> None:
+    service = Text2QL()
+    examples = [
+        DatasetExample(
+            text="show customers highest total first 5",
+            target="sql",
+            expected_query="SELECT customers.total FROM customers ORDER BY customers.total DESC LIMIT 5;",
+            schema={"entities": ["customers"], "fields": {"customers": ["id", "total"]}},
+        )
+    ]
+
+    report = evaluate_examples(service, examples)
+
+    assert report.total == 1
+    assert report.execution_accuracy == pytest.approx(1.0)

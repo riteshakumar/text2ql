@@ -84,3 +84,33 @@ def test_execute_query_result_on_json_evaluates_count_aggregation() -> None:
 
     assert note == ""
     assert rows == [{"count": 2}]
+
+
+def test_execute_query_result_on_json_supports_sql_metadata_and_operators() -> None:
+    payload = {
+        "portfolio_data": {
+            "positions": [
+                {"symbol": "QQQ", "quantity": 100.104, "status": "active"},
+                {"symbol": "BAC", "quantity": 50.0, "status": "inactive"},
+                {"symbol": "AAPL", "quantity": 10.0, "status": "active"},
+            ]
+        }
+    }
+    result = QueryResult(
+        query="SELECT ...",
+        target="sql",
+        confidence=1.0,
+        explanation="",
+        metadata={
+            "table": "positions",
+            "columns": ["symbol", "quantity"],
+            "filters": {"quantity_gt": 20, "status_ne": "inactive"},
+            "limit": 1,
+            "offset": 0,
+        },
+    )
+
+    rows, note = execute_query_result_on_json(result, payload, root_key="portfolio_data")
+
+    assert note == ""
+    assert rows == [{"symbol": "QQQ", "quantity": 100.104}]
