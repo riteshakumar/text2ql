@@ -244,6 +244,96 @@ report = evaluate_examples(Text2QL(), synthetic)
 print(report.exact_match_accuracy, report.execution_accuracy)
 ```
 
+Execution accuracy against a real backend:
+
+```python
+from text2ql import Text2QL, evaluate_examples
+
+def backend_executor(query: str, example):
+    # Replace with your real backend call (GraphQL/SQL/etc).
+    # Return normalized execution payload (rows/object).
+    return run_query_against_backend(query)
+
+report = evaluate_examples(
+    Text2QL(),
+    examples,
+    execution_backend=backend_executor,
+)
+print(report.execution_accuracy)
+```
+
+Domain-aware synthetic rewrites via plugins:
+
+```python
+synthetic = generate_synthetic_examples(
+    examples,
+    variants_per_example=3,
+    rewrite_plugins=["generic", "portfolio"],
+    domain="portfolio",
+)
+```
+
+More domain examples:
+
+```python
+crm_synthetic = generate_synthetic_examples(
+    examples,
+    variants_per_example=3,
+    rewrite_plugins=["generic", "crm"],
+    domain="crm",
+)
+
+healthcare_synthetic = generate_synthetic_examples(
+    examples,
+    variants_per_example=3,
+    rewrite_plugins=["generic", "healthcare"],
+    domain="healthcare",
+)
+```
+
+Template slot generation and schema-aware lexicalization:
+
+```python
+seed = [DatasetExample(
+    text="show sales pipeline",
+    target="graphql",
+    expected_query="query GeneratedQuery { opportunities { amount } }",
+    schema={
+        "entities": ["opportunities"],
+        "fields": {"opportunities": ["amount", "createdAt", "stage"]},
+        "args": {"opportunities": ["stage"]},
+    },
+    mapping={"filter_values": {"stage": {"open": "Open"}}},
+)]
+
+synthetic = generate_synthetic_examples(
+    seed,
+    variants_per_example=4,
+    rewrite_plugins=["generic", "crm"],
+    domain="crm",
+)
+```
+
+Generation behavior:
+
+- Uses per-domain slot templates filled from schema/mapping (`entity`, `metric`, `date`, `filter`, `value`).
+- Applies schema-aware lexicalization so synthetic prompts prefer schema/mapping terms.
+- Scores candidates (`source`, `confidence`, `novelty`) and keeps highest-scoring variants first.
+- Adds metadata on each synthetic example:
+  - `synthetic_rewrite_source`
+  - `synthetic_rewrite_confidence`
+  - `synthetic_rewrite_novelty`
+  - `synthetic_rewrite_score`
+
+Built-in rewrite plugins:
+
+- `generic`: neutral paraphrases (`show`/`list`, `top`/`first`, etc.).
+- `portfolio`: holdings/asset phrasing rewrites (`how many qqq do i own` -> quantity/share variants).
+- `banking`: account and money-flow paraphrases (`balance`, `transfer`, `deposit`, `withdraw`, `statement`).
+- `crm`: sales workflow paraphrases (`leads`, `opportunities`, `pipeline`, `contacts`, `deals`).
+- `healthcare`: clinical data paraphrases (`patients`, `encounters`, `diagnosis`, `medications`, `labs`, `claims`).
+- `ecommerce`: shopping/order paraphrases (`orders`, `products`, `cart`, `inventory`, `refund`, `shipment`).
+
 ### Dataset format
 
 Supported file types:
@@ -273,9 +363,11 @@ Example `.jsonl` row:
 ### Evaluation metrics
 
 - `exact_match_accuracy`: normalized string match (whitespace-insensitive).
-- `execution_accuracy`: structural GraphQL signature match (entity + filters + selected fields).
+- `execution_accuracy`:
+  - with `execution_backend`: compares real backend execution outputs for predicted vs expected queries.
+  - without `execution_backend`: structural GraphQL signature match (entity + filters + selected fields).
 
-Current execution accuracy is a static structural approximation, not live backend execution.
+For precomputed gold execution output, set `example.metadata["expected_execution_result"]`.
 
 ## Troubleshooting
 
@@ -332,5 +424,3 @@ python -m twine check dist/*
 1. Add `SQL`, `Cypher`, `Jsonata`, `Jq` and `SPARQL` engines.
 2. Expand prompts and constraints per target language.
 3. Add richer synthetic generation using domain-specific rewrite plugins.
-4. Add execution accuracy against real backends.
-5. Publish package to PyPI and add CI release workflow.

@@ -368,6 +368,11 @@ class GraphQLEngine(QueryEngine):
                     )
                 )
                 filters[identifier_key] = mapped_value
+                # Guard against spurious lexical extraction like `quantity: "of"`
+                # from prompts such as "what quantity of QQQ do I own".
+                for quantity_key in self._quantity_field_candidates():
+                    if filters.get(quantity_key) == "of":
+                        del filters[quantity_key]
 
     def _apply_advanced_filters(self, filters: dict[str, Any], lowered: str) -> None:
         range_filters = self._detect_between_filters(lowered)
@@ -442,6 +447,12 @@ class GraphQLEngine(QueryEngine):
 
     @staticmethod
     def _detect_owned_asset(lowered: str) -> str | None:
+        match = re.search(r"\bwhat quantity of\s+([a-z0-9_]+)\s+do i own\b", lowered)
+        if match is not None:
+            return match.group(1)
+        match = re.search(r"\bquantity of\s+([a-z0-9_]+)\s+do i own\b", lowered)
+        if match is not None:
+            return match.group(1)
         match = re.search(r"\bhow many\s+([a-z0-9_]+)\s+do i own\b", lowered)
         if match is not None:
             return match.group(1)
