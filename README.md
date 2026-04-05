@@ -156,6 +156,51 @@ Language support:
 - `english` (default)
 - `en` (alias)
 
+## Nested GraphQL + schema validation
+
+You can define relation-aware schema config for nested query generation and strict validation.
+
+Example:
+
+```python
+result = service.generate(
+    text="show customers with latest order total",
+    target="graphql",
+    schema={
+        "entities": ["customers"],
+        "fields": {"customers": ["id", "email"]},
+        "args": {"customers": ["limit", "status"]},
+        "relations": {
+            "customers": {
+                "orders": {
+                    "target": "orders",
+                    "fields": ["id", "total", "createdAt"],
+                    "args": ["limit"],
+                    "aliases": ["order"]
+                }
+            }
+        }
+    },
+)
+```
+
+Behavior:
+
+- Detects nested intents (e.g. `latest order total`) and emits nested selections.
+- Validates entity, fields, and args against schema before returning query.
+- Drops invalid fields/args and records notes in `result.metadata["validation_notes"]`.
+
+Additional GraphQL intent support:
+
+- Aggregations: `count`, `sum`, `avg`, `min`, `max`
+- Advanced filters:
+  - range: `price between 10 and 20` -> `price_gte`, `price_lte`
+  - in-list: `category in retail, wholesale` -> `category_in`
+  - grouped filters: `AND`/`OR` groups
+- Post-generation introspection validation:
+  - supply `schema["introspection"]` with `query` and `types`
+  - engine validates generated entity/args/fields against introspection metadata
+
 ## Dataset + evaluation hooks
 
 ```python

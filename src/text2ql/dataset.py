@@ -60,7 +60,7 @@ def generate_synthetic_examples(
                         "Return a concise quality note for synthetic query generation.",
                         json.dumps(hook_payload),
                     )
-                except Exception:
+                except (RuntimeError, ValueError, TypeError):
                     # Hook is optional and should never block generation.
                     pass
     return synthetic
