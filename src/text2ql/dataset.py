@@ -207,34 +207,22 @@ def _collect_rewrite_candidates(
         except Exception:  # noqa: BLE001
             continue
         for candidate in outputs:
-            cleaned = candidate.strip()
-            if not cleaned or cleaned in seen:
-                continue
-            if allowed_lexicon and not _is_schema_lexically_valid(cleaned, allowed_lexicon):
-                continue
-            seen.add(cleaned)
-            ordered.append(
-                _RewriteCandidate(
-                    text=cleaned,
-                    source=plugin_name,
-                    confidence=_source_confidence(plugin_name),
-                )
+            _append_candidate(
+                ordered=ordered,
+                seen=seen,
+                text=candidate,
+                source=plugin_name,
+                allowed_lexicon=allowed_lexicon,
             )
 
     for template in _domain_template_rewrites(example, domain):
-        cleaned = template.strip()
-        if not cleaned or cleaned in seen:
-            continue
-        if allowed_lexicon and not _is_schema_lexically_valid(cleaned, allowed_lexicon):
-            continue
-        seen.add(cleaned)
         source_name = f"{domain}-template" if domain else "template"
-        ordered.append(
-            _RewriteCandidate(
-                text=cleaned,
-                source=source_name,
-                confidence=_source_confidence(source_name),
-            )
+        _append_candidate(
+            ordered=ordered,
+            seen=seen,
+            text=template,
+            source=source_name,
+            allowed_lexicon=allowed_lexicon,
         )
 
     seed_text = example.text.strip() or example.text
@@ -247,6 +235,28 @@ def _collect_rewrite_candidates(
             )
         )
     return ordered or [_RewriteCandidate(text=example.text, source="seed", confidence=0.35)]
+
+
+def _append_candidate(
+    ordered: list[_RewriteCandidate],
+    seen: set[str],
+    text: str,
+    source: str,
+    allowed_lexicon: set[str],
+) -> None:
+    cleaned = text.strip()
+    if not cleaned or cleaned in seen:
+        return
+    if allowed_lexicon and not _is_schema_lexically_valid(cleaned, allowed_lexicon):
+        return
+    seen.add(cleaned)
+    ordered.append(
+        _RewriteCandidate(
+            text=cleaned,
+            source=source,
+            confidence=_source_confidence(source),
+        )
+    )
 
 
 def _rank_candidates(seed_text: str, candidates: list[_RewriteCandidate]) -> list[_RewriteCandidate]:
@@ -445,20 +455,17 @@ def _extract_fields(schema: dict[str, Any] | None) -> list[str]:
     if not isinstance(schema, dict):
         return []
     fields_raw = schema.get("fields")
-    out: list[str] = []
     if isinstance(fields_raw, dict):
-        for values in fields_raw.values():
-            if isinstance(values, list):
-                out.extend([item for item in values if isinstance(item, str)])
-    elif isinstance(fields_raw, list):
-        for item in fields_raw:
-            if isinstance(item, str):
-                out.append(item)
-            elif isinstance(item, dict):
-                name = item.get("name")
-                if isinstance(name, str):
-                    out.append(name)
-    return out
+        return [
+            item
+            for values in fields_raw.values()
+            if isinstance(values, list)
+            for item in values
+            if isinstance(item, str)
+        ]
+    if isinstance(fields_raw, list):
+        return _extract_named_or_string_list(fields_raw)
+    return []
 
 
 def _extract_args(schema: dict[str, Any] | None) -> list[str]:
@@ -480,13 +487,7 @@ def _extract_filter_values(mapping: dict[str, Any] | None) -> list[str]:
         return []
     candidates: list[str] = []
     for key in ("filter_values", "filter_value_aliases"):
-        blob = mapping.get(key)
-        if isinstance(blob, dict):
-            for nested in blob.values():
-                if isinstance(nested, dict):
-                    for value in nested.values():
-                        if isinstance(value, str):
-                            candidates.append(value)
+        candidates.extend(_extract_nested_str_values(mapping.get(key)))
     return candidates
 
 
@@ -503,77 +504,43 @@ def _dedupe_preserve_order(items: list[str]) -> list[str]:
 
 def _infer_example_domain(example: DatasetExample) -> str | None:
     lowered_text = example.text.lower()
-    if any(token in lowered_text for token in ("portfolio", "positions", "holdings", "symbol", "account")):
-        return "portfolio"
-    if any(
-        token in lowered_text
-        for token in (
-            "balance",
-            "transfer",
-            "deposit",
-            "withdraw",
-            "statement",
-            "checking",
-            "savings",
-            "transactions",
-        )
-    ):
-        return "banking"
-    if any(
-        token in lowered_text
-        for token in (
-            "lead",
-            "opportunity",
-            "pipeline",
-            "contact",
-            "deal",
-            "account executive",
-            "sales stage",
-            "crm",
-        )
-    ):
-        return "crm"
-    if any(
-        token in lowered_text
-        for token in (
-            "patient",
-            "encounter",
-            "diagnosis",
-            "medication",
-            "lab",
-            "claim",
-            "provider",
-            "healthcare",
-            "clinical",
-        )
-    ):
-        return "healthcare"
-    if any(
-        token in lowered_text
-        for token in (
-            "order",
-            "cart",
-            "checkout",
-            "product",
-            "sku",
-            "inventory",
-            "refund",
-            "shipment",
-        )
-    ):
-        return "ecommerce"
+    text_domain = _match_domain_by_keywords(lowered_text, _DOMAIN_TEXT_HINTS)
+    if text_domain is not None:
+        return text_domain
     if isinstance(example.schema, dict):
         schema_blob = json.dumps(example.schema, sort_keys=True).lower()
-        if any(token in schema_blob for token in ("positions", "transactions", "acct", "portfolio")):
-            return "portfolio"
-        if any(token in schema_blob for token in ("balance", "transfer", "deposit", "checking", "savings")):
-            return "banking"
-        if any(token in schema_blob for token in ("leads", "opportunities", "pipeline", "contacts", "crm")):
-            return "crm"
-        if any(token in schema_blob for token in ("patients", "encounters", "medications", "labs", "claims")):
-            return "healthcare"
-        if any(token in schema_blob for token in ("orders", "products", "cart", "inventory", "shipments")):
-            return "ecommerce"
+        return _match_domain_by_keywords(schema_blob, _DOMAIN_SCHEMA_HINTS)
+    return None
+
+
+def _extract_named_or_string_list(items: list[Any]) -> list[str]:
+    out: list[str] = []
+    for item in items:
+        if isinstance(item, str):
+            out.append(item)
+            continue
+        if isinstance(item, dict):
+            name = item.get("name")
+            if isinstance(name, str):
+                out.append(name)
+    return out
+
+
+def _extract_nested_str_values(value: Any) -> list[str]:
+    if not isinstance(value, dict):
+        return []
+    out: list[str] = []
+    for nested in value.values():
+        if not isinstance(nested, dict):
+            continue
+        out.extend(str_value for str_value in nested.values() if isinstance(str_value, str))
+    return out
+
+
+def _match_domain_by_keywords(content: str, domain_hints: dict[str, tuple[str, ...]]) -> str | None:
+    for domain, hints in domain_hints.items():
+        if any(token in content for token in hints):
+            return domain
     return None
 
 
@@ -798,6 +765,22 @@ _FILTER_HINTS = (
     "segment",
     "priority",
 )
+
+_DOMAIN_TEXT_HINTS: dict[str, tuple[str, ...]] = {
+    "portfolio": ("portfolio", "positions", "holdings", "symbol", "account"),
+    "banking": ("balance", "transfer", "deposit", "withdraw", "statement", "checking", "savings", "transactions"),
+    "crm": ("lead", "opportunity", "pipeline", "contact", "deal", "account executive", "sales stage", "crm"),
+    "healthcare": ("patient", "encounter", "diagnosis", "medication", "lab", "claim", "provider", "healthcare", "clinical"),
+    "ecommerce": ("order", "cart", "checkout", "product", "sku", "inventory", "refund", "shipment"),
+}
+
+_DOMAIN_SCHEMA_HINTS: dict[str, tuple[str, ...]] = {
+    "portfolio": ("positions", "transactions", "acct", "portfolio"),
+    "banking": ("balance", "transfer", "deposit", "checking", "savings"),
+    "crm": ("leads", "opportunities", "pipeline", "contacts", "crm"),
+    "healthcare": ("patients", "encounters", "medications", "labs", "claims"),
+    "ecommerce": ("orders", "products", "cart", "inventory", "shipments"),
+}
 
 _DOMAIN_SLOT_HINTS: dict[str, tuple[str, ...]] = {
     "portfolio": ("position", "holding", "symbol", "account", "market", "quantity"),

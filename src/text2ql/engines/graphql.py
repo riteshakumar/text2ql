@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from textwrap import dedent
 from typing import Any
 
@@ -15,6 +16,12 @@ from text2ql.schema_config import (
 from text2ql.types import QueryRequest, QueryResult
 
 from .base import QueryEngine
+
+_WORD_IDENTIFIER = r"([A-Za-z_]\w*)"
+_FILTER_VALUE = r"([\w.:-]+)"
+_AND_TOKEN = " and "
+_ISO_DATE = r"\d{4}-\d{2}-\d{2}"
+_DATE_RANGE_PATTERN = rf"\b{_WORD_IDENTIFIER}\s+from\s+({_ISO_DATE})\s+to\s+({_ISO_DATE})\b"
 
 
 class GraphQLEngine(QueryEngine):
@@ -404,20 +411,20 @@ class GraphQLEngine(QueryEngine):
     def _detect_comparison_filters(self, lowered: str) -> dict[str, Any]:
         filters: dict[str, Any] = {}
         symbolic_patterns = [
-            (r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*>=\s*([a-zA-Z0-9_.:-]+)\b", "_gte"),
-            (r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*<=\s*([a-zA-Z0-9_.:-]+)\b", "_lte"),
-            (r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*>\s*([a-zA-Z0-9_.:-]+)\b", "_gt"),
-            (r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*<\s*([a-zA-Z0-9_.:-]+)\b", "_lt"),
+            (rf"\b{_WORD_IDENTIFIER}\s*>=\s*{_FILTER_VALUE}\b", "_gte"),
+            (rf"\b{_WORD_IDENTIFIER}\s*<=\s*{_FILTER_VALUE}\b", "_lte"),
+            (rf"\b{_WORD_IDENTIFIER}\s*>\s*{_FILTER_VALUE}\b", "_gt"),
+            (rf"\b{_WORD_IDENTIFIER}\s*<\s*{_FILTER_VALUE}\b", "_lt"),
         ]
         for pattern, suffix in symbolic_patterns:
             for match in re.finditer(pattern, lowered):
                 filters[f"{match.group(1)}{suffix}"] = match.group(2)
 
         lexical_patterns = [
-            (r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s+greater than\s+([a-zA-Z0-9_.:-]+)\b", "_gt"),
-            (r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s+less than\s+([a-zA-Z0-9_.:-]+)\b", "_lt"),
-            (r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s+after\s+([a-zA-Z0-9_.:-]+)\b", "_gt"),
-            (r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s+before\s+([a-zA-Z0-9_.:-]+)\b", "_lt"),
+            (rf"\b{_WORD_IDENTIFIER}\s+greater than\s+{_FILTER_VALUE}\b", "_gt"),
+            (rf"\b{_WORD_IDENTIFIER}\s+less than\s+{_FILTER_VALUE}\b", "_lt"),
+            (rf"\b{_WORD_IDENTIFIER}\s+after\s+{_FILTER_VALUE}\b", "_gt"),
+            (rf"\b{_WORD_IDENTIFIER}\s+before\s+{_FILTER_VALUE}\b", "_lt"),
         ]
         for pattern, suffix in lexical_patterns:
             for match in re.finditer(pattern, lowered):
@@ -427,7 +434,7 @@ class GraphQLEngine(QueryEngine):
     def _detect_negation_filters(self, lowered: str) -> dict[str, Any]:
         filters: dict[str, Any] = {}
         for match in re.finditer(
-            r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:!=|is not|not)\s*([a-zA-Z0-9_.:-]+)\b",
+            rf"\b{_WORD_IDENTIFIER}\s*(?:!=|is not|not)\s*{_FILTER_VALUE}\b",
             lowered,
         ):
             filters[f"{match.group(1)}_ne"] = match.group(2)
@@ -436,7 +443,7 @@ class GraphQLEngine(QueryEngine):
     def _detect_date_range_filters(self, lowered: str) -> dict[str, Any]:
         filters: dict[str, Any] = {}
         for match in re.finditer(
-            r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s+from\s+([0-9]{4}-[0-9]{2}-[0-9]{2})\s+to\s+([0-9]{4}-[0-9]{2}-[0-9]{2})\b",
+            _DATE_RANGE_PATTERN,
             lowered,
         ):
             field = match.group(1)
@@ -454,11 +461,11 @@ class GraphQLEngine(QueryEngine):
             filters["orderDirection"] = "DESC"
             if "limit" not in existing_filters and "first" not in existing_filters:
                 filters["limit"] = "1"
-        highest = re.search(r"\bhighest\s+([a-zA-Z_][a-zA-Z0-9_]*)\b", lowered)
+        highest = re.search(rf"\bhighest\s+{_WORD_IDENTIFIER}\b", lowered)
         if highest:
             filters["orderBy"] = highest.group(1)
             filters["orderDirection"] = "DESC"
-        lowest = re.search(r"\blowest\s+([a-zA-Z_][a-zA-Z0-9_]*)\b", lowered)
+        lowest = re.search(rf"\blowest\s+{_WORD_IDENTIFIER}\b", lowered)
         if lowest:
             filters["orderBy"] = lowest.group(1)
             filters["orderDirection"] = "ASC"
@@ -516,13 +523,13 @@ class GraphQLEngine(QueryEngine):
             return {}
         if " or " in lowered:
             return {"or": simple_conditions}
-        if " and " in lowered:
+        if _AND_TOKEN in lowered:
             return {"and": simple_conditions}
         return {}
 
     def _parse_grouped_precedence_filters(self, lowered: str) -> dict[str, Any]:
         # Parse OR groups first, then AND within each OR branch.
-        if " or " not in lowered and " and " not in lowered:
+        if " or " not in lowered and _AND_TOKEN not in lowered:
             return {}
         where_clause = self._extract_where_clause(lowered) or lowered
         or_parts = [part.strip() for part in where_clause.split(" or ") if part.strip()]
@@ -543,7 +550,7 @@ class GraphQLEngine(QueryEngine):
 
     def _parse_and_conditions(self, text: str) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
-        for part in [segment.strip() for segment in text.split(" and ") if segment.strip()]:
+        for part in [segment.strip() for segment in text.split(_AND_TOKEN) if segment.strip()]:
             if part.startswith("where "):
                 part = part[6:].strip()
             condition = self._parse_atomic_filter_condition(part)
@@ -553,9 +560,9 @@ class GraphQLEngine(QueryEngine):
 
     def _parse_atomic_filter_condition(self, text: str) -> dict[str, Any] | None:
         for pattern, suffix in [
-            (r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*(>=|<=|>|<)\s*([a-zA-Z0-9_.:-]+)$", None),
-            (r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:!=|is not|not)\s*([a-zA-Z0-9_.:-]+)$", "_ne"),
-            (r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:is\s+)?([a-zA-Z0-9_.:-]+)$", ""),
+            (rf"^{_WORD_IDENTIFIER}\s*(>=|<=|>|<)\s*{_FILTER_VALUE}$", None),
+            (rf"^{_WORD_IDENTIFIER}\s*(?:!=|is not|not)\s*{_FILTER_VALUE}$", "_ne"),
+            (rf"^{_WORD_IDENTIFIER}\s*(?:is\s+)?{_FILTER_VALUE}$", ""),
         ]:
             match = re.match(pattern, text)
             if not match:
@@ -579,7 +586,7 @@ class GraphQLEngine(QueryEngine):
     @staticmethod
     def _extract_filter_value(alias: str, text: str) -> str | None:
         key_pattern = re.escape(alias)
-        matches = list(re.finditer(rf"\b{key_pattern}\b\s+(?:is\s+)?([a-zA-Z0-9_]+)", text))
+        matches = list(re.finditer(rf"\b{key_pattern}\b\s+(?:is\s+)?(\w+)", text))
         if not matches:
             return None
         return matches[-1].group(1)
@@ -1219,23 +1226,37 @@ class GraphQLEngine(QueryEngine):
         notes: list[str],
     ) -> None:
         for key, value in list(filters.items()):
-            if key in {"and", "or", "not"} and isinstance(value, list):
-                compact_children: list[dict[str, Any]] = []
-                for child in value:
-                    if isinstance(child, dict):
-                        self._coerce_and_validate_filter_values(child, entity, config, notes)
-                        if child:
-                            compact_children.append(child)
-                if compact_children:
-                    filters[key] = compact_children
-                else:
-                    filters.pop(key, None)
+            if self._coerce_group_filter_value(filters, key, value, entity, config, notes):
                 continue
             coerced = self._coerce_filter_value(entity, key, value, config, notes)
             if coerced is None and value is not None and not self._is_explicit_null_literal(value):
                 filters.pop(key, None)
             else:
                 filters[key] = coerced
+
+    def _coerce_group_filter_value(
+        self,
+        filters: dict[str, Any],
+        key: str,
+        value: Any,
+        entity: str,
+        config: NormalizedSchemaConfig,
+        notes: list[str],
+    ) -> bool:
+        if key not in {"and", "or", "not"} or not isinstance(value, list):
+            return False
+        compact_children: list[dict[str, Any]] = []
+        for child in value:
+            if not isinstance(child, dict):
+                continue
+            self._coerce_and_validate_filter_values(child, entity, config, notes)
+            if child:
+                compact_children.append(child)
+        if compact_children:
+            filters[key] = compact_children
+        else:
+            filters.pop(key, None)
+        return True
 
     @staticmethod
     def _is_explicit_null_literal(value: Any) -> bool:
@@ -1294,11 +1315,25 @@ class GraphQLEngine(QueryEngine):
             return int(raw)
         if re.fullmatch(r"-?\d+\.\d+", raw):
             return float(raw)
-        if re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:[tT]\d{2}:\d{2}(?::\d{2})?(?:z|[+\-]\d{2}:\d{2})?)?", raw):
+        if GraphQLEngine._is_iso_date_or_datetime(raw):
             return raw
         if arg_type and "enum" in arg_type.lower():
             return raw.upper()
         return raw
+
+    @staticmethod
+    def _is_iso_date_or_datetime(raw: str) -> bool:
+        try:
+            datetime.strptime(raw, "%Y-%m-%d")
+            return True
+        except ValueError:
+            pass
+        datetime_raw = raw.replace("Z", "+00:00").replace("z", "+00:00")
+        try:
+            datetime.fromisoformat(datetime_raw)
+            return True
+        except ValueError:
+            return False
 
     @staticmethod
     def _enum_values_for_type(arg_type: str, config: NormalizedSchemaConfig) -> set[str]:

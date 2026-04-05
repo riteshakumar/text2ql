@@ -178,28 +178,64 @@ def main() -> None:
     schema = _load_json_object(args.schema, args.schema_file)
     mapping = _load_json_object(args.mapping, args.mapping_file)
     service = Text2QL(provider=_build_provider(args))
+    prompts, metadata, use_synthetic = _build_prompts_and_metadata(args, schema, mapping)
+    expected_query, expected_execution, execution_eval_enabled, execution_data_payload = _load_execution_eval_inputs(
+        args
+    )
+    results, execution_matches, execution_total = _generate_result_payloads(
+        args=args,
+        service=service,
+        schema=schema,
+        mapping=mapping,
+        prompts=prompts,
+        metadata=metadata,
+        execution_eval_enabled=execution_eval_enabled,
+        execution_data_payload=execution_data_payload,
+        expected_query=expected_query,
+        expected_execution=expected_execution,
+    )
+
+    if len(results) == 1 and not use_synthetic and not execution_eval_enabled:
+        print(results[0]["query"])
+        return
+
+    summary = {
+        "total_prompts": len(results),
+        "execution_matches": execution_matches,
+        "execution_total": execution_total,
+        "execution_accuracy": (execution_matches / execution_total) if execution_total else 0.0,
+    }
+    print(json.dumps({"results": results, "summary": summary}, indent=2))
+
+
+def _build_prompts_and_metadata(
+    args: argparse.Namespace,
+    schema: dict[str, Any] | None,
+    mapping: dict[str, Any] | None,
+) -> tuple[list[str], list[dict[str, Any]], bool]:
     plugins = [token.strip() for token in args.rewrite_plugins.split(",") if token.strip()]
     use_synthetic = bool(plugins or args.domain or max(1, args.variants_per_example) > 1)
+    if not use_synthetic:
+        return [args.text], [{}], False
+    seed = DatasetExample(
+        text=args.text,
+        target=args.target,
+        expected_query="",
+        schema=schema,
+        mapping=mapping,
+    )
+    synthetic = generate_synthetic_examples(
+        [seed],
+        variants_per_example=max(1, args.variants_per_example),
+        rewrite_plugins=plugins or None,
+        domain=args.domain or None,
+    )
+    return [example.text for example in synthetic], [example.metadata for example in synthetic], True
 
-    prompts = [args.text]
-    metadata: list[dict[str, Any]] = [{}]
-    if use_synthetic:
-        seed = DatasetExample(
-            text=args.text,
-            target=args.target,
-            expected_query="",
-            schema=schema,
-            mapping=mapping,
-        )
-        synthetic = generate_synthetic_examples(
-            [seed],
-            variants_per_example=max(1, args.variants_per_example),
-            rewrite_plugins=plugins or None,
-            domain=args.domain or None,
-        )
-        prompts = [example.text for example in synthetic]
-        metadata = [example.metadata for example in synthetic]
 
+def _load_execution_eval_inputs(
+    args: argparse.Namespace,
+) -> tuple[str, Any, bool, dict[str, Any] | None]:
     expected_query = args.expected_query.strip()
     if args.expected_query_file:
         expected_query = Path(args.expected_query_file).read_text(encoding="utf-8").strip()
@@ -208,7 +244,21 @@ def main() -> None:
         expected_execution = json.loads(Path(args.expected_execution_file).read_text(encoding="utf-8"))
     execution_eval_enabled = bool(expected_query or args.expected_execution_file)
     execution_data_payload = _read_json_file(args.data_file) if args.data_file else None
+    return expected_query, expected_execution, execution_eval_enabled, execution_data_payload
 
+
+def _generate_result_payloads(
+    args: argparse.Namespace,
+    service: Text2QL,
+    schema: dict[str, Any] | None,
+    mapping: dict[str, Any] | None,
+    prompts: list[str],
+    metadata: list[dict[str, Any]],
+    execution_eval_enabled: bool,
+    execution_data_payload: dict[str, Any] | None,
+    expected_query: str,
+    expected_execution: Any,
+) -> tuple[list[dict[str, Any]], int, int]:
     results: list[dict[str, Any]] = []
     execution_matches = 0
     execution_total = 0
@@ -226,48 +276,53 @@ def main() -> None:
         )
         payload: dict[str, Any] = {"prompt": prompt, "query": result.query, "metadata": metadata[idx]}
         if execution_eval_enabled:
-            if execution_data_payload is None:
-                payload["execution_eval_warning"] = (
-                    "execution evaluation requires --data-file JSON payload"
-                )
-                results.append(payload)
-                continue
-            rows, note = execute_query_result_on_json(result, execution_data_payload, root_key="portfolio_data")
-            payload["execution_rows"] = rows
-            payload["execution_note"] = note
-            expected_rows = expected_execution
-            expected_note = None
-            if expected_rows is None and expected_query:
-                expected_result = QueryResult(
-                    query=expected_query,
-                    target=args.target,
-                    confidence=1.0,
-                    explanation="expected query",
-                )
-                expected_rows, expected_note = execute_query_result_on_json(
-                    expected_result, execution_data_payload, root_key="portfolio_data"
-                )
-            if expected_note:
-                payload["execution_eval_warning"] = expected_note
-            else:
-                match = _stable_json(rows) == _stable_json(expected_rows)
-                payload["execution_match"] = match
+            _apply_execution_evaluation(
+                payload=payload,
+                result=result,
+                target=args.target,
+                execution_data_payload=execution_data_payload,
+                expected_query=expected_query,
+                expected_execution=expected_execution,
+            )
+            if "execution_match" in payload:
                 execution_total += 1
-                if match:
+                if payload["execution_match"]:
                     execution_matches += 1
         results.append(payload)
+    return results, execution_matches, execution_total
 
-    if len(results) == 1 and not use_synthetic and not execution_eval_enabled:
-        print(results[0]["query"])
+
+def _apply_execution_evaluation(
+    payload: dict[str, Any],
+    result: QueryResult,
+    target: str,
+    execution_data_payload: dict[str, Any] | None,
+    expected_query: str,
+    expected_execution: Any,
+) -> None:
+    if execution_data_payload is None:
+        payload["execution_eval_warning"] = "execution evaluation requires --data-file JSON payload"
         return
+    rows, note = execute_query_result_on_json(result, execution_data_payload, root_key="portfolio_data")
+    payload["execution_rows"] = rows
+    payload["execution_note"] = note
 
-    summary = {
-        "total_prompts": len(results),
-        "execution_matches": execution_matches,
-        "execution_total": execution_total,
-        "execution_accuracy": (execution_matches / execution_total) if execution_total else 0.0,
-    }
-    print(json.dumps({"results": results, "summary": summary}, indent=2))
+    expected_rows = expected_execution
+    expected_note = None
+    if expected_rows is None and expected_query:
+        expected_result = QueryResult(
+            query=expected_query,
+            target=target,
+            confidence=1.0,
+            explanation="expected query",
+        )
+        expected_rows, expected_note = execute_query_result_on_json(
+            expected_result, execution_data_payload, root_key="portfolio_data"
+        )
+    if expected_note:
+        payload["execution_eval_warning"] = expected_note
+        return
+    payload["execution_match"] = _stable_json(rows) == _stable_json(expected_rows)
 
 
 def _build_hybrid_mapping_from_args(args: argparse.Namespace) -> dict[str, Any]:
