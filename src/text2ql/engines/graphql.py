@@ -249,7 +249,7 @@ class GraphQLEngine(QueryEngine):
         filters: dict[str, Any] = {}
         lowered = text.lower()
         where_clause = self._extract_where_clause(lowered)
-        if "most recent" in lowered or "latest" in lowered:
+        if "most recent" in lowered:
             filters["limit"] = "1"
 
         limit_match = re.search(r"(?:top|first|limit)\s+(\d+)", lowered)
