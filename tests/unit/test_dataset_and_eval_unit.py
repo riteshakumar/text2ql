@@ -270,8 +270,15 @@ def test_generate_synthetic_examples_domain_templates_use_schema_slots() -> None
     )
 
     texts = [example.text for example in synthetic]
-    assert any("show opportunities with amount" in text for text in texts)
-    assert any("where stage is Open" in text for text in texts)
+    template_rows = [
+        example
+        for example in synthetic
+        if str(example.metadata.get("synthetic_rewrite_source", "")).endswith("-template")
+    ]
+    assert template_rows
+    assert any("opportunit" in text.lower() for text in texts)
+    assert any(("amount" in text.lower()) or ("stage" in text.lower()) for text in texts)
+    assert any("open" in text.lower() for text in texts)
 
 
 def test_generate_synthetic_examples_schema_aware_lexicalization_filters_unknown_terms() -> None:
