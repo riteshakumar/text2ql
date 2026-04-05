@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "text2ql"
-version = "0.1.1"
+version = "0.1.2"
 description = "Natural language to any query language, starting with GraphQL"
 readme = "README.md"
 requires-python = ">=3.10"
