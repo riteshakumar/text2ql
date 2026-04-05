@@ -306,6 +306,15 @@ class GraphQLEngine(QueryEngine):
         limit_match = re.search(r"(?:top|first|limit)\s+(\d+)", lowered)
         if limit_match:
             filters["limit"] = limit_match.group(1)
+        offset_match = re.search(r"(?:offset|skip)\s+(\d+)", lowered)
+        if offset_match:
+            filters["offset"] = offset_match.group(1)
+        first_match = re.search(r"\bfirst\s+(\d+)\b", lowered)
+        if first_match:
+            filters["first"] = first_match.group(1)
+        after_match = re.search(r"\bafter\s+([a-zA-Z0-9_\-]+)\b", lowered)
+        if after_match:
+            filters["after"] = after_match.group(1)
         return filters
 
     def _apply_alias_key_filters(
@@ -377,12 +386,90 @@ class GraphQLEngine(QueryEngine):
     def _apply_advanced_filters(self, filters: dict[str, Any], lowered: str) -> None:
         range_filters = self._detect_between_filters(lowered)
         in_filters = self._detect_in_filters(lowered)
+        comparison_filters = self._detect_comparison_filters(lowered)
+        negation_filters = self._detect_negation_filters(lowered)
+        date_range_filters = self._detect_date_range_filters(lowered)
+        ordering_filters = self._detect_ordering_filters(lowered, filters)
         grouped_filters = self._detect_grouped_filters(lowered, range_filters, in_filters)
 
         filters.update(range_filters)
         filters.update(in_filters)
+        filters.update(comparison_filters)
+        filters.update(negation_filters)
+        filters.update(date_range_filters)
+        filters.update(ordering_filters)
         if grouped_filters:
             filters.update(grouped_filters)
+
+    def _detect_comparison_filters(self, lowered: str) -> dict[str, Any]:
+        filters: dict[str, Any] = {}
+        symbolic_patterns = [
+            (r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*>=\s*([a-zA-Z0-9_.:-]+)\b", "_gte"),
+            (r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*<=\s*([a-zA-Z0-9_.:-]+)\b", "_lte"),
+            (r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*>\s*([a-zA-Z0-9_.:-]+)\b", "_gt"),
+            (r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*<\s*([a-zA-Z0-9_.:-]+)\b", "_lt"),
+        ]
+        for pattern, suffix in symbolic_patterns:
+            for match in re.finditer(pattern, lowered):
+                filters[f"{match.group(1)}{suffix}"] = match.group(2)
+
+        lexical_patterns = [
+            (r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s+greater than\s+([a-zA-Z0-9_.:-]+)\b", "_gt"),
+            (r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s+less than\s+([a-zA-Z0-9_.:-]+)\b", "_lt"),
+            (r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s+after\s+([a-zA-Z0-9_.:-]+)\b", "_gt"),
+            (r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s+before\s+([a-zA-Z0-9_.:-]+)\b", "_lt"),
+        ]
+        for pattern, suffix in lexical_patterns:
+            for match in re.finditer(pattern, lowered):
+                filters[f"{match.group(1)}{suffix}"] = match.group(2)
+        return filters
+
+    def _detect_negation_filters(self, lowered: str) -> dict[str, Any]:
+        filters: dict[str, Any] = {}
+        for match in re.finditer(
+            r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:!=|is not|not)\s*([a-zA-Z0-9_.:-]+)\b",
+            lowered,
+        ):
+            filters[f"{match.group(1)}_ne"] = match.group(2)
+        return filters
+
+    def _detect_date_range_filters(self, lowered: str) -> dict[str, Any]:
+        filters: dict[str, Any] = {}
+        for match in re.finditer(
+            r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s+from\s+([0-9]{4}-[0-9]{2}-[0-9]{2})\s+to\s+([0-9]{4}-[0-9]{2}-[0-9]{2})\b",
+            lowered,
+        ):
+            field = match.group(1)
+            filters[f"{field}_gte"] = match.group(2)
+            filters[f"{field}_lte"] = match.group(3)
+        return filters
+
+    def _detect_ordering_filters(self, lowered: str, existing_filters: dict[str, Any]) -> dict[str, Any]:
+        filters: dict[str, Any] = {}
+        if "latest order" in lowered:
+            return filters
+        if any(token in lowered for token in ("latest", "newest", "most recent")):
+            order_field = self._detect_order_field(lowered)
+            filters["orderBy"] = order_field
+            filters["orderDirection"] = "DESC"
+            if "limit" not in existing_filters and "first" not in existing_filters:
+                filters["limit"] = "1"
+        highest = re.search(r"\bhighest\s+([a-zA-Z_][a-zA-Z0-9_]*)\b", lowered)
+        if highest:
+            filters["orderBy"] = highest.group(1)
+            filters["orderDirection"] = "DESC"
+        lowest = re.search(r"\blowest\s+([a-zA-Z_][a-zA-Z0-9_]*)\b", lowered)
+        if lowest:
+            filters["orderBy"] = lowest.group(1)
+            filters["orderDirection"] = "ASC"
+        return filters
+
+    @staticmethod
+    def _detect_order_field(lowered: str) -> str:
+        for candidate in ("createdAt", "updatedAt", "date", "timestamp", "asOfDate", "asOfDateTime"):
+            if candidate.lower() in lowered:
+                return candidate
+        return "createdAt"
 
     def _detect_between_filters(self, lowered: str) -> dict[str, Any]:
         filters: dict[str, Any] = {}
@@ -414,6 +501,9 @@ class GraphQLEngine(QueryEngine):
         range_filters: dict[str, Any],
         in_filters: dict[str, Any],
     ) -> dict[str, Any]:
+        precedence_group = self._parse_grouped_precedence_filters(lowered)
+        if precedence_group:
+            return precedence_group
         simple_conditions: list[dict[str, Any]] = []
         for key, value in {**range_filters, **in_filters}.items():
             simple_conditions.append({key: value})
@@ -429,6 +519,55 @@ class GraphQLEngine(QueryEngine):
         if " and " in lowered:
             return {"and": simple_conditions}
         return {}
+
+    def _parse_grouped_precedence_filters(self, lowered: str) -> dict[str, Any]:
+        # Parse OR groups first, then AND within each OR branch.
+        if " or " not in lowered and " and " not in lowered:
+            return {}
+        where_clause = self._extract_where_clause(lowered) or lowered
+        or_parts = [part.strip() for part in where_clause.split(" or ") if part.strip()]
+        if len(or_parts) <= 1:
+            and_conditions = self._parse_and_conditions(where_clause)
+            return {"and": and_conditions} if len(and_conditions) > 1 else {}
+
+        or_group: list[dict[str, Any]] = []
+        for part in or_parts:
+            and_conditions = self._parse_and_conditions(part)
+            if not and_conditions:
+                continue
+            if len(and_conditions) == 1:
+                or_group.append(and_conditions[0])
+            else:
+                or_group.append({"and": and_conditions})
+        return {"or": or_group} if len(or_group) > 1 else {}
+
+    def _parse_and_conditions(self, text: str) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for part in [segment.strip() for segment in text.split(" and ") if segment.strip()]:
+            if part.startswith("where "):
+                part = part[6:].strip()
+            condition = self._parse_atomic_filter_condition(part)
+            if condition:
+                out.append(condition)
+        return out
+
+    def _parse_atomic_filter_condition(self, text: str) -> dict[str, Any] | None:
+        for pattern, suffix in [
+            (r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*(>=|<=|>|<)\s*([a-zA-Z0-9_.:-]+)$", None),
+            (r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:!=|is not|not)\s*([a-zA-Z0-9_.:-]+)$", "_ne"),
+            (r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:is\s+)?([a-zA-Z0-9_.:-]+)$", ""),
+        ]:
+            match = re.match(pattern, text)
+            if not match:
+                continue
+            if suffix is None:
+                field, operator, value = match.group(1), match.group(2), match.group(3)
+                op_suffix = {">=": "_gte", "<=": "_lte", ">": "_gt", "<": "_lt"}[operator]
+                return {f"{field}{op_suffix}": value}
+            if suffix == "_ne":
+                return {f"{match.group(1)}_ne": match.group(2)}
+            return {match.group(1): match.group(2)}
+        return None
 
     @staticmethod
     def _extract_where_clause(lowered: str) -> str | None:
@@ -754,6 +893,7 @@ class GraphQLEngine(QueryEngine):
             relation_filters: dict[str, str] = {}
             if "latest" in lowered and "limit" in relation.args:
                 relation_filters["limit"] = "1"
+            relation_filters.update(self._detect_relation_local_filters(lowered, relation))
 
             nested.append(
                 {
@@ -764,6 +904,31 @@ class GraphQLEngine(QueryEngine):
                 }
             )
         return nested
+
+    def _detect_relation_local_filters(
+        self,
+        lowered: str,
+        relation: NormalizedRelation,
+    ) -> dict[str, str]:
+        if not relation.args:
+            return {}
+        # Capture only local mentions near relation aliases to avoid parent-child leakage.
+        aliases = [relation.name, relation.target, *relation.aliases]
+        windows: list[str] = []
+        for alias in aliases:
+            pattern = rf"\b{re.escape(alias.lower())}\b(.{{0,80}})"
+            for match in re.finditer(pattern, lowered):
+                windows.append(match.group(1))
+        if not windows:
+            return {}
+
+        local_filters: dict[str, str] = {}
+        for window in windows:
+            for arg in relation.args:
+                value = self._extract_filter_value(alias=arg, text=window)
+                if value is not None:
+                    local_filters[arg] = value
+        return local_filters
 
     def _build_query(
         self,
@@ -825,6 +990,8 @@ class GraphQLEngine(QueryEngine):
 
     @staticmethod
     def _format_arg(value: Any) -> str:
+        if value is None:
+            return "null"
         if isinstance(value, bool):
             return "true" if value else "false"
         if isinstance(value, (int, float)):
@@ -890,6 +1057,7 @@ class GraphQLEngine(QueryEngine):
             filters=filters,
             allowed_args=allowed_args,
             entity=validated_entity,
+            config=config,
             notes=notes,
         )
         validated_aggregations = self._validate_aggregations(
@@ -977,11 +1145,13 @@ class GraphQLEngine(QueryEngine):
         filters: dict[str, Any],
         allowed_args: list[str],
         entity: str,
+        config: NormalizedSchemaConfig,
         notes: list[str],
     ) -> dict[str, Any]:
         validated_filters = dict(filters)
         self._drop_invalid_filter_keys(validated_filters, allowed_args, entity, notes)
         self._validate_grouped_filters(validated_filters, allowed_args, notes)
+        self._coerce_and_validate_filter_values(validated_filters, entity, config, notes)
         return validated_filters
 
     def _drop_invalid_filter_keys(
@@ -993,11 +1163,25 @@ class GraphQLEngine(QueryEngine):
     ) -> None:
         if not allowed_args:
             return
-        invalid_keys = [key for key in filters if key not in allowed_args and key not in {"and", "or"}]
+        invalid_keys = [
+            key
+            for key in filters
+            if not self._is_allowed_filter_key(key, allowed_args) and key not in {"and", "or", "not"}
+        ]
         for key in invalid_keys:
             filters.pop(key, None)
         if invalid_keys:
             notes.append(f"dropped invalid args for '{entity}': {invalid_keys}")
+
+    @staticmethod
+    def _is_allowed_filter_key(key: str, allowed_args: list[str]) -> bool:
+        if key in allowed_args:
+            return True
+        suffixes = ("_gte", "_lte", "_gt", "_lt", "_in", "_nin", "_ne")
+        for suffix in suffixes:
+            if key.endswith(suffix) and key[: -len(suffix)] in allowed_args:
+                return True
+        return False
 
     def _validate_grouped_filters(
         self,
@@ -1005,7 +1189,7 @@ class GraphQLEngine(QueryEngine):
         allowed_args: list[str],
         notes: list[str],
     ) -> None:
-        for group_key in {"and", "or"}:
+        for group_key in {"and", "or", "not"}:
             group_conditions = filters.get(group_key)
             if not isinstance(group_conditions, list):
                 continue
@@ -1014,7 +1198,10 @@ class GraphQLEngine(QueryEngine):
                 if not isinstance(condition, dict):
                     continue
                 filtered_condition = {
-                    key: value for key, value in condition.items() if not allowed_args or key in allowed_args
+                    key: value
+                    for key, value in condition.items()
+                    if (not allowed_args or self._is_allowed_filter_key(key, allowed_args))
+                    or key in {"and", "or", "not"}
                 }
                 if filtered_condition:
                     valid_group_conditions.append(filtered_condition)
@@ -1023,6 +1210,100 @@ class GraphQLEngine(QueryEngine):
                 continue
             filters.pop(group_key, None)
             notes.append(f"dropped empty '{group_key}' group after arg validation")
+
+    def _coerce_and_validate_filter_values(
+        self,
+        filters: dict[str, Any],
+        entity: str,
+        config: NormalizedSchemaConfig,
+        notes: list[str],
+    ) -> None:
+        for key, value in list(filters.items()):
+            if key in {"and", "or", "not"} and isinstance(value, list):
+                compact_children: list[dict[str, Any]] = []
+                for child in value:
+                    if isinstance(child, dict):
+                        self._coerce_and_validate_filter_values(child, entity, config, notes)
+                        if child:
+                            compact_children.append(child)
+                if compact_children:
+                    filters[key] = compact_children
+                else:
+                    filters.pop(key, None)
+                continue
+            coerced = self._coerce_filter_value(entity, key, value, config, notes)
+            if coerced is None and value is not None and not self._is_explicit_null_literal(value):
+                filters.pop(key, None)
+            else:
+                filters[key] = coerced
+
+    @staticmethod
+    def _is_explicit_null_literal(value: Any) -> bool:
+        return isinstance(value, str) and value.strip().lower() == "null"
+
+    def _coerce_filter_value(
+        self,
+        entity: str,
+        key: str,
+        value: Any,
+        config: NormalizedSchemaConfig,
+        notes: list[str],
+    ) -> Any:
+        base_key = self._base_filter_key(key)
+        arg_types = config.introspection_query_args.get(entity, {})
+        arg_type = arg_types.get(base_key)
+        if isinstance(value, list):
+            out: list[Any] = []
+            for item in value:
+                coerced = self._coerce_scalar_value(item, arg_type)
+                if coerced is not None:
+                    out.append(coerced)
+            return out
+        coerced_scalar = self._coerce_scalar_value(value, arg_type)
+        if arg_type:
+            enum_values = self._enum_values_for_type(arg_type, config)
+            if enum_values and isinstance(coerced_scalar, str):
+                canonical = next(
+                    (value for value in enum_values if value.lower() == coerced_scalar.lower()),
+                    None,
+                )
+                if canonical is None:
+                    notes.append(f"dropped invalid enum value '{coerced_scalar}' for '{base_key}'")
+                    return None
+                coerced_scalar = canonical
+        return coerced_scalar
+
+    @staticmethod
+    def _base_filter_key(key: str) -> str:
+        for suffix in ("_gte", "_lte", "_gt", "_lt", "_in", "_nin", "_ne"):
+            if key.endswith(suffix):
+                return key[: -len(suffix)]
+        return key
+
+    @staticmethod
+    def _coerce_scalar_value(value: Any, arg_type: str | None) -> Any:
+        if not isinstance(value, str):
+            return value
+        raw = value.strip()
+        lowered = raw.lower()
+        if lowered == "null":
+            return None
+        if lowered in {"true", "false"}:
+            return lowered == "true"
+        if re.fullmatch(r"-?\d+", raw):
+            return int(raw)
+        if re.fullmatch(r"-?\d+\.\d+", raw):
+            return float(raw)
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:[tT]\d{2}:\d{2}(?::\d{2})?(?:z|[+\-]\d{2}:\d{2})?)?", raw):
+            return raw
+        if arg_type and "enum" in arg_type.lower():
+            return raw.upper()
+        return raw
+
+    @staticmethod
+    def _enum_values_for_type(arg_type: str, config: NormalizedSchemaConfig) -> set[str]:
+        cleaned = arg_type.replace("[", "").replace("]", "").replace("!", "").strip()
+        return config.introspection_enum_values.get(cleaned, set())
 
     def _validate_aggregations(
         self,
@@ -1125,7 +1406,19 @@ class GraphQLEngine(QueryEngine):
 
     @staticmethod
     def _order_filters(filters: dict[str, Any]) -> list[tuple[str, Any]]:
-        preferred_order = {"limit": 0, "status": 1}
+        preferred_order = {
+            "limit": 0,
+            "offset": 1,
+            "first": 2,
+            "after": 3,
+            "orderBy": 4,
+            "orderDirection": 5,
+            "orderDir": 6,
+            "status": 10,
+            "and": 90,
+            "or": 91,
+            "not": 92,
+        }
         return sorted(
             filters.items(),
             key=lambda kv: (preferred_order.get(kv[0], 100), kv[0]),

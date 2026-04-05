@@ -27,6 +27,7 @@ class NormalizedSchemaConfig:
     introspection_query_args: dict[str, dict[str, str]] = field(default_factory=dict)
     introspection_entity_fields: dict[str, set[str]] = field(default_factory=dict)
     introspection_relation_targets: dict[str, dict[str, str]] = field(default_factory=dict)
+    introspection_enum_values: dict[str, set[str]] = field(default_factory=dict)
     default_entity: str | None = None
     default_fields: list[str] = field(default_factory=list)
 
@@ -48,12 +49,13 @@ def normalize_schema_config(
     config.field_aliases.update(field_aliases)
     config.args_by_entity = _parse_args(schema.get("args"))
     config.relations_by_entity = _parse_relations(schema.get("relations"))
-    intro_query_args, intro_fields, intro_relation_targets = _parse_introspection(
+    intro_query_args, intro_fields, intro_relation_targets, intro_enum_values = _parse_introspection(
         schema.get("introspection")
     )
     config.introspection_query_args = intro_query_args
     config.introspection_entity_fields = intro_fields
     config.introspection_relation_targets = intro_relation_targets
+    config.introspection_enum_values = intro_enum_values
 
     default_entity = schema.get("default_entity")
     if isinstance(default_entity, str) and default_entity.strip():
@@ -174,17 +176,25 @@ def _parse_relations(
 
 def _parse_introspection(
     payload: Any,
-) -> tuple[dict[str, dict[str, str]], dict[str, set[str]], dict[str, dict[str, str]]]:
+) -> tuple[
+    dict[str, dict[str, str]],
+    dict[str, set[str]],
+    dict[str, dict[str, str]],
+    dict[str, set[str]],
+]:
     query_args: dict[str, dict[str, str]] = {}
     entity_fields: dict[str, set[str]] = {}
     relation_targets: dict[str, dict[str, str]] = {}
+    enum_values: dict[str, set[str]] = {}
     if not isinstance(payload, dict):
-        return query_args, entity_fields, relation_targets
+        return query_args, entity_fields, relation_targets, enum_values
 
     query_payload = payload.get("query")
     types_payload = payload.get("types")
     if not isinstance(query_payload, dict) or not isinstance(types_payload, dict):
-        return query_args, entity_fields, relation_targets
+        return query_args, entity_fields, relation_targets, enum_values
+
+    enum_values = _extract_enum_values(types_payload)
 
     for entity, spec in query_payload.items():
         _parse_introspection_query_entry(
@@ -196,7 +206,7 @@ def _parse_introspection(
             relation_targets=relation_targets,
         )
 
-    return query_args, entity_fields, relation_targets
+    return query_args, entity_fields, relation_targets, enum_values
 
 
 def _clean_graphql_type_name(raw_type: Any) -> str | None:
@@ -490,8 +500,41 @@ def _first_dict(value: Any) -> dict[str, Any] | None:
 def _build_generic_args(fields_by_entity: dict[str, list[str]]) -> dict[str, list[str]]:
     args_by_entity: dict[str, list[str]] = {}
     for entity, fields in fields_by_entity.items():
-        args = {"limit", "status"}
+        args = {"limit", "offset", "first", "after", "status", "orderBy", "orderDirection", "orderDir"}
         for field in fields:
-            args.update({field, f"{field}_gte", f"{field}_lte", f"{field}_in"})
+            args.update(
+                {
+                    field,
+                    f"{field}_gte",
+                    f"{field}_lte",
+                    f"{field}_gt",
+                    f"{field}_lt",
+                    f"{field}_ne",
+                    f"{field}_in",
+                    f"{field}_nin",
+                }
+            )
         args_by_entity[entity] = sorted(args)
     return args_by_entity
+
+
+def _extract_enum_values(types_payload: dict[str, Any]) -> dict[str, set[str]]:
+    out: dict[str, set[str]] = {}
+    for type_name, type_spec in types_payload.items():
+        if not isinstance(type_name, str) or not isinstance(type_spec, dict):
+            continue
+        values_payload = type_spec.get("enumValues", type_spec.get("values"))
+        if not isinstance(values_payload, list):
+            continue
+        values: set[str] = set()
+        for item in values_payload:
+            if isinstance(item, str):
+                values.add(item)
+                continue
+            if isinstance(item, dict):
+                name = item.get("name")
+                if isinstance(name, str):
+                    values.add(name)
+        if values:
+            out[type_name] = values
+    return out

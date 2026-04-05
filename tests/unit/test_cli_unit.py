@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from text2ql.cli import _build_hybrid_mapping_from_args, _load_json_object
+from text2ql.cli import _build_hybrid_mapping_from_args, _load_json_object, build_parser
 
 pytestmark = pytest.mark.unit
 
@@ -73,3 +73,29 @@ def test_build_hybrid_mapping_from_args_requires_data_file() -> None:
 
     with pytest.raises(ValueError, match="--data-file"):
         _build_hybrid_mapping_from_args(args)
+
+
+def test_cli_parser_exposes_synthetic_and_execution_eval_flags() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(
+        [
+            "list users",
+            "--variants-per-example",
+            "3",
+            "--rewrite-plugins",
+            "generic,crm",
+            "--domain",
+            "crm",
+            "--expected-query-file",
+            "expected.graphql",
+            "--expected-execution-file",
+            "expected.json",
+        ]
+    )
+
+    assert args.variants_per_example == 3
+    assert args.rewrite_plugins == "generic,crm"
+    assert args.domain == "crm"
+    assert args.expected_query_file == "expected.graphql"
+    assert args.expected_execution_file == "expected.json"

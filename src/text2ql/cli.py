@@ -6,11 +6,14 @@ from pathlib import Path
 from typing import Any
 
 from text2ql.core import Text2QL
+from text2ql.dataset import DatasetExample, generate_synthetic_examples
+from text2ql.json_execution import execute_query_result_on_json
 from text2ql.mapping import generate_hybrid_mapping
 from text2ql.providers.base import LLMProvider
 from text2ql.providers.openai_compatible import OpenAICompatibleProvider
 from text2ql.providers.rule_based import RuleBasedProvider
 from text2ql.schema_config import infer_schema_from_json_payload
+from text2ql.types import QueryResult
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -106,6 +109,37 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Output path for generated hybrid mapping JSON.",
     )
+    parser.add_argument(
+        "--variants-per-example",
+        type=int,
+        default=1,
+        help="Synthetic variants per prompt when using rewrite plugins/domain.",
+    )
+    parser.add_argument(
+        "--rewrite-plugins",
+        default="",
+        help="Comma-separated rewrite plugins (e.g. generic,portfolio).",
+    )
+    parser.add_argument(
+        "--domain",
+        default="",
+        help="Optional domain hint for synthetic rewrites.",
+    )
+    parser.add_argument(
+        "--expected-query",
+        default="",
+        help="Expected query for execution-match evaluation.",
+    )
+    parser.add_argument(
+        "--expected-query-file",
+        default="",
+        help="Path to expected query file for execution-match evaluation.",
+    )
+    parser.add_argument(
+        "--expected-execution-file",
+        default="",
+        help="Path to expected execution JSON payload (rows/object).",
+    )
     return parser
 
 
@@ -144,19 +178,96 @@ def main() -> None:
     schema = _load_json_object(args.schema, args.schema_file)
     mapping = _load_json_object(args.mapping, args.mapping_file)
     service = Text2QL(provider=_build_provider(args))
-    result = service.generate(
-        text=args.text,
-        target=args.target,
-        schema=schema,
-        mapping=mapping,
-        context={
-            "mode": args.mode,
-            "language": args.language,
-            "system_context": args.system_context,
-        },
-    )
+    plugins = [token.strip() for token in args.rewrite_plugins.split(",") if token.strip()]
+    use_synthetic = bool(plugins or args.domain or max(1, args.variants_per_example) > 1)
 
-    print(result.query)
+    prompts = [args.text]
+    metadata: list[dict[str, Any]] = [{}]
+    if use_synthetic:
+        seed = DatasetExample(
+            text=args.text,
+            target=args.target,
+            expected_query="",
+            schema=schema,
+            mapping=mapping,
+        )
+        synthetic = generate_synthetic_examples(
+            [seed],
+            variants_per_example=max(1, args.variants_per_example),
+            rewrite_plugins=plugins or None,
+            domain=args.domain or None,
+        )
+        prompts = [example.text for example in synthetic]
+        metadata = [example.metadata for example in synthetic]
+
+    expected_query = args.expected_query.strip()
+    if args.expected_query_file:
+        expected_query = Path(args.expected_query_file).read_text(encoding="utf-8").strip()
+    expected_execution = None
+    if args.expected_execution_file:
+        expected_execution = json.loads(Path(args.expected_execution_file).read_text(encoding="utf-8"))
+    execution_eval_enabled = bool(expected_query or args.expected_execution_file)
+    execution_data_payload = _read_json_file(args.data_file) if args.data_file else None
+
+    results: list[dict[str, Any]] = []
+    execution_matches = 0
+    execution_total = 0
+    for idx, prompt in enumerate(prompts):
+        result = service.generate(
+            text=prompt,
+            target=args.target,
+            schema=schema,
+            mapping=mapping,
+            context={
+                "mode": args.mode,
+                "language": args.language,
+                "system_context": args.system_context,
+            },
+        )
+        payload: dict[str, Any] = {"prompt": prompt, "query": result.query, "metadata": metadata[idx]}
+        if execution_eval_enabled:
+            if execution_data_payload is None:
+                payload["execution_eval_warning"] = (
+                    "execution evaluation requires --data-file JSON payload"
+                )
+                results.append(payload)
+                continue
+            rows, note = execute_query_result_on_json(result, execution_data_payload, root_key="portfolio_data")
+            payload["execution_rows"] = rows
+            payload["execution_note"] = note
+            expected_rows = expected_execution
+            expected_note = None
+            if expected_rows is None and expected_query:
+                expected_result = QueryResult(
+                    query=expected_query,
+                    target=args.target,
+                    confidence=1.0,
+                    explanation="expected query",
+                )
+                expected_rows, expected_note = execute_query_result_on_json(
+                    expected_result, execution_data_payload, root_key="portfolio_data"
+                )
+            if expected_note:
+                payload["execution_eval_warning"] = expected_note
+            else:
+                match = _stable_json(rows) == _stable_json(expected_rows)
+                payload["execution_match"] = match
+                execution_total += 1
+                if match:
+                    execution_matches += 1
+        results.append(payload)
+
+    if len(results) == 1 and not use_synthetic and not execution_eval_enabled:
+        print(results[0]["query"])
+        return
+
+    summary = {
+        "total_prompts": len(results),
+        "execution_matches": execution_matches,
+        "execution_total": execution_total,
+        "execution_accuracy": (execution_matches / execution_total) if execution_total else 0.0,
+    }
+    print(json.dumps({"results": results, "summary": summary}, indent=2))
 
 
 def _build_hybrid_mapping_from_args(args: argparse.Namespace) -> dict[str, Any]:
@@ -197,6 +308,10 @@ def _build_provider(args: argparse.Namespace) -> LLMProvider:
         max_retries=args.llm_max_retries,
         retry_backoff_seconds=args.llm_retry_backoff,
     )
+
+
+def _stable_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
 
 
 if __name__ == "__main__":

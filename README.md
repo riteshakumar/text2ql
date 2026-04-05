@@ -13,11 +13,24 @@ Natural Language to Query Language framework.
 
 ## Install
 
+Python requirement: `>=3.10`.
+
+### Pip Users
+
 Install from PyPI:
 
 ```bash
 pip install text2ql
 ```
+
+Quick smoke test:
+
+```bash
+python -c "from text2ql import Text2QL; print(Text2QL().generate(text='list users').query)"
+text2ql --help
+```
+
+### Repo / Development Users
 
 Install from source (editable):
 
@@ -134,6 +147,59 @@ text2ql "show top 3 clients with mail state enabled" \
 
 If you do not pass `--mode llm`, CLI runs deterministic mode.
 `--system-context` is consumed in LLM mode and ignored in deterministic mode.
+
+CLI parity for synthetic variants + execution evaluation:
+
+```bash
+text2ql "how many qqq do i own" \
+  --schema-file ./schema.json \
+  --mapping-file ./mapping.json \
+  --data-file ./portfolio.json \
+  --variants-per-example 3 \
+  --rewrite-plugins generic,portfolio \
+  --domain portfolio \
+  --expected-query-file ./expected.graphql
+```
+
+Execution-eval notes:
+
+- `--expected-query` / `--expected-query-file` / `--expected-execution-file` require `--data-file`.
+- `--data-file` should be the execution payload JSON used for query evaluation.
+- If expected query execution cannot be derived from the payload, CLI reports an eval warning and skips that sample from accuracy denominator.
+
+Minimal file-based CLI example:
+
+```bash
+cat > schema.json <<'JSON'
+{
+  "entities": ["positions"],
+  "fields": {"positions": ["symbol", "quantity"]},
+  "args": {"positions": ["symbol", "limit", "orderBy", "orderDirection"]}
+}
+JSON
+
+cat > mapping.json <<'JSON'
+{
+  "filters": {"ticker": "symbol"},
+  "filter_values": {"symbol": {"qqq": "QQQ"}}
+}
+JSON
+
+cat > data.json <<'JSON'
+{
+  "portfolio_data": {
+    "positions": [
+      {"symbol": "QQQ", "quantity": 100.104},
+      {"symbol": "AAPL", "quantity": 12}
+    ]
+  }
+}
+JSON
+
+text2ql "how many qqq do i own" \
+  --schema-file ./schema.json \
+  --mapping-file ./mapping.json
+```
 
 ## Prompt templates
 
@@ -294,6 +360,8 @@ healthcare_synthetic = generate_synthetic_examples(
 Template slot generation and schema-aware lexicalization:
 
 ```python
+from text2ql.dataset import DatasetExample
+
 seed = [DatasetExample(
     text="show sales pipeline",
     target="graphql",

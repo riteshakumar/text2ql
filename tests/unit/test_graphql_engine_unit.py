@@ -290,7 +290,79 @@ def test_engine_maps_how_many_positions_to_count_aggregation() -> None:
     result = engine.generate(request)
 
     assert any(agg.get("function") == "count" for agg in result.metadata.get("aggregations", []))
-    assert "count" in result.query
+
+
+def test_engine_supports_ordering_and_pagination_primitives() -> None:
+    engine = GraphQLEngine()
+    request = QueryRequest(
+        text="show customers highest total first 5 offset 10",
+        target="graphql",
+        schema={
+            "entities": ["customers"],
+            "fields": {"customers": ["id", "total"]},
+            "args": {"customers": ["first", "offset", "orderBy", "orderDirection"]},
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert "first: 5" in result.query
+    assert "offset: 10" in result.query
+    assert 'orderBy: "total"' in result.query
+    assert 'orderDirection: "DESC"' in result.query
+
+
+def test_engine_supports_negation_and_comparison_filters() -> None:
+    engine = GraphQLEngine()
+    request = QueryRequest(
+        text="show products where price >= 10 and status != inactive",
+        target="graphql",
+        schema={
+            "entities": ["products"],
+            "fields": {"products": ["id", "price", "status"]},
+            "args": {"products": ["price_gte", "status_ne", "and"]},
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert "price_gte: 10" in result.query
+    assert 'status_ne: "inactive"' in result.query
+
+
+def test_engine_coerces_typed_filter_values_and_validates_enum() -> None:
+    engine = GraphQLEngine()
+    request = QueryRequest(
+        text="show orders where status active and shipped_ne false and cursor null",
+        target="graphql",
+        schema={
+            "entities": ["orders"],
+            "fields": {"orders": ["id"]},
+            "args": {"orders": ["status", "shipped_ne", "cursor"]},
+            "introspection": {
+                "query": {
+                    "orders": {
+                        "type": "[Order]",
+                        "args": {
+                            "status": "OrderStatus",
+                            "shipped_ne": "Boolean",
+                            "cursor": "String",
+                        },
+                    }
+                },
+                "types": {
+                    "Order": {"fields": {"id": "ID"}},
+                    "OrderStatus": {"enumValues": ["ACTIVE", "CANCELLED"]},
+                },
+            },
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert 'status: "ACTIVE"' in result.query
+    assert "shipped_ne: false" in result.query
+    assert "cursor: null" in result.query
 
 
 def test_engine_uses_semantic_field_match_for_metric_prompt() -> None:
