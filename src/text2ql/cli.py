@@ -12,6 +12,7 @@ from text2ql.mapping import generate_hybrid_mapping
 from text2ql.providers.base import LLMProvider
 from text2ql.providers.openai_compatible import OpenAICompatibleProvider
 from text2ql.providers.rule_based import RuleBasedProvider
+from text2ql.rewrite import rewrite_user_utterance
 from text2ql.schema_config import infer_schema_from_json_payload
 from text2ql.types import QueryResult
 
@@ -124,6 +125,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--domain",
         default="",
         help="Optional domain hint for synthetic rewrites.",
+    )
+    parser.add_argument(
+        "--llm-rewrite",
+        default="off",
+        choices=["off", "on"],
+        help="Enable schema-aware LLM utterance rewrite before query generation.",
     )
     parser.add_argument(
         "--expected-query",
@@ -263,8 +270,19 @@ def _generate_result_payloads(
     execution_matches = 0
     execution_total = 0
     for idx, prompt in enumerate(prompts):
+        rewritten_prompt = prompt
+        rewrite_meta: dict[str, Any] = {"applied": False, "reason": "disabled"}
+        if args.llm_rewrite == "on" and args.mode == "llm":
+            rewritten_prompt, rewrite_meta = rewrite_user_utterance(
+                text=prompt,
+                target=args.target,
+                schema=schema,
+                mapping=mapping,
+                provider=service.provider,
+                system_context=args.system_context,
+            )
         result = service.generate(
-            text=prompt,
+            text=rewritten_prompt,
             target=args.target,
             schema=schema,
             mapping=mapping,
@@ -274,7 +292,13 @@ def _generate_result_payloads(
                 "system_context": args.system_context,
             },
         )
-        payload: dict[str, Any] = {"prompt": prompt, "query": result.query, "metadata": metadata[idx]}
+        payload: dict[str, Any] = {
+            "prompt": prompt,
+            "rewritten_prompt": rewritten_prompt,
+            "rewrite": rewrite_meta,
+            "query": result.query,
+            "metadata": metadata[idx],
+        }
         if execution_eval_enabled:
             _apply_execution_evaluation(
                 payload=payload,

@@ -35,18 +35,20 @@ class GraphQLEngine(QueryEngine):
 
     def __init__(self, provider: LLMProvider | None = None) -> None:
         self.provider = provider
+        self._last_llm_error: str | None = None
 
     def generate(self, request: QueryRequest) -> QueryResult:
         prompt = request.text.strip()
         config = normalize_schema_config(request.schema, request.mapping)
         mode = str(request.context.get("mode", "deterministic")).strip().lower()
         llm_error: str | None = None
+        self._last_llm_error = None
 
         if mode == "llm" and self.provider is not None:
             llm_result = self._generate_with_llm(prompt, config, request.context)
             if llm_result is not None:
                 return llm_result
-            llm_error = "LLM mode fallback to deterministic mode."
+            llm_error = self._last_llm_error or "LLM mode fallback to deterministic mode."
 
         entity = self._detect_entity(prompt, config)
         fields = self._detect_fields(prompt, config, entity)
@@ -107,11 +109,13 @@ class GraphQLEngine(QueryEngine):
         system_prompt = self._apply_system_context(system_prompt, context)
         try:
             raw = self.provider.complete(system_prompt=system_prompt, user_prompt=user_prompt)
-        except (RuntimeError, ValueError, TypeError):
+        except (RuntimeError, ValueError, TypeError) as exc:
+            self._last_llm_error = f"LLM provider error: {exc}"
             return None
         try:
             intent = parse_graphql_intent(raw, config, language=resolved_language)
-        except ConstrainedOutputError:
+        except ConstrainedOutputError as exc:
+            self._last_llm_error = f"LLM output parse error: {exc}"
             return None
 
         nested: list[dict[str, Any]] = []

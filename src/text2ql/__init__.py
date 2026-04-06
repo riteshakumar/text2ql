@@ -5,6 +5,7 @@ from .dataset import DatasetExample, generate_synthetic_examples, ingest_dataset
 from .evaluate import EvaluationReport, evaluate_examples
 from .json_execution import execute_query_result_on_json
 from .mapping import generate_hybrid_mapping
+from .rewrite import rewrite_user_utterance
 from .schema_config import infer_schema_from_json_payload
 from .types import QueryRequest, QueryResult
 
@@ -20,4 +21,5 @@ __all__ = [
     "generate_synthetic_examples",
     "infer_schema_from_json_payload",
     "ingest_dataset",
+    "rewrite_user_utterance",
 ]

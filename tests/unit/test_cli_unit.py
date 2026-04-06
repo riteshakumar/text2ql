@@ -99,3 +99,20 @@ def test_cli_parser_exposes_synthetic_and_execution_eval_flags() -> None:
     assert args.domain == "crm"
     assert args.expected_query_file == "expected.graphql"
     assert args.expected_execution_file == "expected.json"
+
+
+def test_cli_parser_exposes_llm_rewrite_flag() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(
+        [
+            "how many qqq do i own",
+            "--mode",
+            "llm",
+            "--llm-rewrite",
+            "on",
+        ]
+    )
+
+    assert args.mode == "llm"
+    assert args.llm_rewrite == "on"

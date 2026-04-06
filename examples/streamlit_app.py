@@ -13,7 +13,7 @@ from typing import Any
 import streamlit as st
 
 
-def _import_text2ql() -> tuple[Any, Any, Any, Any, Any, Any, Any, Any]:
+def _import_text2ql() -> tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any]:
     try:
         from text2ql import (
             DatasetExample,
@@ -23,6 +23,7 @@ def _import_text2ql() -> tuple[Any, Any, Any, Any, Any, Any, Any, Any]:
             generate_hybrid_mapping,
             generate_synthetic_examples,
             infer_schema_from_json_payload,
+            rewrite_user_utterance,
         )
         from text2ql.evaluate import sql_execution_match
         from text2ql.providers.openai_compatible import OpenAICompatibleProvider
@@ -35,6 +36,7 @@ def _import_text2ql() -> tuple[Any, Any, Any, Any, Any, Any, Any, Any]:
             generate_hybrid_mapping,
             generate_synthetic_examples,
             infer_schema_from_json_payload,
+            rewrite_user_utterance,
             sql_execution_match,
             OpenAICompatibleProvider,
         )
@@ -54,6 +56,7 @@ def _import_text2ql() -> tuple[Any, Any, Any, Any, Any, Any, Any, Any]:
             generate_hybrid_mapping,
             generate_synthetic_examples,
             infer_schema_from_json_payload,
+            rewrite_user_utterance,
         )
         from text2ql.evaluate import sql_execution_match
         from text2ql.providers.openai_compatible import OpenAICompatibleProvider
@@ -66,6 +69,7 @@ def _import_text2ql() -> tuple[Any, Any, Any, Any, Any, Any, Any, Any]:
             generate_hybrid_mapping,
             generate_synthetic_examples,
             infer_schema_from_json_payload,
+            rewrite_user_utterance,
             sql_execution_match,
             OpenAICompatibleProvider,
         )
@@ -79,6 +83,7 @@ def _import_text2ql() -> tuple[Any, Any, Any, Any, Any, Any, Any, Any]:
     generate_hybrid_mapping,
     generate_synthetic_examples,
     infer_schema_from_json_payload,
+    rewrite_user_utterance,
     sql_execution_match,
     OpenAICompatibleProvider,
 ) = _import_text2ql()
@@ -170,6 +175,11 @@ def main() -> None:
         target = st.selectbox("Target", options=["graphql", "sql"], index=0)
         mode = st.selectbox("Mode", options=["deterministic", "llm"], index=0)
         llm_model = st.text_input("LLM Model", value="gpt-4o-mini")
+        llm_rewrite = st.checkbox(
+            "LLM Utterance Rewrite",
+            value=False,
+            help="Rewrite user utterance with schema-aware LLM before query generation (LLM mode only).",
+        )
         system_context = st.text_area("System Context", value="", height=90)
         variants_per_example = st.number_input("Variants per Prompt", min_value=1, max_value=20, value=1, step=1)
         rewrite_plugins = st.multiselect("Rewrite Plugins", options=PLUGIN_OPTIONS, default=[])
@@ -199,6 +209,7 @@ def main() -> None:
         st.markdown(
             "- `deterministic`: no LLM calls, fully rule-based\n"
             "- `llm`: uses provider then validates against schema\n"
+            "- `LLM Utterance Rewrite`: optional pre-generation rewrite step\n"
             "- GraphQL mode can execute against JSON payload\n"
             "- SQL mode supports signature match against expected query"
         )
@@ -250,8 +261,19 @@ def main() -> None:
         for idx, (active_prompt, synth_meta) in enumerate(prompts, start=1):
             started = time.perf_counter()
             gen_start = time.perf_counter()
+            rewritten_prompt = active_prompt
+            rewrite_meta: dict[str, Any] = {"applied": False, "reason": "disabled"}
+            if llm_rewrite and mode == "llm":
+                rewritten_prompt, rewrite_meta = rewrite_user_utterance(
+                    text=active_prompt,
+                    target=target,
+                    schema=inferred_schema,
+                    mapping=mapping,
+                    provider=service.provider,
+                    system_context=system_context,
+                )
             result = service.generate(
-                text=active_prompt,
+                text=rewritten_prompt,
                 target=target,
                 schema=inferred_schema,
                 mapping=mapping,
@@ -267,6 +289,8 @@ def main() -> None:
             row: dict[str, Any] = {
                 "idx": idx,
                 "prompt": active_prompt,
+                "rewritten_prompt": rewritten_prompt,
+                "rewrite_meta": rewrite_meta,
                 "synthetic": synth_meta,
                 "query": result.query,
                 "metadata": result.metadata,
@@ -314,6 +338,11 @@ def main() -> None:
                     f"generate={row['timing_ms'].get('generate', 0):.3f} "
                     f"execute={row['timing_ms'].get('execute', 0):.3f}"
                 )
+                if llm_rewrite and mode == "llm":
+                    st.markdown("**Rewritten Prompt**")
+                    st.code(row.get("rewritten_prompt", ""), language="text")
+                    st.markdown("**Rewrite metadata**")
+                    st.json(row.get("rewrite_meta", {}), expanded=False)
                 st.json(row.get("synthetic", {}), expanded=False)
                 st.code(row["query"], language="graphql" if target == "graphql" else "sql")
 

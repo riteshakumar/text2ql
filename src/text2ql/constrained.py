@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -42,10 +43,7 @@ def parse_graphql_intent(
     if resolved_language != "english":
         raise ConstrainedOutputError(f"Unsupported constraint language '{language}'")
 
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ConstrainedOutputError("LLM output must be valid JSON") from exc
+    payload = _load_intent_payload(raw)
 
     if not isinstance(payload, dict):
         raise ConstrainedOutputError("LLM output must be a JSON object")
@@ -93,10 +91,7 @@ def parse_sql_intent(
     if resolved_language != "english":
         raise ConstrainedOutputError(f"Unsupported constraint language '{language}'")
 
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ConstrainedOutputError("LLM output must be valid JSON") from exc
+    payload = _load_intent_payload(raw)
     if not isinstance(payload, dict):
         raise ConstrainedOutputError("LLM output must be a JSON object")
 
@@ -211,3 +206,68 @@ def _coerce_optional_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _load_intent_payload(raw: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        return payload
+
+    fenced = _extract_fenced_json(raw)
+    if fenced is not None:
+        try:
+            payload = json.loads(fenced)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            return payload
+
+    object_blob = _extract_first_json_object(raw)
+    if object_blob is not None:
+        try:
+            payload = json.loads(object_blob)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            return payload
+
+    raise ConstrainedOutputError("LLM output must be valid JSON")
+
+
+def _extract_fenced_json(raw: str) -> str | None:
+    match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", raw, flags=re.S | re.I)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _extract_first_json_object(raw: str) -> str | None:
+    start = raw.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for idx in range(start, len(raw)):
+        ch = raw[idx]
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return raw[start : idx + 1].strip()
+    return None
