@@ -112,10 +112,20 @@ def _stable_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
 
 
-def _build_service(mode: str, llm_model: str) -> Any:
+def _default_api_key() -> str:
+    secret_key = ""
+    try:
+        secret_key = str(st.secrets.get("OPENAI_API_KEY", st.secrets.get("TEXT2QL_API_KEY", ""))).strip()
+    except Exception:
+        secret_key = ""
+    env_key = (os.getenv("OPENAI_API_KEY") or os.getenv("TEXT2QL_API_KEY") or "").strip()
+    return secret_key or env_key
+
+
+def _build_service(mode: str, llm_model: str, api_key: str) -> Any:
     if mode != "llm":
         return Text2QL()
-    return Text2QL(provider=OpenAICompatibleProvider(model=llm_model))
+    return Text2QL(provider=OpenAICompatibleProvider(api_key=api_key or None, model=llm_model))
 
 
 def _build_prompts(
@@ -175,6 +185,12 @@ def main() -> None:
         target = st.selectbox("Target", options=["graphql", "sql"], index=0)
         mode = st.selectbox("Mode", options=["deterministic", "llm"], index=0)
         llm_model = st.text_input("LLM Model", value="gpt-4o-mini")
+        api_key_input = st.text_input(
+            "OpenAI API Key",
+            value=_default_api_key(),
+            type="password",
+            help="Optional. Uses this key first, then Streamlit Secrets/env vars.",
+        )
         llm_rewrite = st.checkbox(
             "LLM Utterance Rewrite",
             value=False,
@@ -240,11 +256,14 @@ def main() -> None:
         )
 
         if mode == "llm":
-            api_key = os.getenv("OPENAI_API_KEY") or os.getenv("TEXT2QL_API_KEY")
+            api_key = (api_key_input or "").strip() or _default_api_key()
             if not api_key:
-                st.warning("LLM mode selected but OPENAI_API_KEY/TEXT2QL_API_KEY is not set. Request may fail.")
+                st.warning(
+                    "LLM mode selected but no API key found. Set OpenAI API Key in sidebar "
+                    "or configure OPENAI_API_KEY/TEXT2QL_API_KEY in Streamlit Secrets."
+                )
 
-        service = _build_service(mode, llm_model)
+        service = _build_service(mode, llm_model, api_key=(api_key_input or "").strip())
         prompts = _build_prompts(
             prompt=prompt,
             requested_variants=int(variants_per_example),
