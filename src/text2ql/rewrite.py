@@ -35,6 +35,20 @@ def rewrite_user_utterance(
             "notes": "Canonicalized owned-asset quantity intent using schema-derived slot hints.",
             "raw": "",
         }
+    inferred_asset = _match_how_many_asset_phrase(text.lower())
+    if (
+        inferred_asset is not None
+        and _schema_supports_identifier_and_quantity(config)
+        and _looks_like_identifier_value(inferred_asset, config)
+    ):
+        canonical = f"how many {quantity_label} of {inferred_asset.upper()} do i own"
+        return canonical, {
+            "applied": canonical.strip() != text.strip(),
+            "source": "schema_slot_canonicalizer",
+            "confidence": 0.95,
+            "notes": "Canonicalized 'how many <asset>' intent into ownership quantity query using schema/mapping values.",
+            "raw": "",
+        }
     system_prompt = _build_system_prompt(target, system_context)
     user_prompt = _build_user_prompt(text=text, config=config, target=target)
     try:
@@ -48,6 +62,13 @@ def rewrite_user_utterance(
     rewritten = payload.get("rewritten_text")
     if not isinstance(rewritten, str) or not rewritten.strip():
         return text, {"applied": False, "reason": "missing_rewritten_text", "raw": raw}
+    if _looks_like_query_text(rewritten):
+        return text, {
+            "applied": False,
+            "reason": "guard_rejected_query_like_rewrite",
+            "notes": "Rewrite must remain natural language and not emit SQL/GraphQL query text.",
+            "raw": raw,
+        }
     if _has_ownership_intent(text) and not _has_ownership_intent(rewritten):
         return text, {
             "applied": False,
@@ -71,7 +92,8 @@ def _build_system_prompt(target: str, system_context: str) -> str:
         "Return ONLY JSON object with keys: rewritten_text (string), notes (string), confidence (number 0..1).\n"
         "Do not invent entities/fields that are not present in schema context.\n"
         "Keep intent unchanged.\n"
-        "Never convert concrete business questions into meta/help wording (e.g., avoid 'how to query ...')."
+        "Never convert concrete business questions into meta/help wording (e.g., avoid 'how to query ...').\n"
+        "Never output SQL or GraphQL query text; rewritten_text must be natural-language."
     )
     if system_context.strip():
         return f"{base}\n\nAdditional system context:\n{system_context.strip()}"
@@ -170,6 +192,16 @@ def _match_owned_asset_phrase(lowered: str) -> str | None:
     return None
 
 
+def _match_how_many_asset_phrase(lowered: str) -> str | None:
+    match = re.search(r"\bhow many\s+([a-z0-9_]+)\b", lowered)
+    if not match:
+        return None
+    asset = match.group(1)
+    if asset in {"positions", "holdings", "accounts", "orders", "customers", "users", "items"}:
+        return None
+    return asset
+
+
 def _has_ownership_intent(text: str) -> bool:
     lowered = text.lower()
     return any(token in lowered for token in _OWNERSHIP_HINTS)
@@ -196,3 +228,34 @@ def _preferred_quantity_label(config: Any) -> str:
         if any(preferred in name for name in names):
             return preferred
     return "quantity"
+
+
+def _looks_like_identifier_value(asset: str, config: Any) -> bool:
+    token = asset.strip().lower()
+    if not token:
+        return False
+    for alias_map in config.filter_value_aliases.values():
+        if not isinstance(alias_map, dict):
+            continue
+        for key, value in alias_map.items():
+            if isinstance(key, str) and key.lower() == token:
+                return True
+            if isinstance(value, str) and value.lower() == token:
+                return True
+    return len(token) <= 5 and token.isalpha()
+
+
+def _looks_like_query_text(text: str) -> bool:
+    stripped = text.strip()
+    lowered = stripped.lower()
+    if lowered.startswith("select ") or lowered.startswith("with "):
+        return True
+    if lowered.startswith("query ") or lowered.startswith("mutation "):
+        return True
+    if " from " in lowered and (" where " in lowered or lowered.startswith("select ")):
+        return True
+    if ("{" in stripped and "}" in stripped) and (
+        lowered.startswith("query") or lowered.startswith("mutation") or "(" in stripped
+    ):
+        return True
+    return False

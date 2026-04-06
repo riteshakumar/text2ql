@@ -174,3 +174,32 @@ def test_sql_engine_rejects_schema_relation_not_in_introspection() -> None:
 
 def test_sql_engine_extract_filter_value_ignores_spurious_token() -> None:
     assert SQLEngine._extract_filter_value("status", "show account where status is") is None
+
+
+def test_sql_engine_llm_reconciles_owned_asset_filter_when_missing() -> None:
+    class _StubProvider:
+        def complete(self, system_prompt: str, user_prompt: str) -> str:
+            return (
+                '{"table":"positions","columns":["quantity"],"filters":{},'
+                '"joins":[],"order_by":null,"order_dir":null,"limit":null,"offset":null,'
+                '"explanation":"stub","confidence":0.9}'
+            )
+
+    engine = SQLEngine(provider=_StubProvider())
+    request = QueryRequest(
+        text="how many qqq do i own",
+        target="sql",
+        schema={
+            "entities": ["positions"],
+            "fields": {"positions": ["symbol", "quantity"]},
+            "args": {"positions": ["symbol"]},
+        },
+        mapping={"filter_values": {"symbol": {"qqq": "QQQ"}}},
+        context={"mode": "llm", "language": "english"},
+    )
+
+    result = engine.generate(request)
+
+    assert "FROM positions" in result.query
+    assert "positions.symbol = 'QQQ'" in result.query
+    assert "positions.quantity" in result.query

@@ -120,10 +120,17 @@ class GraphQLEngine(QueryEngine):
 
         nested: list[dict[str, Any]] = []
         aggregations: list[dict[str, str]] = []
+        reconciled_entity, reconciled_fields, reconciled_filters = self._reconcile_owned_asset_intent(
+            prompt=prompt,
+            entity=intent.entity,
+            fields=list(intent.fields),
+            filters=dict(intent.filters),
+            config=config,
+        )
         entity, fields, filters, aggregations, nested, validation_notes = self._validate_components(
-            intent.entity,
-            intent.fields,
-            intent.filters,
+            reconciled_entity,
+            reconciled_fields,
+            reconciled_filters,
             aggregations,
             nested,
             config,
@@ -147,6 +154,47 @@ class GraphQLEngine(QueryEngine):
                 "validation_notes": validation_notes,
             },
         )
+
+    def _reconcile_owned_asset_intent(
+        self,
+        prompt: str,
+        entity: str,
+        fields: list[str],
+        filters: dict[str, Any],
+        config: NormalizedSchemaConfig,
+    ) -> tuple[str, list[str], dict[str, Any]]:
+        lowered = prompt.lower()
+        owned_asset = self._detect_owned_asset(lowered)
+        if owned_asset is None:
+            return entity, fields, filters
+
+        holdings_entity = self._resolve_holdings_entity(config)
+        resolved_entity = holdings_entity or entity
+        schema_fields = self._fields_for_entity(config, resolved_entity)
+        if not schema_fields:
+            return resolved_entity, fields, filters
+
+        identifier_key = self._resolve_identifier_filter_key(
+            config=config,
+            entity=resolved_entity,
+            filter_key_aliases={"status": "status", **config.filter_key_aliases},
+        )
+        resolved_filters = dict(filters)
+        if identifier_key and identifier_key not in resolved_filters:
+            mapped_value = config.filter_value_aliases.get(identifier_key.lower(), {}).get(
+                owned_asset.lower(),
+                owned_asset.upper(),
+            )
+            resolved_filters[identifier_key] = mapped_value
+
+        resolved_fields = list(fields)
+        owned_fields = self._resolve_holdings_fields(schema_fields)
+        for field in owned_fields:
+            if field not in resolved_fields:
+                resolved_fields.append(field)
+        if not resolved_fields:
+            resolved_fields = owned_fields or schema_fields[:2]
+        return resolved_entity, resolved_fields, resolved_filters
 
     @staticmethod
     def _apply_system_context(system_prompt: str, context: dict[str, Any]) -> str:

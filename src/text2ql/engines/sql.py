@@ -146,8 +146,15 @@ class SQLEngine(QueryEngine):
             return None
 
         table = intent.table
-        columns = intent.columns
+        columns = list(intent.columns)
         filters = dict(intent.filters)
+        table, columns, filters = self._reconcile_owned_asset_intent(
+            prompt=prompt,
+            table=table,
+            columns=columns,
+            filters=filters,
+            config=config,
+        )
         joins = self._materialize_llm_joins(intent.joins, config, table)
         order_by = intent.order_by
         order_dir = intent.order_dir
@@ -208,6 +215,42 @@ class SQLEngine(QueryEngine):
             },
         )
 
+    def _reconcile_owned_asset_intent(
+        self,
+        prompt: str,
+        table: str,
+        columns: list[str],
+        filters: dict[str, Any],
+        config: Any,
+    ) -> tuple[str, list[str], dict[str, Any]]:
+        owned_asset = self._detect_owned_asset(prompt.lower())
+        if owned_asset is None:
+            return table, columns, filters
+
+        holdings_table = self._resolve_holdings_table(config)
+        resolved_table = holdings_table or table
+        table_columns = self._columns_for_table(config, resolved_table)
+        if not table_columns:
+            return resolved_table, columns, filters
+
+        identifier_key = self._resolve_identifier_filter_key(config, resolved_table)
+        resolved_filters = dict(filters)
+        if identifier_key and identifier_key not in resolved_filters:
+            mapped_value = config.filter_value_aliases.get(identifier_key.lower(), {}).get(
+                owned_asset.lower(),
+                owned_asset.upper(),
+            )
+            resolved_filters[identifier_key] = mapped_value
+
+        resolved_columns = list(columns)
+        preferred = self._resolve_holdings_columns(table_columns)
+        for column in preferred:
+            if column not in resolved_columns:
+                resolved_columns.append(column)
+        if not resolved_columns:
+            resolved_columns = preferred or table_columns[:2]
+        return resolved_table, resolved_columns, resolved_filters
+
     @staticmethod
     def _apply_system_context(system_prompt: str, context: dict[str, Any]) -> str:
         extra = context.get("system_context")
@@ -258,6 +301,84 @@ class SQLEngine(QueryEngine):
         if config.default_entity:
             return config.default_entity
         return (config.entities[0] if config.entities else "items")
+
+    @staticmethod
+    def _detect_owned_asset(lowered: str) -> str | None:
+        match = re.search(r"\bwhat quantity of\s+([a-z0-9_]+)\s+do i own\b", lowered)
+        if match is not None:
+            return match.group(1)
+        match = re.search(r"\bquantity of\s+([a-z0-9_]+)\s+do i own\b", lowered)
+        if match is not None:
+            return match.group(1)
+        match = re.search(r"\bhow many\s+([a-z0-9_]+)\s+do i own\b", lowered)
+        if match is not None:
+            return match.group(1)
+        match = re.search(r"\bhow many\s+([a-z0-9_]+)\s+i own\b", lowered)
+        if match is not None:
+            return match.group(1)
+        return None
+
+    def _resolve_holdings_table(self, config: Any) -> str | None:
+        best_table: str | None = None
+        best_score = 0
+        for entity in config.entities:
+            columns = self._columns_for_table(config, entity)
+            if not columns:
+                continue
+            score = self._score_holdings_table(entity, columns)
+            if score > best_score:
+                best_score = score
+                best_table = entity
+        return best_table if best_score > 0 else None
+
+    def _score_holdings_table(self, table: str, columns: list[str]) -> int:
+        lowered_table = table.lower()
+        lowered_columns = {column.lower() for column in columns}
+        has_identifier = any(candidate in lowered_columns for candidate in self._identifier_column_candidates())
+        has_quantity = any(candidate in lowered_columns for candidate in self._quantity_column_candidates())
+        if not (has_identifier and has_quantity):
+            return 0
+        score = 1
+        if lowered_table in {"positions", "holdings", "assets"}:
+            score += 4
+        if {"symbol", "securitytype"}.intersection(lowered_columns):
+            score += 1
+        if {"acctnum", "acctname", "accountpositioncount"}.intersection(lowered_columns):
+            score -= 3
+        return score
+
+    def _resolve_identifier_filter_key(self, config: Any, table: str) -> str | None:
+        table_args = {arg.lower(): arg for arg in config.args_by_entity.get(table, [])}
+        table_columns = {column.lower(): column for column in self._columns_for_table(config, table)}
+        for candidate in self._identifier_column_candidates():
+            if candidate in table_args:
+                return table_args[candidate]
+            if candidate in table_columns:
+                return table_columns[candidate]
+        return None
+
+    def _resolve_holdings_columns(self, columns: list[str]) -> list[str]:
+        lowered_to_original = {column.lower(): column for column in columns}
+        selection: list[str] = []
+        for candidate in self._quantity_column_candidates():
+            field = lowered_to_original.get(candidate)
+            if field is not None:
+                selection.append(field)
+                break
+        for candidate in self._identifier_column_candidates():
+            field = lowered_to_original.get(candidate)
+            if field is not None and field not in selection:
+                selection.append(field)
+                break
+        return selection
+
+    @staticmethod
+    def _quantity_column_candidates() -> tuple[str, ...]:
+        return ("quantity", "qty", "shares", "units", "amount", "holding")
+
+    @staticmethod
+    def _identifier_column_candidates() -> tuple[str, ...]:
+        return ("symbol", "ticker", "stock", "asset", "security", "code", "name")
 
     def _detect_columns(self, lowered: str, config: Any, table: str) -> list[str]:
         allowed = self._columns_for_table(config, table)
