@@ -363,7 +363,8 @@ class SQLEngine(QueryEngine):
 
     def _parse_and_nodes(self, text: str) -> list[dict[str, Any]]:
         nodes: list[dict[str, Any]] = []
-        for part in self._split_top_level(text, "and"):
+        normalized = self._strip_outer_parentheses(text)
+        for part in self._split_top_level(normalized, "and"):
             if part.startswith("where "):
                 part = part[6:].strip()
             part = self._strip_outer_parentheses(part)
