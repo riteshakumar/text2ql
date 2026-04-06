@@ -329,6 +329,44 @@ def test_generate_synthetic_examples_adds_scoring_metadata() -> None:
     assert synthetic[0].metadata["synthetic_rewrite_score"] >= synthetic[-1].metadata["synthetic_rewrite_score"]
 
 
+def test_generate_synthetic_examples_templates_scope_filters_to_entity_fields() -> None:
+    seeds = [
+        DatasetExample(
+            text="show account summary",
+            target="graphql",
+            expected_query="query GeneratedQuery { accountSummary { isPartialBalance } }",
+            schema={
+                "entities": ["positions", "accountSummary"],
+                "fields": {
+                    "positions": ["symbol", "status", "quantity"],
+                    "accountSummary": ["isPartialBalance", "acctNum"],
+                },
+                "args": {
+                    "positions": ["status", "symbol"],
+                    "accountSummary": ["acctNum"],
+                },
+            },
+            mapping={
+                "filter_values": {
+                    "status": {"open": "open"},
+                    "acctNum": {"x21985452": "X21985452"},
+                }
+            },
+        )
+    ]
+
+    synthetic = generate_synthetic_examples(
+        seeds,
+        variants_per_example=6,
+        rewrite_plugins=["generic", "portfolio"],
+        domain="portfolio",
+    )
+
+    texts = [example.text.lower() for example in synthetic]
+    assert any("accountsummary where acctnum is x21985452" in text for text in texts)
+    assert not any("accountsummary where status is" in text for text in texts)
+
+
 def test_evaluate_examples_reports_exact_and_execution_accuracy() -> None:
     service = Text2QL()
     examples = [

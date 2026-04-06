@@ -104,3 +104,17 @@ def test_infer_schema_from_json_payload_returns_text2ql_shape() -> None:
     assert "fields" in inferred
     assert "args" in inferred
     assert "default_entity" in inferred
+
+
+def test_normalize_schema_config_auto_discovers_args_from_fields_when_missing() -> None:
+    schema = {
+        "entities": ["accountSummary"],
+        "fields": {"accountSummary": ["isPartialBalance", "asOfDateTime"]},
+    }
+
+    config = normalize_schema_config(schema)
+
+    assert "accountSummary" in config.args_by_entity
+    assert "isPartialBalance" in config.args_by_entity["accountSummary"]
+    assert "asOfDateTime" in config.args_by_entity["accountSummary"]
+    assert "limit" in config.args_by_entity["accountSummary"]

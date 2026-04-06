@@ -372,21 +372,22 @@ def _domain_template_rewrites(example: DatasetExample, domain: str | None) -> li
     if not _domain_slots_compatible(domain, slots):
         return []
     entities = slots["entity"][:2]
-    metrics = slots["metric"][:2]
-    dates = slots["date"][:2]
-    filters = slots["filter"][:2]
-    values = slots["value"][:2]
 
     rewrites: list[str] = []
     for entity in entities:
-        if metrics:
-            rewrites.append(f"show {entity} with {metrics[0]}")
-            rewrites.append(f"what is {metrics[0]} for {entity}")
-        if dates:
-            rewrites.append(f"show {entity} by {dates[0]}")
-        if filters and values:
-            rewrites.append(f"show {entity} where {filters[0]} is {values[0]}")
-            rewrites.append(f"list {entity} with {filters[0]} {values[0]}")
+        entity_metrics = _entity_metrics(example.schema, entity)[:2]
+        entity_dates = _entity_dates(example.schema, entity)[:2]
+        entity_filters = _entity_filters(example.schema, entity)[:2]
+        entity_values = _filter_values_for_keys(example.mapping, entity_filters)[:2]
+
+        if entity_metrics:
+            rewrites.append(f"show {entity} with {entity_metrics[0]}")
+            rewrites.append(f"what is {entity_metrics[0]} for {entity}")
+        if entity_dates:
+            rewrites.append(f"show {entity} by {entity_dates[0]}")
+        if entity_filters and entity_values:
+            rewrites.append(f"show {entity} where {entity_filters[0]} is {entity_values[0]}")
+            rewrites.append(f"list {entity} with {entity_filters[0]} {entity_values[0]}")
     return rewrites
 
 
@@ -489,6 +490,66 @@ def _extract_filter_values(mapping: dict[str, Any] | None) -> list[str]:
     for key in ("filter_values", "filter_value_aliases"):
         candidates.extend(_extract_nested_str_values(mapping.get(key)))
     return candidates
+
+
+def _entity_metrics(schema: dict[str, Any] | None, entity: str) -> list[str]:
+    fields = _extract_fields_for_entity(schema, entity)
+    return [field for field in fields if any(token in field.lower() for token in _METRIC_HINTS)]
+
+
+def _entity_dates(schema: dict[str, Any] | None, entity: str) -> list[str]:
+    fields = _extract_fields_for_entity(schema, entity)
+    return [field for field in fields if any(token in field.lower() for token in _DATE_HINTS)]
+
+
+def _entity_filters(schema: dict[str, Any] | None, entity: str) -> list[str]:
+    fields = _extract_fields_for_entity(schema, entity)
+    args = _extract_args_for_entity(schema, entity)
+    return [
+        field
+        for field in (args + fields)
+        if any(token in field.lower() for token in _FILTER_HINTS)
+    ]
+
+
+def _extract_fields_for_entity(schema: dict[str, Any] | None, entity: str) -> list[str]:
+    if not isinstance(schema, dict):
+        return []
+    fields_raw = schema.get("fields")
+    if isinstance(fields_raw, dict):
+        values = fields_raw.get(entity, [])
+        if isinstance(values, list):
+            return [item for item in values if isinstance(item, str)]
+        return []
+    return _extract_fields(schema)
+
+
+def _extract_args_for_entity(schema: dict[str, Any] | None, entity: str) -> list[str]:
+    if not isinstance(schema, dict):
+        return []
+    args_raw = schema.get("args")
+    if isinstance(args_raw, dict):
+        values = args_raw.get(entity, [])
+        if isinstance(values, list):
+            return [item for item in values if isinstance(item, str)]
+        return []
+    return _extract_args(schema)
+
+
+def _filter_values_for_keys(mapping: dict[str, Any] | None, keys: list[str]) -> list[str]:
+    if not isinstance(mapping, dict) or not keys:
+        return []
+    out: list[str] = []
+    for bucket in ("filter_values", "filter_value_aliases"):
+        payload = mapping.get(bucket)
+        if not isinstance(payload, dict):
+            continue
+        for key in keys:
+            nested = payload.get(key)
+            if not isinstance(nested, dict):
+                continue
+            out.extend(value for value in nested.values() if isinstance(value, str))
+    return _dedupe_preserve_order(out)
 
 
 def _dedupe_preserve_order(items: list[str]) -> list[str]:

@@ -22,6 +22,7 @@ _FILTER_VALUE = r"([\w.:-]+)"
 _AND_TOKEN = " and "
 _ISO_DATE = r"\d{4}-\d{2}-\d{2}"
 _DATE_RANGE_PATTERN = rf"\b{_WORD_IDENTIFIER}\s+from\s+({_ISO_DATE})\s+to\s+({_ISO_DATE})\b"
+_SPURIOUS_FILTER_VALUES = {"where", "with", "and", "or", "for", "of", "in", "is"}
 
 
 class GraphQLEngine(QueryEngine):
@@ -250,7 +251,7 @@ class GraphQLEngine(QueryEngine):
         return config.default_fields or schema_fields[:3]
 
     def _detect_common_fields(self, lowered: str, common_fields: list[str]) -> list[str]:
-        selected = [field for field in common_fields if self._contains_token(lowered, field.lower())]
+        selected = [field for field in common_fields if self._contains_field_token(lowered, field.lower())]
         return selected or ["id", "name"]
 
     def _select_fields_from_schema(
@@ -261,12 +262,22 @@ class GraphQLEngine(QueryEngine):
     ) -> list[str]:
         selected: list[str] = []
         for field in schema_fields:
-            if self._contains_token(lowered, field.lower()):
+            if self._contains_field_token(lowered, field.lower()):
                 selected.append(field)
         for alias, canonical in self._sorted_alias_pairs(config.field_aliases):
-            if canonical in schema_fields and self._contains_token(lowered, alias):
+            if canonical in schema_fields and self._contains_field_token(lowered, alias):
                 selected.append(canonical)
         return self._unique_in_order(selected)
+
+    @staticmethod
+    def _contains_field_token(text: str, token: str) -> bool:
+        if GraphQLEngine._contains_token(text, token):
+            return True
+        if token.endswith("s") and len(token) > 3 and GraphQLEngine._contains_token(text, token[:-1]):
+            return True
+        if not token.endswith("s") and GraphQLEngine._contains_token(text, f"{token}s"):
+            return True
+        return False
 
     def _detect_filters(
         self,
@@ -340,9 +351,20 @@ class GraphQLEngine(QueryEngine):
             if value is None:
                 continue
             resolved_canonical = self._resolve_filter_key_for_entity(config, entity, canonical)
+            if self._is_spurious_filter_value(value):
+                continue
+            if str(resolved_canonical).strip().lower() == entity.strip().lower():
+                continue
             mapped_value = (
                 config.filter_value_aliases.get(str(resolved_canonical).lower(), {}).get(value.lower(), value)
             )
+            if self._is_spurious_filter_value(mapped_value):
+                continue
+            if (
+                str(resolved_canonical).lower() in self._quantity_field_candidates()
+                and self._is_spurious_quantity_value(mapped_value)
+            ):
+                continue
             filters[str(resolved_canonical)] = mapped_value
 
     def _apply_alias_value_filters(
@@ -387,8 +409,20 @@ class GraphQLEngine(QueryEngine):
                 # Guard against spurious lexical extraction like `quantity: "of"`
                 # from prompts such as "what quantity of QQQ do I own".
                 for quantity_key in self._quantity_field_candidates():
-                    if filters.get(quantity_key) == "of":
+                    if self._is_spurious_quantity_value(filters.get(quantity_key)):
                         del filters[quantity_key]
+
+    @staticmethod
+    def _is_spurious_quantity_value(value: Any) -> bool:
+        if not isinstance(value, str):
+            return False
+        return value.strip().lower() in {"of", "for"}
+
+    @staticmethod
+    def _is_spurious_filter_value(value: Any) -> bool:
+        if not isinstance(value, str):
+            return False
+        return value.strip().lower() in _SPURIOUS_FILTER_VALUES
 
     def _apply_advanced_filters(self, filters: dict[str, Any], lowered: str) -> None:
         range_filters = self._detect_between_filters(lowered)

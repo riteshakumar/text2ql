@@ -70,6 +70,7 @@ def normalize_schema_config(
     _apply_mapping_payload(config, schema.get("mapping"))
     _apply_mapping_payload(config, schema.get("mappings"))
     _apply_mapping_payload(config, mapping)
+    _auto_discover_args(config, schema, mapping)
     return config
 
 
@@ -538,3 +539,92 @@ def _extract_enum_values(types_payload: dict[str, Any]) -> dict[str, set[str]]:
         if values:
             out[type_name] = values
     return out
+
+
+def _auto_discover_args(
+    config: NormalizedSchemaConfig,
+    schema: dict[str, Any],
+    mapping: dict[str, Any],
+) -> None:
+    entities = list(dict.fromkeys(config.entities + list(config.fields_by_entity.keys())))
+    if not entities:
+        return
+
+    discovered: dict[str, set[str]] = {entity: set(config.args_by_entity.get(entity, [])) for entity in entities}
+
+    for entity, arg_map in config.introspection_query_args.items():
+        if entity not in discovered:
+            discovered[entity] = set()
+        discovered[entity].update(arg_map.keys())
+
+    for payload in (schema, mapping):
+        if not isinstance(payload, dict):
+            continue
+        for hint_key in ("filters", "filterable_fields", "query_args", "params", "parameters", "where"):
+            _merge_discovered_from_hint_payload(discovered, entities, config, payload.get(hint_key))
+
+    for canonical in config.filter_key_aliases.values():
+        if not isinstance(canonical, str) or not canonical.strip():
+            continue
+        canonical_name = canonical.strip()
+        for entity in entities:
+            entity_fields = _candidate_fields_for_entity(config, entity)
+            if canonical_name in entity_fields:
+                discovered.setdefault(entity, set()).add(canonical_name)
+
+    for entity in entities:
+        if not discovered.get(entity):
+            discovered[entity] = set(_candidate_fields_for_entity(config, entity))
+        discovered[entity].update({"limit", "offset", "first", "after", "orderBy", "orderDirection", "orderDir"})
+
+    for entity, args in discovered.items():
+        normalized = sorted(arg for arg in args if isinstance(arg, str) and arg.strip())
+        if normalized:
+            config.args_by_entity[entity] = normalized
+
+
+def _merge_discovered_from_hint_payload(
+    discovered: dict[str, set[str]],
+    entities: list[str],
+    config: NormalizedSchemaConfig,
+    payload: Any,
+) -> None:
+    if isinstance(payload, list):
+        normalized = {str(item).strip() for item in payload if str(item).strip()}
+        if not normalized:
+            return
+        for entity in entities:
+            allowed_for_entity = set(_candidate_fields_for_entity(config, entity)) | set(
+                config.introspection_query_args.get(entity, {}).keys()
+            )
+            scoped = {item for item in normalized if item in allowed_for_entity}
+            if scoped:
+                discovered.setdefault(entity, set()).update(scoped)
+        return
+    if not isinstance(payload, dict):
+        return
+    if all(isinstance(value, list) for value in payload.values()):
+        for entity, values in payload.items():
+            if not isinstance(entity, str):
+                continue
+            normalized = {str(item).strip() for item in values if str(item).strip()}
+            if normalized:
+                discovered.setdefault(entity, set()).update(normalized)
+        return
+    # Alias-like maps: keys are aliases and values are canonicals.
+    for canonical in payload.values():
+        if isinstance(canonical, str) and canonical.strip():
+            canonical_name = canonical.strip()
+            for entity in entities:
+                allowed_for_entity = set(_candidate_fields_for_entity(config, entity)) | set(
+                    config.introspection_query_args.get(entity, {}).keys()
+                )
+                if canonical_name in allowed_for_entity:
+                    discovered.setdefault(entity, set()).add(canonical_name)
+
+
+def _candidate_fields_for_entity(config: NormalizedSchemaConfig, entity: str) -> list[str]:
+    entity_fields = config.fields_by_entity.get(entity, [])
+    if entity_fields:
+        return [field for field in entity_fields if isinstance(field, str) and field.strip()]
+    return [field for field in config.fields if isinstance(field, str) and field.strip()]

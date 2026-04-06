@@ -257,6 +257,70 @@ def test_engine_prefers_where_clause_filter_match_over_earlier_mentions() -> Non
     assert result.metadata.get("filters", {}).get("symbol") == "QQQ"
 
 
+def test_engine_does_not_infer_quantity_filter_from_list_symbols_phrase() -> None:
+    engine = GraphQLEngine()
+    request = QueryRequest(
+        text="list symbols and quantity for all positions",
+        target="graphql",
+        schema={
+            "entities": ["positions"],
+            "fields": {"positions": ["symbol", "quantity"]},
+            "args": {"positions": ["quantity"]},
+            "default_entity": "positions",
+            "default_fields": ["symbol", "quantity"],
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert "positions(quantity:" not in result.query
+    assert "symbol" in result.query
+    assert "quantity" in result.query
+    assert result.metadata.get("filters", {}).get("quantity") is None
+
+
+def test_engine_drops_unknown_filter_when_args_are_auto_discovered() -> None:
+    engine = GraphQLEngine()
+    request = QueryRequest(
+        text="show accountSummary status active",
+        target="graphql",
+        schema={
+            "entities": ["accountSummary"],
+            "fields": {"accountSummary": ["isPartialBalance", "asOfDateTime"]},
+            "default_entity": "accountSummary",
+            "default_fields": ["isPartialBalance"],
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert "accountSummary(" not in result.query
+    assert "status:" not in result.query
+    assert "status" not in result.metadata.get("filters", {})
+
+
+def test_engine_drops_spurious_entity_alias_filter_value_where() -> None:
+    engine = GraphQLEngine()
+    request = QueryRequest(
+        text="show accountSummary where status is X21985452",
+        target="graphql",
+        schema={
+            "entities": ["accountSummary"],
+            "fields": {"accountSummary": ["isPartialBalance", "acctNum"]},
+            "default_entity": "accountSummary",
+            "default_fields": ["isPartialBalance"],
+        },
+        mapping={"filters": {"acctNum": "acctNum"}},
+    )
+
+    result = engine.generate(request)
+
+    assert "accountSummary(" not in result.query
+    assert "status:" not in result.query
+    assert "accountSummary:" not in result.query
+    assert result.metadata.get("filters") == {}
+
+
 def test_engine_generalizes_how_many_owned_for_ticker_field() -> None:
     engine = GraphQLEngine()
     request = QueryRequest(
