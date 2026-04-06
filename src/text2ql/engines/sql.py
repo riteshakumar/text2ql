@@ -367,6 +367,18 @@ class SQLEngine(QueryEngine):
             if part.startswith("where "):
                 part = part[6:].strip()
             part = self._strip_outer_parentheses(part)
+            in_match = re.match(r"^([a-zA-Z_][a-zA-Z0-9_]*)\s+in\s+([a-zA-Z0-9_,\s-]+)$", part)
+            if in_match:
+                field = in_match.group(1)
+                values_blob = in_match.group(2)
+                values = [
+                    token.strip()
+                    for token in re.split(r",|\s+or\s+|\s+and\s+", values_blob)
+                    if token.strip()
+                ]
+                if values:
+                    nodes.append({f"{field}_in": values})
+                    continue
             for pattern, suffix in [
                 (r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*(>=|<=|>|<)\s*([a-zA-Z0-9_.:-]+)$", None),
                 (r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:!=|is not|not)\s*([a-zA-Z0-9_.:-]+)$", "_ne"),

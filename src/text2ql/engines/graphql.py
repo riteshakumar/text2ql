@@ -649,6 +649,17 @@ class GraphQLEngine(QueryEngine):
         return candidate
 
     def _parse_atomic_filter_condition(self, text: str) -> dict[str, Any] | None:
+        in_match = re.match(rf"^{_WORD_IDENTIFIER}\s+in\s+([A-Za-z0-9_,\s-]+)$", text)
+        if in_match:
+            field = in_match.group(1)
+            values_blob = in_match.group(2)
+            values = [
+                token.strip()
+                for token in re.split(r",|\s+or\s+|\s+and\s+", values_blob)
+                if token.strip()
+            ]
+            if values:
+                return {f"{field}_in": values}
         for pattern, suffix in [
             (rf"^{_WORD_IDENTIFIER}\s*(>=|<=|>|<)\s*{_FILTER_VALUE}$", None),
             (rf"^{_WORD_IDENTIFIER}\s*(?:!=|is not|not)\s*{_FILTER_VALUE}$", "_ne"),
@@ -1004,9 +1015,9 @@ class GraphQLEngine(QueryEngine):
             if not selected_fields:
                 selected_fields = relation_fields[:1]
 
-            relation_filters: dict[str, str] = {}
+            relation_filters: dict[str, Any] = {}
             if "latest" in lowered and "limit" in relation.args:
-                relation_filters["limit"] = "1"
+                relation_filters["limit"] = 1
             relation_filters.update(self._detect_relation_local_filters(lowered, relation))
 
             nested.append(
