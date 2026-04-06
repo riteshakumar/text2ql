@@ -588,16 +588,7 @@ class SQLEngine(QueryEngine):
         out: dict[str, Any] = {}
         for key, value in filters.items():
             if key in {"and", "or", "not"} and isinstance(value, list):
-                nested = []
-                for node in value:
-                    if not isinstance(node, dict):
-                        continue
-                    valid_node = {}
-                    for n_key, n_val in node.items():
-                        if self._is_allowed_filter_key(n_key, allowed_filter_keys):
-                            valid_node[n_key] = n_val
-                    if valid_node:
-                        nested.append(valid_node)
+                nested = self._validate_group_nodes(value, allowed_filter_keys)
                 if nested:
                     out[key] = nested
                 continue
@@ -606,6 +597,28 @@ class SQLEngine(QueryEngine):
             else:
                 notes.append(f"dropped invalid filter '{key}'")
         return out
+
+    def _validate_group_nodes(
+        self,
+        nodes: list[dict[str, Any]],
+        allowed_filter_keys: set[str],
+    ) -> list[dict[str, Any]]:
+        nested: list[dict[str, Any]] = []
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            valid_node: dict[str, Any] = {}
+            for n_key, n_val in node.items():
+                if n_key in {"and", "or", "not"} and isinstance(n_val, list):
+                    child = self._validate_group_nodes(n_val, allowed_filter_keys)
+                    if child:
+                        valid_node[n_key] = child
+                    continue
+                if self._is_allowed_filter_key(n_key, allowed_filter_keys):
+                    valid_node[n_key] = n_val
+            if valid_node:
+                nested.append(valid_node)
+        return nested
 
     @staticmethod
     def _is_allowed_filter_key(key: str, allowed_filter_keys: set[str]) -> bool:
@@ -799,10 +812,19 @@ class SQLEngine(QueryEngine):
     ) -> str | None:
         expressions: list[str] = []
         for node in nodes:
-            atom = [
-                self._sql_condition(alias, n_key, n_value, exact_filter_keys=exact_filter_keys)
-                for n_key, n_value in node.items()
-            ]
+            atom: list[str] = []
+            for n_key, n_value in node.items():
+                if n_key in {"and", "or", "not"} and isinstance(n_value, list):
+                    grouped = self._build_group_expression(
+                        n_key,
+                        n_value,
+                        alias,
+                        exact_filter_keys=exact_filter_keys,
+                    )
+                    if grouped:
+                        atom.append(grouped)
+                    continue
+                atom.append(self._sql_condition(alias, n_key, n_value, exact_filter_keys=exact_filter_keys))
             if atom:
                 expressions.append(" AND ".join(atom))
         if not expressions:
