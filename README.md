@@ -206,6 +206,24 @@ text2ql "how many qqq do i own" \
   --expected-query-file ./expected_query.graphql
 ```
 
+## Streamlit Playground
+
+Run an interactive UI for GraphQL + SQL testing:
+
+```bash
+pip install -e ".[app]"
+streamlit run examples/streamlit_app.py
+```
+
+What you get:
+
+- Deterministic and LLM modes in one app.
+- GraphQL and SQL target switch.
+- Bundled sample data (`examples/sample_schema.json`, `examples/sample_data.json`) or uploaded JSON files.
+- Synthetic rewrite controls (`variants`, `plugins`, `domain`).
+- GraphQL execution on JSON payload + optional expected-query execution match.
+- SQL optional expected-query signature match.
+
 ## Quickstart
 
 ```python

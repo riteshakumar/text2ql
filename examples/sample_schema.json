@@ -1,0 +1,27 @@
+{
+  "entities": ["positions", "accountSummary"],
+  "fields": {
+    "positions": [
+      "symbol",
+      "quantity",
+      "marketValue",
+      "todaysGainLoss",
+      "totalGainLoss",
+      "securityType"
+    ],
+    "accountSummary": [
+      "totalMarketValue",
+      "totalCostBasis",
+      "totalUnrealizedGainLoss",
+      "cashAvailableToWithdraw",
+      "cashAvailableToTrade",
+      "isPartialBalance"
+    ]
+  },
+  "args": {
+    "positions": ["symbol", "securityType", "limit", "offset", "orderBy", "orderDirection"],
+    "accountSummary": ["limit"]
+  },
+  "default_entity": "positions",
+  "default_fields": ["symbol", "quantity", "marketValue"]
+}

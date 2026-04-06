@@ -1,0 +1,40 @@
+{
+  "portfolio_data": {
+    "positions": [
+      {
+        "symbol": "QQQ",
+        "quantity": 100.104,
+        "marketValue": 52232.14,
+        "todaysGainLoss": 251.62,
+        "totalGainLoss": 4812.40,
+        "securityType": "Equity"
+      },
+      {
+        "symbol": "BAC",
+        "quantity": 250.0,
+        "marketValue": 9825.0,
+        "todaysGainLoss": -21.5,
+        "totalGainLoss": 512.2,
+        "securityType": "Equity"
+      },
+      {
+        "symbol": "SPAXX",
+        "quantity": 1200.0,
+        "marketValue": 1200.0,
+        "todaysGainLoss": 0.0,
+        "totalGainLoss": 0.0,
+        "securityType": "Core"
+      }
+    ],
+    "accountSummary": [
+      {
+        "totalMarketValue": 63257.14,
+        "totalCostBasis": 57944.0,
+        "totalUnrealizedGainLoss": 5313.14,
+        "cashAvailableToWithdraw": 4200.0,
+        "cashAvailableToTrade": 8200.0,
+        "isPartialBalance": false
+      }
+    ]
+  }
+}
