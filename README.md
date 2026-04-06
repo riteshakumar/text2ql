@@ -74,6 +74,7 @@ export OPENAI_API_KEY=...
 text2ql "show latest 5 orders with status active" \
   --target graphql \
   --mode llm \
+  --llm-rewrite on \
   --schema '{"entities":["orders"],"fields":{"orders":["id","status","createdAt"]},"args":{"orders":["status","limit","orderBy","orderDirection"]}}'
 
 # 4) LLM mode (SQL)
@@ -81,6 +82,7 @@ export OPENAI_API_KEY=...
 text2ql "show latest 5 orders with status active" \
   --target sql \
   --mode llm \
+  --llm-rewrite on \
   --schema '{"entities":["orders"],"fields":{"orders":["id","status","createdAt"]}}'
 ```
 
@@ -146,6 +148,7 @@ Operational notes:
 - Set `OPENAI_API_KEY` (or `TEXT2QL_API_KEY`) for `--mode llm`.
 - `--expected-query` / `--expected-query-file` / `--expected-execution-file` require `--data-file`.
 - If expected query execution cannot be derived from payload JSON, CLI emits an eval warning and skips that item from accuracy denominator.
+- `--llm-rewrite on` enables schema-aware LLM utterance rewrite before generation (LLM mode only).
 
 ## Feature Matrix
 
@@ -204,6 +207,25 @@ text2ql "how many qqq do i own" \
   --rewrite-plugins generic,portfolio \
   --domain portfolio \
   --expected-query-file ./expected_query.graphql
+
+5) Enable schema-aware LLM utterance rewrite:
+
+```bash
+export OPENAI_API_KEY=...
+text2ql "how many qqq do i own" \
+  --target graphql \
+  --mode llm \
+  --llm-rewrite on \
+  --schema-file ./schema.json \
+  --mapping-file ./mapping.generated.json \
+  --data-file ./data.json
+```
+
+CLI JSON output includes:
+
+- `prompt`: original user utterance
+- `rewritten_prompt`: prompt after optional LLM rewrite
+- `rewrite`: rewrite metadata (`applied`, `reason/source`, `confidence`, `notes`)
 ```
 
 ## Streamlit Playground
@@ -221,8 +243,38 @@ What you get:
 - GraphQL and SQL target switch.
 - Bundled sample data (`examples/sample_schema.json`, `examples/sample_data.json`) or uploaded JSON files.
 - Synthetic rewrite controls (`variants`, `plugins`, `domain`).
+- LLM utterance rewrite toggle (schema-aware pre-generation rewrite in LLM mode).
 - GraphQL execution on JSON payload + optional expected-query execution match.
 - SQL optional expected-query signature match.
+
+## Sample Runners
+
+The `research` workspace includes sample runners that support synthetic variants and LLM rewrite:
+
+GraphQL:
+
+```bash
+python3 sample_text2ql_graphql_runner.py \
+  --schema-file ./test_schema_definition.json \
+  --portfolio-file ./test_customer_portfolio_data.json \
+  --prompt "how many qqq do i own" \
+  --mode llm \
+  --llm-model gpt-4o-mini \
+  --llm-rewrite on \
+  --verbose
+```
+
+SQL:
+
+```bash
+python3 sample_text2ql_sql_runner.py \
+  --schema-file ./test_schema_definition.json \
+  --portfolio-file ./test_customer_portfolio_data.json \
+  --prompt "show latest positions" \
+  --mode llm \
+  --llm-model gpt-4o-mini \
+  --llm-rewrite on
+```
 
 ## Quickstart
 
