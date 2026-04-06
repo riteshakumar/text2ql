@@ -118,3 +118,59 @@ def test_sql_engine_supports_relation_join_with_local_filters() -> None:
 
     assert "LEFT JOIN orders orders ON orders.customerId = customers.id" in result.query
     assert "orders.status = 'shipped'" in result.query
+
+
+def test_sql_engine_parses_grouped_filters_with_parentheses_precedence() -> None:
+    engine = SQLEngine()
+    request = QueryRequest(
+        text="show products where (status active and price >= 10) or category in retail, wholesale",
+        target="sql",
+        schema={"entities": ["products"], "fields": {"products": ["price", "status", "category"]}},
+    )
+
+    result = engine.generate(request)
+
+    assert "products.status = 'active'" in result.query
+    assert "products.price >= 10" in result.query
+    assert "products.category IN ('retail', 'wholesale')" in result.query
+    assert " OR " in result.query
+
+
+def test_sql_engine_rejects_schema_relation_not_in_introspection() -> None:
+    engine = SQLEngine()
+    request = QueryRequest(
+        text="show customers with orders status shipped",
+        target="sql",
+        schema={
+            "entities": ["customers"],
+            "fields": {"customers": ["id", "email"]},
+            "relations": {
+                "customers": {
+                    "orders": {
+                        "target": "orders",
+                        "fields": ["id", "status", "total"],
+                        "args": ["status"],
+                        "aliases": ["order"],
+                    }
+                }
+            },
+            "introspection": {
+                "query": {"customers": {"type": "[Customer]", "args": {}}},
+                "types": {
+                    "Customer": {"fields": {"id": "ID", "email": "String", "profile": "Profile"}},
+                    "Order": {"fields": {"id": "ID", "status": "String", "total": "Float"}},
+                    "Profile": {"fields": {"id": "ID"}},
+                },
+            },
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert "LEFT JOIN orders" not in result.query
+    notes = result.metadata.get("validation_notes", [])
+    assert any("dropped invalid relation 'orders'" in note for note in notes)
+
+
+def test_sql_engine_extract_filter_value_ignores_spurious_token() -> None:
+    assert SQLEngine._extract_filter_value("status", "show account where status is") is None

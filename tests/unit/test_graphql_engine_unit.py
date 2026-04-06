@@ -449,3 +449,81 @@ def test_engine_uses_semantic_field_match_for_metric_prompt() -> None:
 
     assert result.metadata.get("entity") == "gainLossBalanceDetail"
     assert "totalMarketVal" in result.query
+
+
+def test_engine_parses_grouped_filters_with_parentheses_precedence() -> None:
+    engine = GraphQLEngine()
+    request = QueryRequest(
+        text="show products where (status active and price >= 10) or category in retail, wholesale",
+        target="graphql",
+        schema={
+            "entities": ["products"],
+            "fields": {"products": ["id", "status", "price", "category"]},
+            "args": {"products": ["or", "and", "status", "price_gte", "category_in"]},
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert "or:" in result.query
+    assert "and:" in result.query
+    assert 'status: "active"' in result.query
+    assert "price_gte: 10" in result.query
+    assert 'category_in: ["retail", "wholesale"]' in result.query
+
+
+def test_engine_rejects_schema_relation_not_in_introspection() -> None:
+    engine = GraphQLEngine()
+    request = QueryRequest(
+        text="show customers with orders total",
+        target="graphql",
+        schema={
+            "entities": ["customers"],
+            "fields": {"customers": ["id", "email"]},
+            "relations": {
+                "customers": {
+                    "orders": {
+                        "target": "orders",
+                        "fields": ["id", "total"],
+                        "args": ["limit"],
+                    }
+                }
+            },
+            "introspection": {
+                "query": {"customers": {"type": "[Customer]", "args": {}}},
+                "types": {
+                    "Customer": {
+                        "fields": {"id": "ID", "email": "String", "profile": "Profile"},
+                    },
+                    "Order": {"fields": {"id": "ID", "total": "Float"}},
+                    "Profile": {"fields": {"id": "ID"}},
+                },
+            },
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert "orders {" not in result.query
+    notes = result.metadata.get("validation_notes", [])
+    assert any("dropped unknown relation 'orders'" in note for note in notes)
+
+
+def test_engine_escapes_string_arguments_safely() -> None:
+    engine = GraphQLEngine()
+    request = QueryRequest(
+        text='show users where status "active"',
+        target="graphql",
+        schema={
+            "entities": ["users"],
+            "fields": {"users": ["id", "status"]},
+            "args": {"users": ["status"]},
+        },
+        mapping={"filters": {"status": "status"}},
+    )
+
+    # Direct format helper assertion for escaping behavior.
+    assert GraphQLEngine._format_arg('x"y\\z') == '"x\\"y\\\\z"'
+
+    result = engine.generate(request)
+    assert "users(status:" in result.query or "users {" in result.query

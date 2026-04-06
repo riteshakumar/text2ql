@@ -12,6 +12,8 @@ from text2ql.types import QueryRequest, QueryResult
 
 from .base import QueryEngine
 
+_SPURIOUS_FILTER_VALUES = {"where", "with", "and", "or", "for", "of", "in", "is"}
+
 
 @dataclass(slots=True)
 class _RelationJoin:
@@ -345,8 +347,8 @@ class SQLEngine(QueryEngine):
     def _parse_grouped_filters(self, lowered: str) -> dict[str, Any]:
         if " and " not in lowered and " or " not in lowered:
             return {}
-        where_clause = self._extract_where_clause(lowered) or lowered
-        or_parts = [part.strip() for part in where_clause.split(" or ") if part.strip()]
+        where_clause = self._strip_outer_parentheses(self._extract_where_clause(lowered) or lowered)
+        or_parts = self._split_top_level(where_clause, "or")
         if len(or_parts) <= 1:
             and_nodes = self._parse_and_nodes(where_clause)
             return {"and": and_nodes} if len(and_nodes) > 1 else {}
@@ -361,13 +363,83 @@ class SQLEngine(QueryEngine):
 
     def _parse_and_nodes(self, text: str) -> list[dict[str, Any]]:
         nodes: list[dict[str, Any]] = []
-        for part in [segment.strip() for segment in text.split(" and ") if segment.strip()]:
+        for part in self._split_top_level(text, "and"):
             if part.startswith("where "):
                 part = part[6:].strip()
-            match = re.match(r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:is\s+)?([a-zA-Z0-9_.:-]+)$", part)
-            if match:
-                nodes.append({match.group(1): match.group(2)})
+            part = self._strip_outer_parentheses(part)
+            for pattern, suffix in [
+                (r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*(>=|<=|>|<)\s*([a-zA-Z0-9_.:-]+)$", None),
+                (r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:!=|is not|not)\s*([a-zA-Z0-9_.:-]+)$", "_ne"),
+                (r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:is\s+)?([a-zA-Z0-9_.:-]+)$", ""),
+            ]:
+                match = re.match(pattern, part)
+                if not match:
+                    continue
+                if suffix is None:
+                    field, operator, value = match.group(1), match.group(2), match.group(3)
+                    op_suffix = {">=": "_gte", "<=": "_lte", ">": "_gt", "<": "_lt"}[operator]
+                    nodes.append({f"{field}{op_suffix}": value})
+                elif suffix == "_ne":
+                    nodes.append({f"{match.group(1)}_ne": match.group(2)})
+                else:
+                    nodes.append({match.group(1): match.group(2)})
+                break
         return nodes
+
+    @staticmethod
+    def _split_top_level(text: str, operator: str) -> list[str]:
+        if not text:
+            return []
+        parts: list[str] = []
+        depth = 0
+        start = 0
+        i = 0
+        token = f" {operator} "
+        token_len = len(token)
+        while i < len(text):
+            ch = text[i]
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if depth == 0 and text[i : i + token_len] == token:
+                part = text[start:i].strip()
+                if part:
+                    parts.append(part)
+                i += token_len
+                start = i
+                continue
+            i += 1
+        tail = text[start:].strip()
+        if tail:
+            parts.append(tail)
+        return parts
+
+    @staticmethod
+    def _strip_outer_parentheses(text: str) -> str:
+        candidate = text.strip()
+        while candidate.startswith("(") and candidate.endswith(")"):
+            depth = 0
+            balanced = True
+            for idx, ch in enumerate(candidate):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth < 0:
+                        balanced = False
+                        break
+                    if depth == 0 and idx != len(candidate) - 1:
+                        balanced = False
+                        break
+            if not balanced or depth != 0:
+                break
+            candidate = candidate[1:-1].strip()
+        return candidate
 
     def _detect_order(self, lowered: str, selected_columns: list[str]) -> tuple[str | None, str | None]:
         if "latest order" in lowered:
@@ -533,9 +605,13 @@ class SQLEngine(QueryEngine):
 
     @staticmethod
     def _allowed_filter_keys(config: Any, table: str, allowed_columns: set[str]) -> set[str]:
+        table_args = set(config.args_by_entity.get(table, []))
+        intro_args = set(config.introspection_query_args.get(table, {}).keys())
         keys = set(allowed_columns)
-        keys.update(config.args_by_entity.get(table, []))
-        keys.update(config.introspection_query_args.get(table, {}).keys())
+        if intro_args:
+            keys.update((table_args & intro_args) or intro_args)
+        else:
+            keys.update(table_args)
         return keys
 
     def _coerce_filter_values(
@@ -615,6 +691,8 @@ class SQLEngine(QueryEngine):
         table: str,
         notes: list[str],
     ) -> list[_RelationJoin]:
+        intro_relations = config.introspection_relation_targets.get(table, {})
+        strict_intro_relations = bool(intro_relations)
         relation_map = config.relations_by_entity.get(table, {})
         valid: list[_RelationJoin] = []
         for join in joins:
@@ -622,7 +700,15 @@ class SQLEngine(QueryEngine):
             if relation is None:
                 notes.append(f"dropped invalid relation '{join.relation}' for '{table}'")
                 continue
+            if strict_intro_relations and join.relation not in intro_relations:
+                notes.append(f"dropped invalid relation '{join.relation}' for '{table}'")
+                continue
             allowed = set(relation.fields)
+            if join.relation in intro_relations:
+                target_type = intro_relations[join.relation]
+                intro_allowed = set(config.introspection_entity_fields.get(target_type, set()))
+                if intro_allowed:
+                    allowed = allowed.intersection(intro_allowed) or intro_allowed
             join_fields = [field for field in join.fields if field in allowed] or (relation.fields[:1] or ["id"])
             join_filters = {
                 key: value
@@ -764,7 +850,10 @@ class SQLEngine(QueryEngine):
         intro = sorted(config.introspection_entity_fields.get(table, set()))
         if not intro:
             return base
-        return sorted(set(base) | set(intro))
+        if not base:
+            return intro
+        overlap = sorted(set(base).intersection(set(intro)))
+        return overlap or intro
 
     @staticmethod
     def _extract_where_clause(lowered: str) -> str | None:
@@ -776,10 +865,19 @@ class SQLEngine(QueryEngine):
     @staticmethod
     def _extract_filter_value(alias: str, text: str) -> str | None:
         key_pattern = re.escape(alias)
-        matches = list(re.finditer(rf"\b{key_pattern}\b\s+(?:is\s+)?([a-zA-Z0-9_]+)", text))
-        if not matches:
-            return None
-        return matches[-1].group(1)
+        patterns = [
+            rf"\b{key_pattern}\b\s*(?:=|:)\s*([^\s,)\]]+)",
+            rf"\b{key_pattern}\b\s+(?:is\s+|equals\s+|equal to\s+)?([^\s,)\]]+)",
+        ]
+        for pattern in patterns:
+            matches = list(re.finditer(pattern, text))
+            if not matches:
+                continue
+            candidate = matches[-1].group(1).strip().strip('"').strip("'")
+            if candidate.lower() in _SPURIOUS_FILTER_VALUES:
+                continue
+            return candidate
+        return None
 
     @staticmethod
     def _contains_token(text: str, token: str) -> bool:

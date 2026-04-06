@@ -387,7 +387,6 @@ def _domain_template_rewrites(example: DatasetExample, domain: str | None) -> li
             rewrites.append(f"show {entity} by {entity_dates[0]}")
         if entity_filters and entity_values:
             rewrites.append(f"show {entity} where {entity_filters[0]} is {entity_values[0]}")
-            rewrites.append(f"list {entity} with {entity_filters[0]} {entity_values[0]}")
     return rewrites
 
 
@@ -822,6 +821,11 @@ _FILTER_HINTS = (
     "stage",
     "state",
     "symbol",
+    "acct",
+    "account",
+    "id",
+    "num",
+    "number",
     "region",
     "segment",
     "priority",

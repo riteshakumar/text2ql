@@ -562,11 +562,11 @@ class GraphQLEngine(QueryEngine):
         return {}
 
     def _parse_grouped_precedence_filters(self, lowered: str) -> dict[str, Any]:
-        # Parse OR groups first, then AND within each OR branch.
         if " or " not in lowered and _AND_TOKEN not in lowered:
             return {}
-        where_clause = self._extract_where_clause(lowered) or lowered
-        or_parts = [part.strip() for part in where_clause.split(" or ") if part.strip()]
+        where_clause = self._strip_outer_parentheses(self._extract_where_clause(lowered) or lowered)
+        # Parse OR groups first at top-level only, then AND within each OR branch.
+        or_parts = self._split_top_level(where_clause, "or")
         if len(or_parts) <= 1:
             and_conditions = self._parse_and_conditions(where_clause)
             return {"and": and_conditions} if len(and_conditions) > 1 else {}
@@ -584,13 +584,69 @@ class GraphQLEngine(QueryEngine):
 
     def _parse_and_conditions(self, text: str) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
-        for part in [segment.strip() for segment in text.split(_AND_TOKEN) if segment.strip()]:
+        for part in self._split_top_level(text, "and"):
             if part.startswith("where "):
                 part = part[6:].strip()
+            part = self._strip_outer_parentheses(part)
             condition = self._parse_atomic_filter_condition(part)
             if condition:
                 out.append(condition)
         return out
+
+    @staticmethod
+    def _split_top_level(text: str, operator: str) -> list[str]:
+        if not text:
+            return []
+        parts: list[str] = []
+        depth = 0
+        start = 0
+        i = 0
+        token = f" {operator} "
+        token_len = len(token)
+        while i < len(text):
+            ch = text[i]
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if depth == 0 and text[i : i + token_len] == token:
+                part = text[start:i].strip()
+                if part:
+                    parts.append(part)
+                i += token_len
+                start = i
+                continue
+            i += 1
+        tail = text[start:].strip()
+        if tail:
+            parts.append(tail)
+        return parts
+
+    @staticmethod
+    def _strip_outer_parentheses(text: str) -> str:
+        candidate = text.strip()
+        while candidate.startswith("(") and candidate.endswith(")"):
+            depth = 0
+            balanced = True
+            for idx, ch in enumerate(candidate):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth < 0:
+                        balanced = False
+                        break
+                    if depth == 0 and idx != len(candidate) - 1:
+                        balanced = False
+                        break
+            if not balanced or depth != 0:
+                break
+            candidate = candidate[1:-1].strip()
+        return candidate
 
     def _parse_atomic_filter_condition(self, text: str) -> dict[str, Any] | None:
         for pattern, suffix in [
@@ -620,10 +676,19 @@ class GraphQLEngine(QueryEngine):
     @staticmethod
     def _extract_filter_value(alias: str, text: str) -> str | None:
         key_pattern = re.escape(alias)
-        matches = list(re.finditer(rf"\b{key_pattern}\b\s+(?:is\s+)?(\w+)", text))
-        if not matches:
-            return None
-        return matches[-1].group(1)
+        patterns = [
+            rf"\b{key_pattern}\b\s*(?:=|:)\s*([^\s,)\]]+)",
+            rf"\b{key_pattern}\b\s+(?:is\s+|equals\s+|equal to\s+)?([^\s,)\]]+)",
+        ]
+        for pattern in patterns:
+            matches = list(re.finditer(pattern, text))
+            if not matches:
+                continue
+            candidate = matches[-1].group(1).strip().strip('"').strip("'")
+            if GraphQLEngine._is_spurious_filter_value(candidate):
+                continue
+            return candidate
+        return None
 
     @staticmethod
     def _detect_owned_asset(lowered: str) -> str | None:
@@ -647,14 +712,22 @@ class GraphQLEngine(QueryEngine):
         entity: str,
         filter_key_aliases: dict[str, str],
     ) -> str | None:
+        entity_args = {arg.lower(): arg for arg in config.args_by_entity.get(entity, [])}
+        entity_fields = {field.lower(): field for field in self._fields_for_entity(config, entity)}
         for candidate in self._identifier_field_candidates():
             canonical = filter_key_aliases.get(candidate)
-            if isinstance(canonical, str) and canonical:
-                return canonical
-        schema_fields = self._fields_for_entity(config, entity)
-        for field in schema_fields:
-            if field.lower() in self._identifier_field_candidates():
-                return field
+            if not (isinstance(canonical, str) and canonical):
+                continue
+            canonical_lower = canonical.lower()
+            if canonical_lower in entity_args:
+                return entity_args[canonical_lower]
+            if canonical_lower in entity_fields:
+                return entity_fields[canonical_lower]
+        for candidate in self._identifier_field_candidates():
+            if candidate in entity_args:
+                return entity_args[candidate]
+            if candidate in entity_fields:
+                return entity_fields[candidate]
         return None
 
     def _resolve_filter_key_for_entity(
@@ -1038,7 +1111,8 @@ class GraphQLEngine(QueryEngine):
         if isinstance(value, (int, float)):
             return str(value)
         if isinstance(value, str):
-            return value if value.isdigit() else f'"{value}"'
+            escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+            return f'"{escaped}"'
         if isinstance(value, list):
             return "[" + ", ".join(GraphQLEngine._format_arg(item) for item in value) + "]"
         if isinstance(value, dict):
@@ -1149,7 +1223,8 @@ class GraphQLEngine(QueryEngine):
             return allowed_fields
         if not allowed_fields:
             return sorted(introspection_fields)
-        return sorted(set(allowed_fields) | introspection_fields)
+        intersection = sorted(set(allowed_fields).intersection(introspection_fields))
+        return intersection or sorted(introspection_fields)
 
     def _validate_fields(
         self,
@@ -1179,7 +1254,10 @@ class GraphQLEngine(QueryEngine):
         introspection_args = config.introspection_query_args.get(entity, {})
         if not introspection_args:
             return allowed_args
-        return sorted(set(allowed_args) | set(introspection_args.keys()))
+        if not allowed_args:
+            return sorted(introspection_args.keys())
+        intersection = sorted(set(allowed_args).intersection(set(introspection_args.keys())))
+        return intersection or sorted(introspection_args.keys())
 
     def _validate_filters(
         self,
@@ -1458,11 +1536,29 @@ class GraphQLEngine(QueryEngine):
         relation_name: str,
         config: NormalizedSchemaConfig,
     ) -> NormalizedRelation | None:
+        intro_relations = config.introspection_relation_targets.get(entity, {})
+        strict_intro_relations = bool(intro_relations)
         relation_map = config.relations_by_entity.get(entity, {})
         relation = relation_map.get(relation_name)
         if relation is not None:
+            if strict_intro_relations and relation_name not in intro_relations:
+                return None
+            if relation_name in intro_relations:
+                target_type = intro_relations[relation_name]
+                intro_fields = sorted(config.introspection_entity_fields.get(target_type, {"id"}))
+                filtered_fields = (
+                    sorted(set(relation.fields).intersection(set(intro_fields)))
+                    if relation.fields
+                    else intro_fields
+                )
+                return NormalizedRelation(
+                    name=relation.name,
+                    target=target_type,
+                    fields=filtered_fields or intro_fields,
+                    args=relation.args,
+                    aliases=relation.aliases,
+                )
             return relation
-        intro_relations = config.introspection_relation_targets.get(entity, {})
         if relation_name not in intro_relations:
             return None
         target_type = intro_relations[relation_name]
