@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -30,7 +31,7 @@ class OpenAICompatibleProvider(LLMProvider):
         self.max_retries = max_retries
         self.retry_backoff_seconds = retry_backoff_seconds
 
-    def complete(self, system_prompt: str, user_prompt: str) -> str:
+    def _build_request(self, system_prompt: str, user_prompt: str) -> urllib.request.Request:
         payload = {
             "model": self.model,
             "messages": [
@@ -39,27 +40,56 @@ class OpenAICompatibleProvider(LLMProvider):
             ],
             "temperature": 0.0,
         }
-        body = json.dumps(payload).encode("utf-8")
-        request = urllib.request.Request(
+        return urllib.request.Request(
             url=f"{self.base_url}/chat/completions",
-            data=body,
+            data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {self.api_key}",
             },
             method="POST",
         )
-        raw = self._request_with_retries(request)
 
+    @staticmethod
+    def _parse_response(raw: str) -> str:
         decoded = json.loads(raw)
         choices = decoded.get("choices", [])
         if not choices:
             raise RuntimeError("LLM provider returned no choices")
-        message = choices[0].get("message", {})
-        content = message.get("content", "")
+        content = choices[0].get("message", {}).get("content", "")
         if not isinstance(content, str):
             raise RuntimeError("LLM provider returned invalid content payload")
         return content.strip()
+
+    def complete(self, system_prompt: str, user_prompt: str) -> str:
+        raw = self._request_with_retries(self._build_request(system_prompt, user_prompt))
+        return self._parse_response(raw)
+
+    async def acomplete(self, system_prompt: str, user_prompt: str) -> str:
+        """Async completion with non-blocking retries — no thread held during backoff."""
+        request = self._build_request(system_prompt, user_prompt)
+        attempts = self.max_retries + 1
+        last_error: Exception | None = None
+
+        for attempt in range(attempts):
+            try:
+                raw = await asyncio.to_thread(
+                    urllib.request.urlopen, request, self.timeout_seconds
+                )
+                return self._parse_response(raw.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                last_error = exc
+                if exc.code != 429 or attempt == attempts - 1:
+                    break
+                retry_after = exc.headers.get("Retry-After")
+                await asyncio.sleep(self._retry_delay(attempt, retry_after))
+            except urllib.error.URLError as exc:
+                last_error = exc
+                if attempt == attempts - 1:
+                    break
+                await asyncio.sleep(self._retry_delay(attempt, None))
+
+        raise RuntimeError(f"LLM provider request failed: {last_error}") from last_error
 
     def _request_with_retries(self, request: urllib.request.Request) -> str:
         attempts = self.max_retries + 1
@@ -74,8 +104,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 if exc.code != 429 or attempt == attempts - 1:
                     break
                 retry_after = exc.headers.get("Retry-After")
-                wait_seconds = self._retry_delay(attempt, retry_after)
-                time.sleep(wait_seconds)
+                time.sleep(self._retry_delay(attempt, retry_after))
             except urllib.error.URLError as exc:
                 last_error = exc
                 if attempt == attempts - 1:

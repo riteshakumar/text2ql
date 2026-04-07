@@ -15,7 +15,7 @@ from text2ql.schema_config import (
 )
 from text2ql.types import QueryRequest, QueryResult
 
-from .base import QueryEngine
+from .base import QueryEngine, compute_deterministic_confidence
 
 _WORD_IDENTIFIER = r"([A-Za-z_]\w*)"
 _FILTER_VALUE = r"([\w.:-]+)"
@@ -68,7 +68,14 @@ class GraphQLEngine(QueryEngine):
         if filters:
             explanation += f" Added filters: {filters}."
 
-        confidence = 0.62 if filters else 0.56
+        confidence = compute_deterministic_confidence(
+            entity=entity,
+            fields=fields,
+            filters=filters,
+            validation_notes=validation_notes,
+            config=config,
+            extra_signals={"aggregations": aggregations, "nested": nested},
+        )
 
         return QueryResult(
             query=query,
@@ -87,31 +94,32 @@ class GraphQLEngine(QueryEngine):
             },
         )
 
-    def _generate_with_llm(
+    def _prepare_llm_prompts(
         self,
         prompt: str,
         config: NormalizedSchemaConfig,
         context: dict,
-    ) -> QueryResult | None:
+    ) -> tuple[str, str, str] | None:
+        """Build (system_prompt, user_prompt, resolved_language) or return None on error."""
         template = resolve_prompt_template(context)
         language = str(context.get("language", "english"))
         try:
             resolved_language = resolve_language(language)
         except ValueError:
             return None
-
         system_prompt, user_prompt = build_graphql_prompts(
-            prompt,
-            config,
-            template,
-            language=resolved_language,
+            prompt, config, template, language=resolved_language,
         )
-        system_prompt = self._apply_system_context(system_prompt, context)
-        try:
-            raw = self.provider.complete(system_prompt=system_prompt, user_prompt=user_prompt)
-        except (RuntimeError, ValueError, TypeError) as exc:
-            self._last_llm_error = f"LLM provider error: {exc}"
-            return None
+        return self._apply_system_context(system_prompt, context), user_prompt, resolved_language
+
+    def _build_llm_result(
+        self,
+        raw: str,
+        prompt: str,
+        config: NormalizedSchemaConfig,
+        resolved_language: str,
+    ) -> QueryResult | None:
+        """Parse raw LLM output and assemble a QueryResult, or return None on parse error."""
         try:
             intent = parse_graphql_intent(raw, config, language=resolved_language)
         except ConstrainedOutputError as exc:
@@ -128,12 +136,7 @@ class GraphQLEngine(QueryEngine):
             config=config,
         )
         entity, fields, filters, aggregations, nested, validation_notes = self._validate_components(
-            reconciled_entity,
-            reconciled_fields,
-            reconciled_filters,
-            aggregations,
-            nested,
-            config,
+            reconciled_entity, reconciled_fields, reconciled_filters, aggregations, nested, config,
         )
         query = self._build_query(entity, fields, filters, aggregations, nested)
         validation_notes.extend(self._validate_generated_query_against_introspection(query, config))
@@ -154,6 +157,62 @@ class GraphQLEngine(QueryEngine):
                 "validation_notes": validation_notes,
             },
         )
+
+    def _generate_with_llm(
+        self,
+        prompt: str,
+        config: NormalizedSchemaConfig,
+        context: dict,
+    ) -> QueryResult | None:
+        prepared = self._prepare_llm_prompts(prompt, config, context)
+        if prepared is None:
+            return None
+        system_prompt, user_prompt, resolved_language = prepared
+        try:
+            raw = self.provider.complete(system_prompt=system_prompt, user_prompt=user_prompt)
+        except (RuntimeError, ValueError, TypeError) as exc:
+            self._last_llm_error = f"LLM provider error: {exc}"
+            return None
+        return self._build_llm_result(raw, prompt, config, resolved_language)
+
+    async def _agenerate_with_llm(
+        self,
+        prompt: str,
+        config: NormalizedSchemaConfig,
+        context: dict,
+    ) -> QueryResult | None:
+        prepared = self._prepare_llm_prompts(prompt, config, context)
+        if prepared is None:
+            return None
+        system_prompt, user_prompt, resolved_language = prepared
+        try:
+            raw = await self.provider.acomplete(system_prompt=system_prompt, user_prompt=user_prompt)
+        except (RuntimeError, ValueError, TypeError) as exc:
+            self._last_llm_error = f"LLM provider error: {exc}"
+            return None
+        return self._build_llm_result(raw, prompt, config, resolved_language)
+
+    async def agenerate(self, request: QueryRequest) -> QueryResult:
+        """Async generate — LLM I/O is truly async; deterministic path runs inline."""
+        prompt = request.text.strip()
+        config = normalize_schema_config(request.schema, request.mapping)
+        mode = str(request.context.get("mode", "deterministic")).strip().lower()
+        self._last_llm_error = None
+
+        if mode == "llm" and self.provider is not None:
+            llm_result = await self._agenerate_with_llm(prompt, config, request.context)
+            if llm_result is not None:
+                return llm_result
+
+        # Deterministic path is pure CPU — safe to run inline in async context
+        det_request = QueryRequest(
+            text=request.text,
+            target=request.target,
+            schema=request.schema,
+            mapping=request.mapping,
+            context={**request.context, "mode": "deterministic"},
+        )
+        return self.generate(det_request)
 
     def _reconcile_owned_asset_intent(
         self,

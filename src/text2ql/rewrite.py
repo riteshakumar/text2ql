@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import Any
@@ -53,6 +54,88 @@ def rewrite_user_utterance(
     user_prompt = _build_user_prompt(text=text, config=config, target=target)
     try:
         raw = provider.complete(system_prompt=system_prompt, user_prompt=user_prompt)
+    except (RuntimeError, ValueError, TypeError) as exc:
+        return text, {"applied": False, "reason": f"provider_error: {exc}"}
+
+    payload = _load_json_payload(raw)
+    if not isinstance(payload, dict):
+        return text, {"applied": False, "reason": "rewrite_parse_error", "raw": raw}
+    rewritten = payload.get("rewritten_text")
+    if not isinstance(rewritten, str) or not rewritten.strip():
+        return text, {"applied": False, "reason": "missing_rewritten_text", "raw": raw}
+    if _looks_like_query_text(rewritten):
+        return text, {
+            "applied": False,
+            "reason": "guard_rejected_query_like_rewrite",
+            "notes": "Rewrite must remain natural language and not emit SQL/GraphQL query text.",
+            "raw": raw,
+        }
+    if _has_ownership_intent(text) and not _has_ownership_intent(rewritten):
+        return text, {
+            "applied": False,
+            "reason": "guard_rejected_intent_drift",
+            "notes": "Original prompt expressed ownership intent; rewritten prompt removed it.",
+            "raw": raw,
+        }
+
+    return rewritten.strip(), {
+        "applied": rewritten.strip() != text.strip(),
+        "source": "llm_rewrite",
+        "confidence": payload.get("confidence"),
+        "notes": payload.get("notes", ""),
+        "raw": raw,
+    }
+
+
+async def arewrite_user_utterance(
+    text: str,
+    target: str,
+    schema: dict[str, Any] | None,
+    mapping: dict[str, Any] | None,
+    provider: LLMProvider | None,
+    system_context: str = "",
+) -> tuple[str, dict[str, Any]]:
+    """Async version of rewrite_user_utterance.
+
+    The deterministic canonicalization path runs inline (no I/O).
+    The LLM call uses ``provider.acomplete`` so it doesn't block the event loop.
+    """
+    if provider is None:
+        return text, {"applied": False, "reason": "provider_unavailable"}
+
+    config = normalize_schema_config(schema, mapping)
+    owned_asset = _match_owned_asset_phrase(text.lower())
+    quantity_label = _preferred_quantity_label(config)
+
+    if owned_asset is not None and _schema_supports_identifier_and_quantity(config):
+        canonical = f"how many {quantity_label} of {owned_asset.upper()} do i own"
+        return canonical, {
+            "applied": canonical.strip() != text.strip(),
+            "source": "schema_slot_canonicalizer",
+            "confidence": 1.0,
+            "notes": "Canonicalized owned-asset quantity intent using schema-derived slot hints.",
+            "raw": "",
+        }
+
+    inferred_asset = _match_how_many_asset_phrase(text.lower())
+    if (
+        inferred_asset is not None
+        and _schema_supports_identifier_and_quantity(config)
+        and _looks_like_identifier_value(inferred_asset, config)
+    ):
+        canonical = f"how many {quantity_label} of {inferred_asset.upper()} do i own"
+        return canonical, {
+            "applied": canonical.strip() != text.strip(),
+            "source": "schema_slot_canonicalizer",
+            "confidence": 0.95,
+            "notes": "Canonicalized 'how many <asset>' intent into ownership quantity query using schema/mapping values.",
+            "raw": "",
+        }
+
+    system_prompt = _build_system_prompt(target, system_context)
+    user_prompt = _build_user_prompt(text=text, config=config, target=target)
+    try:
+        raw = await provider.acomplete(system_prompt=system_prompt, user_prompt=user_prompt)
     except (RuntimeError, ValueError, TypeError) as exc:
         return text, {"applied": False, "reason": f"provider_error: {exc}"}
 

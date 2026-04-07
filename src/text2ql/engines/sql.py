@@ -10,7 +10,7 @@ from text2ql.providers.base import LLMProvider
 from text2ql.schema_config import NormalizedRelation, normalize_schema_config
 from text2ql.types import QueryRequest, QueryResult
 
-from .base import QueryEngine
+from .base import QueryEngine, compute_deterministic_confidence
 
 _SPURIOUS_FILTER_VALUES = {"where", "with", "and", "or", "for", "of", "in", "is"}
 
@@ -89,10 +89,18 @@ class SQLEngine(QueryEngine):
             offset=offset,
             exact_filter_keys=exact_filter_keys,
         )
+        confidence = compute_deterministic_confidence(
+            entity=table,
+            fields=columns,
+            filters=filters,
+            validation_notes=notes,
+            config=config,
+            extra_signals={"joins": joins, "order_by": order_by},
+        )
         return QueryResult(
             query=query,
             target="sql",
-            confidence=0.62 if filters else 0.56,
+            confidence=confidence,
             explanation=f"Mapped text to SQL on table '{table}' with columns {columns}.",
             metadata={
                 "table": table,
@@ -121,72 +129,54 @@ class SQLEngine(QueryEngine):
             },
         )
 
-    def _generate_with_llm(
+    def _prepare_llm_prompts(
         self,
         prompt: str,
         config: Any,
         context: dict[str, Any],
-    ) -> QueryResult | None:
+    ) -> tuple[str, str, str] | None:
+        """Build (system_prompt, user_prompt, resolved_language) or return None on error."""
         template = resolve_prompt_template(context)
         language = str(context.get("language", "english"))
         try:
             resolved_language = resolve_language(language)
         except ValueError:
             return None
+        system_prompt, user_prompt = build_sql_prompts(prompt, config, template, language=resolved_language)
+        return self._apply_system_context(system_prompt, context), user_prompt, resolved_language
 
-        system_prompt, user_prompt = build_sql_prompts(
-            prompt,
-            config,
-            template,
-            language=resolved_language,
-        )
-        system_prompt = self._apply_system_context(system_prompt, context)
-        try:
-            raw = self.provider.complete(system_prompt=system_prompt, user_prompt=user_prompt)
-        except (RuntimeError, ValueError, TypeError) as exc:
-            self._last_llm_error = f"LLM provider error: {exc}"
-            return None
+    def _build_llm_result(
+        self,
+        raw: str,
+        prompt: str,
+        config: Any,
+        resolved_language: str,
+    ) -> QueryResult | None:
+        """Parse raw LLM output and assemble a QueryResult, or return None on parse error."""
         try:
             intent = parse_sql_intent(raw, config, language=resolved_language)
         except ConstrainedOutputError as exc:
             self._last_llm_error = f"LLM output parse error: {exc}"
             return None
 
-        table = intent.table
-        columns = list(intent.columns)
-        filters = dict(intent.filters)
         table, columns, filters = self._reconcile_owned_asset_intent(
             prompt=prompt,
-            table=table,
-            columns=columns,
-            filters=filters,
+            table=intent.table,
+            columns=list(intent.columns),
+            filters=dict(intent.filters),
             config=config,
         )
         joins = self._materialize_llm_joins(intent.joins, config, table)
-        order_by = intent.order_by
-        order_dir = intent.order_dir
-        limit = intent.limit
-        offset = intent.offset
+        order_by, order_dir, limit, offset = intent.order_by, intent.order_dir, intent.limit, intent.offset
 
         table, columns, filters, joins, order_by, order_dir, notes = self._validate_components(
-            table=table,
-            columns=columns,
-            filters=filters,
-            joins=joins,
-            order_by=order_by,
-            order_dir=order_dir,
-            config=config,
+            table=table, columns=columns, filters=filters, joins=joins,
+            order_by=order_by, order_dir=order_dir, config=config,
         )
         exact_filter_keys = self._allowed_filter_keys(config, table, set(columns))
         query = self._build_sql(
-            table=table,
-            columns=columns,
-            filters=filters,
-            joins=joins,
-            order_by=order_by,
-            order_dir=order_dir,
-            limit=limit,
-            offset=offset,
+            table=table, columns=columns, filters=filters, joins=joins,
+            order_by=order_by, order_dir=order_dir, limit=limit, offset=offset,
             exact_filter_keys=exact_filter_keys,
         )
         return QueryResult(
@@ -202,14 +192,14 @@ class SQLEngine(QueryEngine):
                 "filters": filters,
                 "joins": [
                     {
-                        "relation": join.relation,
-                        "target": join.target,
-                        "alias": join.alias,
-                        "on_clause": join.on_clause,
-                        "fields": join.fields,
-                        "filters": join.filters,
+                        "relation": j.relation,
+                        "target": j.target,
+                        "alias": j.alias,
+                        "on_clause": j.on_clause,
+                        "fields": j.fields,
+                        "filters": j.filters,
                     }
-                    for join in joins
+                    for j in joins
                 ],
                 "order_by": order_by,
                 "order_dir": order_dir,
@@ -221,6 +211,62 @@ class SQLEngine(QueryEngine):
                 "validation_notes": notes,
             },
         )
+
+    def _generate_with_llm(
+        self,
+        prompt: str,
+        config: Any,
+        context: dict[str, Any],
+    ) -> QueryResult | None:
+        prepared = self._prepare_llm_prompts(prompt, config, context)
+        if prepared is None:
+            return None
+        system_prompt, user_prompt, resolved_language = prepared
+        try:
+            raw = self.provider.complete(system_prompt=system_prompt, user_prompt=user_prompt)
+        except (RuntimeError, ValueError, TypeError) as exc:
+            self._last_llm_error = f"LLM provider error: {exc}"
+            return None
+        return self._build_llm_result(raw, prompt, config, resolved_language)
+
+    async def _agenerate_with_llm(
+        self,
+        prompt: str,
+        config: Any,
+        context: dict[str, Any],
+    ) -> QueryResult | None:
+        prepared = self._prepare_llm_prompts(prompt, config, context)
+        if prepared is None:
+            return None
+        system_prompt, user_prompt, resolved_language = prepared
+        try:
+            raw = await self.provider.acomplete(system_prompt=system_prompt, user_prompt=user_prompt)
+        except (RuntimeError, ValueError, TypeError) as exc:
+            self._last_llm_error = f"LLM provider error: {exc}"
+            return None
+        return self._build_llm_result(raw, prompt, config, resolved_language)
+
+    async def agenerate(self, request: QueryRequest) -> QueryResult:
+        """Async generate — LLM I/O is truly async; deterministic path runs inline."""
+        prompt = request.text.strip()
+        config = normalize_schema_config(request.schema, request.mapping)
+        mode = str(request.context.get("mode", "deterministic")).strip().lower()
+        self._last_llm_error = None
+
+        if mode == "llm" and self.provider is not None:
+            llm_result = await self._agenerate_with_llm(prompt, config, request.context)
+            if llm_result is not None:
+                return llm_result
+
+        # Deterministic path is pure CPU — safe to run inline in async context
+        det_request = QueryRequest(
+            text=request.text,
+            target=request.target,
+            schema=request.schema,
+            mapping=request.mapping,
+            context={**request.context, "mode": "deterministic"},
+        )
+        return self.generate(det_request)
 
     def _reconcile_owned_asset_intent(
         self,
