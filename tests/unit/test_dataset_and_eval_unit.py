@@ -19,13 +19,13 @@ def test_ingest_dataset_jsonl(tmp_path: Path) -> None:
                     {
                         "text": "list users",
                         "target": "graphql",
-                        "expected_query": "query GeneratedQuery { user { id name } }",
+                        "expected_query": "{ user { id name } }",
                     }
                 ),
                 json.dumps(
                     {
                         "text": "list customers",
-                        "expected_query": "query GeneratedQuery { customer { id name } }",
+                        "expected_query": "{ customer { id name } }",
                     }
                 ),
             ]
@@ -44,7 +44,7 @@ def test_generate_synthetic_examples_marks_variants() -> None:
         DatasetExample(
             text="show top 3 customers",
             target="graphql",
-            expected_query="query GeneratedQuery { customers(limit: 3) { id } }",
+            expected_query="{ customers(limit: 3) { id } }",
         )
     ]
 
@@ -60,7 +60,7 @@ def test_generate_synthetic_examples_with_portfolio_plugin() -> None:
         DatasetExample(
             text="how many qqq do i own",
             target="graphql",
-            expected_query='query GeneratedQuery { positions(symbol: "QQQ") { quantity } }',
+            expected_query='{ positions(symbol: "QQQ") { quantity } }',
         )
     ]
 
@@ -80,7 +80,7 @@ def test_generate_synthetic_examples_auto_domain_plugin() -> None:
         DatasetExample(
             text="how many bac do i own",
             target="graphql",
-            expected_query='query GeneratedQuery { positions(symbol: "BAC") { quantity } }',
+            expected_query='{ positions(symbol: "BAC") { quantity } }',
             schema={"entities": ["positions"], "fields": {"positions": ["symbol", "quantity"]}},
         )
     ]
@@ -96,7 +96,7 @@ def test_generate_synthetic_examples_with_banking_plugin() -> None:
         DatasetExample(
             text="show account balance",
             target="graphql",
-            expected_query="query GeneratedQuery { accounts { balance } }",
+            expected_query="{ accounts { balance } }",
         )
     ]
 
@@ -116,7 +116,7 @@ def test_generate_synthetic_examples_with_ecommerce_plugin() -> None:
         DatasetExample(
             text="show recent orders",
             target="graphql",
-            expected_query="query GeneratedQuery { orders { id } }",
+            expected_query="{ orders { id } }",
         )
     ]
 
@@ -136,7 +136,7 @@ def test_generate_synthetic_examples_with_crm_plugin() -> None:
         DatasetExample(
             text="show opportunity pipeline",
             target="graphql",
-            expected_query="query GeneratedQuery { opportunities { id } }",
+            expected_query="{ opportunities { id } }",
         )
     ]
 
@@ -156,7 +156,7 @@ def test_generate_synthetic_examples_with_healthcare_plugin() -> None:
         DatasetExample(
             text="show patient medications",
             target="graphql",
-            expected_query="query GeneratedQuery { medications { id } }",
+            expected_query="{ medications { id } }",
         )
     ]
 
@@ -176,7 +176,7 @@ def test_generate_synthetic_examples_auto_domain_plugin_banking() -> None:
         DatasetExample(
             text="show transfer transactions",
             target="graphql",
-            expected_query="query GeneratedQuery { transactions { id } }",
+            expected_query="{ transactions { id } }",
             schema={"entities": ["accounts"], "fields": {"accounts": ["balance", "accountNumber"]}},
         )
     ]
@@ -192,7 +192,7 @@ def test_generate_synthetic_examples_auto_domain_plugin_ecommerce() -> None:
         DatasetExample(
             text="show inventory records",
             target="graphql",
-            expected_query="query GeneratedQuery { inventory { sku } }",
+            expected_query="{ inventory { sku } }",
             schema={"entities": ["products"], "fields": {"products": ["sku", "inventory"]}},
         )
     ]
@@ -208,7 +208,7 @@ def test_generate_synthetic_examples_auto_domain_plugin_crm() -> None:
         DatasetExample(
             text="show lead pipeline",
             target="graphql",
-            expected_query="query GeneratedQuery { leads { id } }",
+            expected_query="{ leads { id } }",
             schema={"entities": ["opportunities"], "fields": {"opportunities": ["stage", "amount"]}},
         )
     ]
@@ -224,7 +224,7 @@ def test_generate_synthetic_examples_auto_domain_plugin_healthcare() -> None:
         DatasetExample(
             text="show patient encounters",
             target="graphql",
-            expected_query="query GeneratedQuery { encounters { id } }",
+            expected_query="{ encounters { id } }",
             schema={"entities": ["patients"], "fields": {"patients": ["patientId", "name"]}},
         )
     ]
@@ -240,7 +240,7 @@ def test_generate_synthetic_examples_rejects_unknown_plugin() -> None:
         DatasetExample(
             text="list users",
             target="graphql",
-            expected_query="query GeneratedQuery { users { id } }",
+            expected_query="{ users { id } }",
         )
     ]
     with pytest.raises(ValueError, match="Unknown rewrite plugin"):
@@ -252,7 +252,7 @@ def test_generate_synthetic_examples_domain_templates_use_schema_slots() -> None
         DatasetExample(
             text="show sales pipeline",
             target="graphql",
-            expected_query="query GeneratedQuery { opportunities { amount } }",
+            expected_query="{ opportunities { amount } }",
             schema={
                 "entities": ["opportunities"],
                 "fields": {"opportunities": ["amount", "createdAt", "stage"]},
@@ -289,7 +289,7 @@ def test_generate_synthetic_examples_schema_aware_lexicalization_filters_unknown
         DatasetExample(
             text="show opportunities",
             target="graphql",
-            expected_query="query GeneratedQuery { opportunities { id } }",
+            expected_query="{ opportunities { id } }",
             schema={"entities": ["opportunities"], "fields": {"opportunities": ["id", "stage"]}},
         )
     ]
@@ -308,7 +308,7 @@ def test_generate_synthetic_examples_adds_scoring_metadata() -> None:
         DatasetExample(
             text="show recent orders",
             target="graphql",
-            expected_query="query GeneratedQuery { orders { id } }",
+            expected_query="{ orders { id } }",
             schema={"entities": ["orders"], "fields": {"orders": ["id", "createdAt", "status"]}},
             mapping={"filter_values": {"status": {"new": "new"}}},
         )
@@ -334,7 +334,7 @@ def test_generate_synthetic_examples_templates_scope_filters_to_entity_fields() 
         DatasetExample(
             text="show account summary",
             target="graphql",
-            expected_query="query GeneratedQuery { accountSummary { isPartialBalance } }",
+            expected_query="{ accountSummary { isPartialBalance } }",
             schema={
                 "entities": ["positions", "accountSummary"],
                 "fields": {
@@ -374,7 +374,7 @@ def test_evaluate_examples_reports_exact_and_execution_accuracy() -> None:
             text="list users",
             target="graphql",
             expected_query=(
-                "query GeneratedQuery {\n"
+                "{\n"
                 "  user {\n"
                 "    id\n"
                 "    name\n"
@@ -397,7 +397,7 @@ def test_evaluate_examples_with_backend_execution() -> None:
         DatasetExample(
             text="list users",
             target="graphql",
-            expected_query="query GeneratedQuery { user { id name } }",
+            expected_query="{ user { id name } }",
             metadata={"expected_execution_result": [{"id": "1", "name": "Ada"}]},
         )
     ]
@@ -421,7 +421,7 @@ def test_evaluate_examples_with_backend_error_marks_failure() -> None:
         DatasetExample(
             text="list users",
             target="graphql",
-            expected_query="query GeneratedQuery { user { id name } }",
+            expected_query="{ user { id name } }",
         )
     ]
 

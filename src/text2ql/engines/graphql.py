@@ -1217,7 +1217,7 @@ class GraphQLEngine(QueryEngine):
         selection = "\n    ".join(selection_lines)
         return dedent(
             f"""
-            query GeneratedQuery {{
+            {{
               {entity}{args} {{
                 {selection}
               }}

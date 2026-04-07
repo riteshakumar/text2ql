@@ -12,7 +12,7 @@ def test_engine_generates_default_query_without_schema() -> None:
     result = engine.generate(QueryRequest(text="list users", target="graphql"))
 
     assert result.target == "graphql"
-    assert "query GeneratedQuery" in result.query
+    assert result.query.strip().startswith("{")
     assert "user" in result.query
 
 

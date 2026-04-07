@@ -762,7 +762,7 @@ from text2ql.dataset import DatasetExample
 seed = [DatasetExample(
     text="show sales pipeline",
     target="graphql",
-    expected_query="query GeneratedQuery { opportunities { amount } }",
+    expected_query="{ opportunities { amount } }",
     schema={
         "entities": ["opportunities"],
         "fields": {"opportunities": ["amount", "createdAt", "stage"]},
@@ -822,7 +822,7 @@ Optional fields:
 Example `.jsonl` row:
 
 ```json
-{"text":"list users","target":"graphql","expected_query":"query GeneratedQuery { user { id name } }"}
+{"text":"list users","target":"graphql","expected_query":"{ user { id name } }"}
 ```
 
 ### Evaluation metrics

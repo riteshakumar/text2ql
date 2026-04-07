@@ -20,7 +20,7 @@ def test_text2ql_supports_multiple_targets_e2e() -> None:
     )
 
     assert graphql_result.target == "graphql"
-    assert "query GeneratedQuery" in graphql_result.query
+    assert graphql_result.query.strip().startswith("{")
     assert sql_result.target == "sql"
     assert sql_result.query.startswith("SELECT")
 
