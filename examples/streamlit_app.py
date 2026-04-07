@@ -326,6 +326,11 @@ def main() -> None:
         rewrite_plugins = st.multiselect("Rewrite Plugins", options=PLUGIN_OPTIONS, default=[])
         domain = st.selectbox("Domain", options=DOMAIN_OPTIONS, index=0)
         st.divider()
+        execute_on_payload = st.checkbox(
+            "Execute on JSON Payload",
+            value=True,
+            help="Turn off to only generate queries without running GraphQL/SQL execution.",
+        )
         expected_query = st.text_area(
             "Expected Query (optional)",
             value="",
@@ -351,6 +356,7 @@ def main() -> None:
             "- `deterministic`: no LLM calls, fully rule-based\n"
             "- `llm`: uses provider then validates against schema\n"
             "- `LLM Utterance Rewrite`: optional pre-generation rewrite step\n"
+            "- `Execute on JSON Payload`: toggle between query-only and query+execution\n"
             "- GraphQL mode can execute against JSON payload\n"
             "- SQL mode supports signature match against expected query"
         )
@@ -452,7 +458,7 @@ def main() -> None:
                 rewrite_meta=rewrite_meta if (llm_rewrite and rewrite_provider is not None) else None,
             )
 
-            if target == "graphql":
+            if target == "graphql" and execute_on_payload:
                 exec_start = time.perf_counter()
                 rows, note = execute_query_result_on_json(result, data_payload, root_key="portfolio_data")
                 exec_elapsed = time.perf_counter() - exec_start
@@ -477,9 +483,9 @@ def main() -> None:
                     else:
                         row["execution_match"] = _stable_json(rows) == _stable_json(expected_rows)
 
-            if target == "sql" and expected_query.strip():
+            if target == "sql" and execute_on_payload and expected_query.strip():
                 row["sql_signature_match"] = sql_execution_match(result.query, expected_query.strip())
-            if target == "sql":
+            if target == "sql" and execute_on_payload:
                 exec_start = time.perf_counter()
                 sql_rows, sql_note = _execute_sql_on_json(result.query, data_payload, root_key="portfolio_data")
                 exec_elapsed = time.perf_counter() - exec_start
@@ -506,22 +512,24 @@ def main() -> None:
                 st.code(row["query"], language="graphql" if target == "graphql" else "sql")
 
                 if target == "graphql":
-                    st.markdown("**Execution rows**")
-                    st.json(row.get("execution_rows", []), expanded=False)
-                    if row.get("execution_note"):
-                        st.info(row["execution_note"])
-                    if "execution_match" in row:
-                        st.write(f"execution_match: `{row['execution_match']}`")
-                    if row.get("execution_eval_warning"):
-                        st.warning(row["execution_eval_warning"])
+                    if execute_on_payload:
+                        st.markdown("**Execution rows**")
+                        st.json(row.get("execution_rows", []), expanded=False)
+                        if row.get("execution_note"):
+                            st.info(row["execution_note"])
+                        if "execution_match" in row:
+                            st.write(f"execution_match: `{row['execution_match']}`")
+                        if row.get("execution_eval_warning"):
+                            st.warning(row["execution_eval_warning"])
 
                 if target == "sql" and "sql_signature_match" in row:
                     st.write(f"sql_signature_match: `{row['sql_signature_match']}`")
                 if target == "sql":
-                    st.markdown("**Execution rows**")
-                    st.json(row.get("sql_execution_rows", []), expanded=False)
-                    if row.get("sql_execution_note"):
-                        st.info(row["sql_execution_note"])
+                    if execute_on_payload:
+                        st.markdown("**Execution rows**")
+                        st.json(row.get("sql_execution_rows", []), expanded=False)
+                        if row.get("sql_execution_note"):
+                            st.info(row["sql_execution_note"])
 
                 st.markdown("**Engine metadata**")
                 st.json(row.get("metadata", {}), expanded=False)

@@ -249,6 +249,7 @@ CLI JSON output includes:
 - `synthetic`: dynamic synthetic metadata (`synthetic_rewrite_confidence`, `synthetic_rewrite_novelty`, `synthetic_rewrite_score`)
 - `engine_metadata`: query-engine metadata returned by `Text2QL`
 - `execution_rows` / `execution_note`: execution output for GraphQL and SQL when `--data-file` is provided
+- `execution_match`: only included when expected output is provided (`--expected-query*` or `--expected-execution-file`)
 
 ## Streamlit Playground
 
@@ -271,6 +272,7 @@ What you get:
 - Sidebar `OpenAI API Key` input (`type=password`) plus fallback to Streamlit secrets/env vars.
 - Synthetic rewrite controls (`variants`, `plugins`, `domain`).
 - LLM utterance rewrite toggle works independently from generation mode.
+- `Execute on JSON Payload` toggle controls query-only vs query+execution mode.
 - GraphQL execution on JSON payload + optional expected-query execution match.
 - SQL execution on JSON payload, plus optional expected-query signature match.
 
@@ -515,6 +517,7 @@ text2ql "how many qqq do i own" \
   --schema-file ./schema.json \
   --mapping-file ./mapping.json \
   --data-file ./portfolio.json \
+  --execute-on-payload \
   --variants-per-example 3 \
   --rewrite-plugins generic,portfolio \
   --domain portfolio \
@@ -525,6 +528,7 @@ Execution-eval notes:
 
 - `--expected-query` / `--expected-query-file` / `--expected-execution-file` require `--data-file`.
 - `--data-file` should be the execution payload JSON used for query evaluation.
+- `--execute-on-payload` enables execution without requiring expected-query comparison.
 - SQL target executes generated SQL in an in-memory SQLite database built from `--data-file`.
 - If expected query execution cannot be derived from the payload, CLI reports an eval warning and skips that sample from accuracy denominator.
 

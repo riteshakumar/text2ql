@@ -155,6 +155,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Path to expected execution JSON payload (rows/object).",
     )
+    parser.add_argument(
+        "--execute-on-payload",
+        action="store_true",
+        help="Execute generated query on --data-file payload without requiring expected-query comparison.",
+    )
     return parser
 
 
@@ -286,7 +291,7 @@ def _load_execution_eval_inputs(
     expected_execution = None
     if args.expected_execution_file:
         expected_execution = json.loads(Path(args.expected_execution_file).read_text(encoding="utf-8"))
-    execution_eval_enabled = bool(expected_query or args.expected_execution_file)
+    execution_eval_enabled = bool(args.execute_on_payload or expected_query or args.expected_execution_file)
     execution_data_payload = _read_json_file(args.data_file) if args.data_file else None
     return expected_query, expected_execution, execution_eval_enabled, execution_data_payload
 
@@ -402,6 +407,8 @@ def _apply_execution_evaluation(
             )
     if expected_note:
         payload["execution_eval_warning"] = expected_note
+        return
+    if expected_rows is None:
         return
     payload["execution_match"] = _stable_json(rows) == _stable_json(expected_rows)
 
