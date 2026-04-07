@@ -391,10 +391,10 @@ class SQLEngine(QueryEngine):
         allowed = self._columns_for_table(config, table)
         selected: list[str] = []
         for column in allowed:
-            if self._contains_token(lowered, column.lower()):
+            if self._contains_column_reference(lowered, column):
                 selected.append(column)
         for alias, canonical in self._sorted_alias_pairs(config.field_aliases):
-            if canonical in allowed and self._contains_token(lowered, alias):
+            if canonical in allowed and self._contains_column_reference(lowered, alias):
                 selected.append(canonical)
         selected = self._unique_in_order(selected)
         if selected:
@@ -1049,6 +1049,60 @@ class SQLEngine(QueryEngine):
     @staticmethod
     def _contains_token(text: str, token: str) -> bool:
         return re.search(rf"\b{re.escape(token)}\b", text) is not None
+
+    @classmethod
+    def _contains_column_reference(cls, text: str, label: str) -> bool:
+        for variant in cls._label_match_variants(label):
+            if cls._contains_token(text, variant):
+                return True
+        return False
+
+    @classmethod
+    def _label_match_variants(cls, label: str) -> set[str]:
+        lowered = str(label).strip().lower()
+        if not lowered:
+            return set()
+
+        variants: set[str] = {lowered}
+        normalized = re.sub(r"[_\s]+", " ", lowered)
+        normalized = re.sub(r"([a-z])([A-Z])", r"\1 \2", normalized).lower()
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        if normalized:
+            variants.add(normalized)
+
+        tokens = [token for token in normalized.split(" ") if token]
+        if len(tokens) == 1:
+            variants.update(cls._token_inflections(tokens[0]))
+
+        if tokens:
+            for replacement in cls._token_inflections(tokens[-1]):
+                phrase = " ".join([*tokens[:-1], replacement]).strip()
+                if phrase:
+                    variants.add(phrase)
+
+        return {variant for variant in variants if variant}
+
+    @staticmethod
+    def _token_inflections(token: str) -> set[str]:
+        token = token.strip().lower()
+        if not token:
+            return set()
+        forms: set[str] = {token}
+        if len(token) > 3:
+            if token.endswith("ies"):
+                forms.add(token[:-3] + "y")
+            elif token.endswith("es"):
+                forms.add(token[:-2])
+            elif token.endswith("s"):
+                forms.add(token[:-1])
+            elif token.endswith("y"):
+                forms.add(token[:-1] + "ies")
+                forms.add(token + "s")
+            elif token.endswith(("x", "z", "ch", "sh")):
+                forms.add(token + "es")
+            else:
+                forms.add(token + "s")
+        return {form for form in forms if form}
 
     @staticmethod
     def _contains_entity_token(text: str, token: str) -> bool:

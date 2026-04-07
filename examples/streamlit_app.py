@@ -319,7 +319,7 @@ def main() -> None:
         llm_rewrite = st.checkbox(
             "LLM Utterance Rewrite",
             value=False,
-            help="Rewrite user utterance with schema-aware LLM before query generation (LLM mode only).",
+            help="Rewrite user utterance with schema-aware LLM before query generation.",
         )
         system_context = st.text_area("System Context", value="", height=90)
         variants_per_example = st.number_input("Variants per Prompt", min_value=1, max_value=20, value=1, step=1)
@@ -380,15 +380,17 @@ def main() -> None:
             overrides=overrides,
         )
 
-        if mode == "llm":
-            api_key = (api_key_input or "").strip() or _default_api_key()
-            if not api_key:
-                st.warning(
-                    "LLM mode selected but no API key found. Set OpenAI API Key in sidebar "
-                    "or configure OPENAI_API_KEY/TEXT2QL_API_KEY in Streamlit Secrets."
-                )
+        api_key = (api_key_input or "").strip() or _default_api_key()
+        if (mode == "llm" or llm_rewrite) and not api_key:
+            st.warning(
+                "LLM mode or LLM rewrite selected but no API key found. Set OpenAI API Key in sidebar "
+                "or configure OPENAI_API_KEY/TEXT2QL_API_KEY in Streamlit Secrets."
+            )
 
         service = _build_service(mode, llm_model, api_key=(api_key_input or "").strip())
+        rewrite_provider = None
+        if llm_rewrite and api_key:
+            rewrite_provider = OpenAICompatibleProvider(api_key=api_key, model=llm_model)
         prompts = _build_prompts(
             prompt=prompt,
             requested_variants=int(variants_per_example),
@@ -407,13 +409,13 @@ def main() -> None:
             gen_start = time.perf_counter()
             rewritten_prompt = active_prompt
             rewrite_meta: dict[str, Any] = {"applied": False, "reason": "disabled"}
-            if llm_rewrite and mode == "llm":
+            if llm_rewrite and rewrite_provider is not None:
                 rewritten_prompt, rewrite_meta = rewrite_user_utterance(
                     text=active_prompt,
                     target=target,
                     schema=inferred_schema,
                     mapping=mapping,
-                    provider=service.provider,
+                    provider=rewrite_provider,
                     system_context=system_context,
                 )
             result = service.generate(
@@ -447,7 +449,7 @@ def main() -> None:
                 seed_prompt=prompt,
                 active_prompt=active_prompt,
                 engine_confidence=_as_unit_float(result.confidence, default=0.5),
-                rewrite_meta=rewrite_meta if (llm_rewrite and mode == "llm") else None,
+                rewrite_meta=rewrite_meta if (llm_rewrite and rewrite_provider is not None) else None,
             )
 
             if target == "graphql":
@@ -495,7 +497,7 @@ def main() -> None:
                     f"generate={row['timing_ms'].get('generate', 0):.3f} "
                     f"execute={row['timing_ms'].get('execute', 0):.3f}"
                 )
-                if llm_rewrite and mode == "llm":
+                if llm_rewrite and rewrite_provider is not None:
                     st.markdown("**Rewritten Prompt**")
                     st.code(row.get("rewritten_prompt", ""), language="text")
                     st.markdown("**Rewrite metadata**")

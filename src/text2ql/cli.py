@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sqlite3
 from pathlib import Path
@@ -200,6 +201,7 @@ def main() -> None:
     results, execution_matches, execution_total = _generate_result_payloads(
         args=args,
         service=service,
+        rewrite_provider=_build_rewrite_provider(args),
         schema=schema,
         mapping=mapping,
         prompts=prompts,
@@ -292,6 +294,7 @@ def _load_execution_eval_inputs(
 def _generate_result_payloads(
     args: argparse.Namespace,
     service: Text2QL,
+    rewrite_provider: LLMProvider | None,
     schema: dict[str, Any] | None,
     mapping: dict[str, Any] | None,
     prompts: list[str],
@@ -307,15 +310,17 @@ def _generate_result_payloads(
     for idx, prompt in enumerate(prompts):
         rewritten_prompt = prompt
         rewrite_meta: dict[str, Any] = {"applied": False, "reason": "disabled"}
-        if args.llm_rewrite == "on" and args.mode == "llm":
+        if args.llm_rewrite == "on" and rewrite_provider is not None:
             rewritten_prompt, rewrite_meta = rewrite_user_utterance(
                 text=prompt,
                 target=args.target,
                 schema=schema,
                 mapping=mapping,
-                provider=service.provider,
+                provider=rewrite_provider,
                 system_context=args.system_context,
             )
+        elif args.llm_rewrite == "on" and rewrite_provider is None:
+            rewrite_meta = {"applied": False, "reason": "missing_api_key_or_provider"}
         result = service.generate(
             text=rewritten_prompt,
             target=args.target,
@@ -332,7 +337,7 @@ def _generate_result_payloads(
             seed_prompt=args.text,
             active_prompt=prompt,
             engine_confidence=_as_unit_float(result.confidence, default=0.5),
-            rewrite_meta=rewrite_meta if (args.llm_rewrite == "on" and args.mode == "llm") else None,
+            rewrite_meta=rewrite_meta if (args.llm_rewrite == "on" and rewrite_provider is not None) else None,
         )
         payload: dict[str, Any] = {
             "prompt": prompt,
@@ -435,6 +440,27 @@ def _build_provider(args: argparse.Namespace) -> LLMProvider:
         return RuleBasedProvider()
     return OpenAICompatibleProvider(
         api_key=(args.llm_api_key or "").strip() or None,
+        model=args.llm_model,
+        base_url=args.llm_base_url,
+        max_retries=args.llm_max_retries,
+        retry_backoff_seconds=args.llm_retry_backoff,
+    )
+
+
+def _build_rewrite_provider(args: argparse.Namespace) -> LLMProvider | None:
+    if args.llm_rewrite != "on":
+        return None
+    if args.llm_provider == "rule-based":
+        return RuleBasedProvider()
+    api_key = (
+        (args.llm_api_key or "").strip()
+        or (os.getenv("OPENAI_API_KEY") or "").strip()
+        or (os.getenv("TEXT2QL_API_KEY") or "").strip()
+    )
+    if not api_key:
+        return None
+    return OpenAICompatibleProvider(
+        api_key=api_key,
         model=args.llm_model,
         base_url=args.llm_base_url,
         max_retries=args.llm_max_retries,

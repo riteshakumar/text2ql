@@ -149,7 +149,8 @@ Operational notes:
 - You can also pass `--llm-api-key` directly in CLI instead of env vars.
 - `--expected-query` / `--expected-query-file` / `--expected-execution-file` require `--data-file`.
 - If expected query execution cannot be derived from payload JSON, CLI emits an eval warning and skips that item from accuracy denominator.
-- `--llm-rewrite on` enables schema-aware LLM utterance rewrite before generation (LLM mode only).
+- `--llm-rewrite on` enables schema-aware LLM utterance rewrite independently of generation mode.
+- `--mode` controls query generation path; `--llm-rewrite` controls prompt rewrite path.
 
 ## Feature Matrix
 
@@ -224,6 +225,19 @@ text2ql "how many qqq do i own" \
   --data-file ./data.json
 ```
 
+6) Rewrite with LLM, but keep query generation deterministic:
+
+```bash
+export OPENAI_API_KEY=...
+text2ql "how many qqq do i own" \
+  --target sql \
+  --mode deterministic \
+  --llm-rewrite on \
+  --llm-api-key "$OPENAI_API_KEY" \
+  --schema-file ./schema.json \
+  --data-file ./data.json
+```
+
 CLI JSON output includes:
 
 - `prompt`: original user utterance
@@ -253,7 +267,7 @@ What you get:
 - Bundled sample data (`examples/sample_schema.json`, `examples/sample_data.json`) or uploaded JSON files.
 - Sidebar `OpenAI API Key` input (`type=password`) plus fallback to Streamlit secrets/env vars.
 - Synthetic rewrite controls (`variants`, `plugins`, `domain`).
-- LLM utterance rewrite toggle (schema-aware pre-generation rewrite in LLM mode).
+- LLM utterance rewrite toggle works independently from generation mode.
 - GraphQL execution on JSON payload + optional expected-query execution match.
 - SQL execution on JSON payload, plus optional expected-query signature match.
 
@@ -424,6 +438,7 @@ text2ql "show latest 5 orders with status active" \
 
 If you do not pass `--mode llm`, CLI runs deterministic mode.
 `--system-context` is consumed in LLM mode and ignored in deterministic mode.
+`--llm-rewrite on` can still apply LLM rewrite even when `--mode deterministic` is used.
 
 CLI parity for synthetic variants + execution evaluation:
 
