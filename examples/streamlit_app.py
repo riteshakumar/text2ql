@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -110,6 +111,82 @@ def _load_uploaded_json(uploaded: Any) -> dict[str, Any]:
 
 def _stable_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
+
+
+def _collect_entity_rows(node: Any, out: dict[str, list[dict[str, Any]]] | None = None) -> dict[str, list[dict[str, Any]]]:
+    if out is None:
+        out = {}
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if isinstance(value, dict):
+                out.setdefault(str(key), []).append(value)
+                _collect_entity_rows(value, out)
+            elif isinstance(value, list):
+                dict_items = [item for item in value if isinstance(item, dict)]
+                if dict_items:
+                    out.setdefault(str(key), []).extend(dict_items)
+                    for item in dict_items:
+                        _collect_entity_rows(item, out)
+                else:
+                    for item in value:
+                        _collect_entity_rows(item, out)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_entity_rows(item, out)
+    return out
+
+
+def _quote_ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _to_sql_scalar(value: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=True, default=str)
+    return value
+
+
+def _execute_sql_on_json(
+    query: str,
+    data_payload: dict[str, Any],
+    root_key: str = "portfolio_data",
+) -> tuple[list[dict[str, Any]], str | None]:
+    root = data_payload.get(root_key, data_payload)
+    if not isinstance(root, dict):
+        return [], "SQL execution skipped: payload must be a JSON object."
+
+    entity_rows = _collect_entity_rows(root)
+    if not entity_rows:
+        return [], "SQL execution skipped: no tabular entities found in payload."
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    try:
+        created_tables = 0
+        for table_name, rows in entity_rows.items():
+            if not rows:
+                continue
+            columns = sorted({str(key) for row in rows for key in row.keys()})
+            if not columns:
+                continue
+            create_sql = f"CREATE TABLE {_quote_ident(table_name)} ({', '.join(f'{_quote_ident(col)} TEXT' for col in columns)});"
+            conn.execute(create_sql)
+            placeholders = ", ".join(["?"] * len(columns))
+            insert_sql = f"INSERT INTO {_quote_ident(table_name)} ({', '.join(_quote_ident(col) for col in columns)}) VALUES ({placeholders});"
+            values = [[_to_sql_scalar(row.get(column)) for column in columns] for row in rows]
+            conn.executemany(insert_sql, values)
+            created_tables += 1
+
+        if created_tables == 0:
+            return [], "SQL execution skipped: no usable tables were created."
+
+        cursor = conn.execute(query)
+        result_rows = [dict(row) for row in cursor.fetchall()]
+        return result_rows, None
+    except sqlite3.Error as exc:
+        return [], f"SQL execution error: {exc}"
+    finally:
+        conn.close()
 
 
 def _default_api_key() -> str:
@@ -346,6 +423,13 @@ def main() -> None:
 
             if target == "sql" and expected_query.strip():
                 row["sql_signature_match"] = sql_execution_match(result.query, expected_query.strip())
+            if target == "sql":
+                exec_start = time.perf_counter()
+                sql_rows, sql_note = _execute_sql_on_json(result.query, data_payload, root_key="portfolio_data")
+                exec_elapsed = time.perf_counter() - exec_start
+                row["sql_execution_rows"] = sql_rows
+                row["sql_execution_note"] = sql_note
+                row["timing_ms"]["execute"] = exec_elapsed * 1000
 
             results.append(row)
 
@@ -377,6 +461,11 @@ def main() -> None:
 
                 if target == "sql" and "sql_signature_match" in row:
                     st.write(f"sql_signature_match: `{row['sql_signature_match']}`")
+                if target == "sql":
+                    st.markdown("**Execution rows**")
+                    st.json(row.get("sql_execution_rows", []), expanded=False)
+                    if row.get("sql_execution_note"):
+                        st.info(row["sql_execution_note"])
 
                 st.markdown("**Engine metadata**")
                 st.json(row.get("metadata", {}), expanded=False)

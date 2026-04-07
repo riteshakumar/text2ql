@@ -48,6 +48,13 @@ class SQLEngine(QueryEngine):
         table = self._detect_table(lowered, config)
         columns = self._detect_columns(lowered, config, table)
         filters = self._detect_filters(lowered, config, table)
+        table, columns, filters = self._reconcile_owned_asset_intent(
+            prompt=prompt,
+            table=table,
+            columns=columns,
+            filters=filters,
+            config=config,
+        )
         joins = self._detect_joins(lowered, table, config)
         order_by, order_dir = self._detect_order(lowered, columns)
         limit, offset = self._detect_pagination(lowered)
