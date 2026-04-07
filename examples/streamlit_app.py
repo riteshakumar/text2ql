@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import re
 import sys
 import time
 from pathlib import Path
@@ -111,6 +112,53 @@ def _load_uploaded_json(uploaded: Any) -> dict[str, Any]:
 
 def _stable_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
+
+
+def _tokenize(text: str) -> set[str]:
+    return {token for token in re.findall(r"[a-z0-9_]+", text.lower()) if token}
+
+
+def _compute_novelty(seed_prompt: str, candidate_prompt: str) -> float:
+    seed_tokens = _tokenize(seed_prompt)
+    cand_tokens = _tokenize(candidate_prompt)
+    if not seed_tokens and not cand_tokens:
+        return 0.0
+    union = seed_tokens | cand_tokens
+    if not union:
+        return 0.0
+    overlap = seed_tokens & cand_tokens
+    jaccard = len(overlap) / len(union)
+    return max(0.0, min(1.0, 1.0 - jaccard))
+
+
+def _as_unit_float(value: Any, default: float = 0.5) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _dynamic_synthetic_meta(
+    base_meta: dict[str, Any],
+    seed_prompt: str,
+    active_prompt: str,
+    engine_confidence: float,
+    rewrite_meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    meta = dict(base_meta)
+    novelty = _compute_novelty(seed_prompt, active_prompt)
+    if rewrite_meta and isinstance(rewrite_meta, dict):
+        confidence = _as_unit_float(
+            rewrite_meta.get("synthetic_rewrite_confidence", rewrite_meta.get("confidence", engine_confidence)),
+            default=engine_confidence,
+        )
+    else:
+        confidence = _as_unit_float(meta.get("synthetic_rewrite_confidence", engine_confidence), default=engine_confidence)
+    score = _as_unit_float(0.65 * confidence + 0.35 * novelty)
+    meta["synthetic_rewrite_confidence"] = confidence
+    meta["synthetic_rewrite_novelty"] = novelty
+    meta["synthetic_rewrite_score"] = score
+    return meta
 
 
 def _collect_entity_rows(node: Any, out: dict[str, list[dict[str, Any]]] | None = None) -> dict[str, list[dict[str, Any]]]:
@@ -387,7 +435,6 @@ def main() -> None:
                 "prompt": active_prompt,
                 "rewritten_prompt": rewritten_prompt,
                 "rewrite_meta": rewrite_meta,
-                "synthetic": synth_meta,
                 "query": result.query,
                 "metadata": result.metadata,
                 "timing_ms": {
@@ -395,6 +442,13 @@ def main() -> None:
                     "generate": gen_elapsed * 1000,
                 },
             }
+            row["synthetic"] = _dynamic_synthetic_meta(
+                base_meta=synth_meta,
+                seed_prompt=prompt,
+                active_prompt=active_prompt,
+                engine_confidence=_as_unit_float(result.confidence, default=0.5),
+                rewrite_meta=rewrite_meta if (llm_rewrite and mode == "llm") else None,
+            )
 
             if target == "graphql":
                 exec_start = time.perf_counter()

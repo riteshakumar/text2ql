@@ -146,6 +146,7 @@ text2ql "how many qqq do i own" \
 Operational notes:
 
 - Set `OPENAI_API_KEY` (or `TEXT2QL_API_KEY`) for `--mode llm`.
+- You can also pass `--llm-api-key` directly in CLI instead of env vars.
 - `--expected-query` / `--expected-query-file` / `--expected-execution-file` require `--data-file`.
 - If expected query execution cannot be derived from payload JSON, CLI emits an eval warning and skips that item from accuracy denominator.
 - `--llm-rewrite on` enables schema-aware LLM utterance rewrite before generation (LLM mode only).
@@ -207,6 +208,7 @@ text2ql "how many qqq do i own" \
   --rewrite-plugins generic,portfolio \
   --domain portfolio \
   --expected-query-file ./expected_query.graphql
+```
 
 5) Enable schema-aware LLM utterance rewrite:
 
@@ -215,6 +217,7 @@ export OPENAI_API_KEY=...
 text2ql "how many qqq do i own" \
   --target graphql \
   --mode llm \
+  --llm-api-key "$OPENAI_API_KEY" \
   --llm-rewrite on \
   --schema-file ./schema.json \
   --mapping-file ./mapping.generated.json \
@@ -226,7 +229,9 @@ CLI JSON output includes:
 - `prompt`: original user utterance
 - `rewritten_prompt`: prompt after optional LLM rewrite
 - `rewrite`: rewrite metadata (`applied`, `reason/source`, `confidence`, `notes`)
-```
+- `synthetic`: dynamic synthetic metadata (`synthetic_rewrite_confidence`, `synthetic_rewrite_novelty`, `synthetic_rewrite_score`)
+- `engine_metadata`: query-engine metadata returned by `Text2QL`
+- `execution_rows` / `execution_note`: execution output for GraphQL and SQL when `--data-file` is provided
 
 ## Streamlit Playground
 
@@ -237,15 +242,35 @@ pip install -e ".[app]"
 streamlit run examples/streamlit_app.py
 ```
 
+Hosted app:
+
+- https://text2ql.streamlit.app/
+
 What you get:
 
 - Deterministic and LLM modes in one app.
 - GraphQL and SQL target switch.
 - Bundled sample data (`examples/sample_schema.json`, `examples/sample_data.json`) or uploaded JSON files.
+- Sidebar `OpenAI API Key` input (`type=password`) plus fallback to Streamlit secrets/env vars.
 - Synthetic rewrite controls (`variants`, `plugins`, `domain`).
 - LLM utterance rewrite toggle (schema-aware pre-generation rewrite in LLM mode).
 - GraphQL execution on JSON payload + optional expected-query execution match.
-- SQL optional expected-query signature match.
+- SQL execution on JSON payload, plus optional expected-query signature match.
+
+For Streamlit Community Cloud deployment:
+
+```bash
+# from repo root
+streamlit run examples/streamlit_app.py
+```
+
+- Main file path: `examples/streamlit_app.py`
+- Requirements file: `examples/requirements.txt`
+- Add secrets in App Settings -> Secrets:
+
+```toml
+OPENAI_API_KEY = "sk-your-openai-key-here"
+```
 
 ## Sample Runners
 
@@ -377,6 +402,7 @@ LLM mode via CLI:
 export OPENAI_API_KEY=...
 text2ql "show top 3 clients with mail state enabled" \
   --mode llm \
+  --llm-api-key "$OPENAI_API_KEY" \
   --language english \
   --system-context "Prefer customer/account semantics and preserve canonical field names." \
   --llm-provider openai-compatible \
@@ -392,6 +418,7 @@ export OPENAI_API_KEY=...
 text2ql "show latest 5 orders with status active" \
   --target sql \
   --mode llm \
+  --llm-api-key "$OPENAI_API_KEY" \
   --schema '{"entities":["orders"],"fields":{"orders":["id","status","createdAt"]}}'
 ```
 
@@ -415,6 +442,7 @@ Execution-eval notes:
 
 - `--expected-query` / `--expected-query-file` / `--expected-execution-file` require `--data-file`.
 - `--data-file` should be the execution payload JSON used for query evaluation.
+- SQL target executes generated SQL in an in-memory SQLite database built from `--data-file`.
 - If expected query execution cannot be derived from the payload, CLI reports an eval warning and skips that sample from accuracy denominator.
 
 Minimal file-based CLI example:
