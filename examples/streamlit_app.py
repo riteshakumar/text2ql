@@ -508,8 +508,7 @@ def main() -> None:
                     st.code(row.get("rewritten_prompt", ""), language="text")
                     st.markdown("**Rewrite metadata**")
                     st.json(row.get("rewrite_meta", {}), expanded=False)
-                st.markdown("**Synthetic Scores**")
-                st.json(row.get("synthetic", {}), expanded=False)
+                st.markdown("**Generated Query**")
                 st.code(row["query"], language="graphql" if target == "graphql" else "sql")
 
                 if target == "graphql":
@@ -532,6 +531,8 @@ def main() -> None:
                         if row.get("sql_execution_note"):
                             st.info(row["sql_execution_note"])
 
+                st.markdown("**Synthetic Scores**")
+                st.json(row.get("synthetic", {}), expanded=False)
                 st.markdown("**Engine metadata**")
                 st.json(row.get("metadata", {}), expanded=False)
 
