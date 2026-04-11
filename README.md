@@ -186,7 +186,7 @@ Operational notes:
 | Real backend execution accuracy hook | Yes | Yes (via `evaluate_examples(..., execution_backend=...)`) |
 | Concurrent evaluation (`aevaluate_examples`) | Yes | Yes |
 | Synthetic rewrite plugins | Yes | Yes (target-agnostic dataset API) |
-| **Abstract IR layer (`QueryIR`, `IRRenderer`)** | **Yes** | **Yes** |
+| **Abstract IR layer (`QueryIR`, `IRRenderer`, `GraphQLIRRenderer`, `SQLIRRenderer`)** | **Yes** | **Yes** |
 | **Structured logging (`TEXT2QL_LOG_LEVEL`)** | **Yes** | **Yes** |
 
 ## CLI-First Workflow
@@ -601,7 +601,7 @@ with SQLAlchemyExecutor("sqlite:///sales.db") as executor:
 
 ## Abstract IR Layer
 
-`text2ql` now defines a canonical **Intermediate Representation** (`QueryIR`) that sits between natural-language parsing and target-language rendering. This is the foundation for adding new query languages without re-implementing the full parsing stack.
+`text2ql` defines a canonical **Intermediate Representation** (`QueryIR`) that sits between natural-language parsing and target-language rendering.  Both engines now build a `QueryIR` internally and call a concrete `IRRenderer` to produce the final query string — the renderer is the **live production path**, not just an inspection helper.
 
 ### Core types
 
@@ -612,7 +612,9 @@ with SQLAlchemyExecutor("sqlite:///sales.db") as executor:
 | `IRJoin` | JOIN between two tables — left/right ON-clause refs, fields, filters |
 | `IRNested` | GraphQL nested selection — relation, target entity, fields, filters |
 | `IRAggregation` | Aggregate expression — `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` |
-| `IRRenderer` | Base class — implement `render(ir: QueryIR) -> str` to add a new query language |
+| `IRRenderer` | Abstract base — implement `render(ir: QueryIR) -> str` to add a new query language |
+| `GraphQLIRRenderer` | **Concrete** renderer for GraphQL (used by `GraphQLEngine` in production) |
+| `SQLIRRenderer` | **Concrete** renderer for SQL — also emits `GROUP BY` when aggregations are present (used by `SQLEngine` in production) |
 
 ### Inspect a result as IR
 
@@ -677,6 +679,54 @@ renderer = CypherRenderer()
 print(renderer.render(ir))
 # MATCH (n:Orders) WHERE n.status = 'active' AND n.total >= 100 RETURN n.id, n.status, n.total
 ```
+
+### SQL aggregations
+
+`SQLIRRenderer` emits `COUNT(*)`, `SUM()`, `AVG()`, `MIN()`, `MAX()` automatically when the SQL engine detects aggregate intent words:
+
+```python
+result = Text2QL().generate(
+    "count all orders with status active",
+    target="sql",
+    schema={"entities": ["orders"], "fields": {"orders": ["id", "status"]}},
+)
+print(result.query)
+# SELECT orders.status, COUNT(*) AS count FROM orders
+# WHERE orders.status = 'active' GROUP BY orders.status;
+```
+
+### Domain-specific entity routing via `keyword_intents`
+
+Instead of hardcoding domain keywords inside the engine, declare routing rules in your schema config.  The engine evaluates these before falling back to alias and semantic matching:
+
+```python
+result = Text2QL().generate(
+    "show my dividend history",
+    target="graphql",
+    schema={
+        "entities": ["transactions", "positions"],
+        "fields": {"transactions": ["id", "amount", "type", "date"]},
+        "keyword_intents": [
+            {
+                "keywords": ["dividend"],
+                "find_entity_by_name": "transactions"
+            },
+            {
+                "keywords": ["net", "worth"],
+                "find_entity_with_fields": ["netWorth", "regulatoryNetWorth"]
+            },
+            {
+                "keywords": ["buying", "power"],
+                "find_entity_with_fields": ["cash", "margin"],
+                "preferred_entity_names": ["buyingPowerDetail"]
+            }
+        ],
+    },
+)
+print(result.metadata["entity"])  # "transactions"
+```
+
+Each intent requires **all** listed `keywords` to appear in the query.  Use `find_entity_by_name` for an exact entity name match, or `find_entity_with_fields` to pick the entity whose schema contains the most candidate fields (with optional `preferred_entity_names` as a tiebreaker).
 
 ## Structured Logging
 
@@ -1144,10 +1194,11 @@ python -m twine check dist/*
 - `text2ql.core.Text2QL`: orchestrator/facade — `generate()`, `agenerate()`, `agenerate_many()`.
 - `text2ql.types`: request/result schemas (`QueryRequest`, `QueryResult`, `ValidationError`).
 - `text2ql.ir`: abstract IR layer — `QueryIR`, `IRFilter`, `IRJoin`, `IRNested`, `IRAggregation`, `IRRenderer`.
+- `text2ql.renderers`: concrete renderers — `GraphQLIRRenderer` and `SQLIRRenderer`.  Both engines build a `QueryIR` internally and call `renderer.render(ir)` to produce the final query string.  `SQLIRRenderer` also handles `SELECT COUNT(*)/SUM()/AVG()` + `GROUP BY` when aggregations are detected.
 - `text2ql.filters`: shared compiled regex singletons and stateless helpers (`detect_comparison_filters`, `detect_negation_filters`, `detect_between_filters`, `detect_in_filters`, `detect_date_range_filters`) — imported by both engines to eliminate regex duplication.
 - `text2ql.engines.*`: per-target query generators — each exposes both `generate()` and `agenerate()`.
   - `strict_validation=True` raises `ValidationError` on contradictory filters or invalid JOIN ON-clause columns.
-  - Entity detection is schema-driven; falls back to generic text extraction (no hardcoded domain lists).
+  - Entity detection is fully schema-driven: alias → name → semantic field match → `schema.keyword_intents` → first schema entity → generic text extraction (no hardcoded domain lists).
   - GraphQL nested detection is recursive (up to `max_depth=3` hops) with cycle prevention.
 - `text2ql.engines.base.compute_deterministic_confidence`: runtime confidence scoring (schema, entity, fields, filters, validation).
 - `text2ql.providers.*`: pluggable LLM provider adapters — implement `complete()`, get `acomplete()` for free (or override for native async).
