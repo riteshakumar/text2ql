@@ -361,32 +361,6 @@ class GraphQLEngine(QueryEngine):
         # replaces the old hardcoded list.
         return self._extract_entity_from_text(lowered)
 
-    @staticmethod
-    def _extract_entity_from_text(lowered: str) -> str:
-        """Heuristically extract the most likely entity name from raw query text.
-
-        Used only when no schema entities are declared.  Avoids hardcoded domain
-        lists by tokenising the query and skipping common stop-words; basic
-        singularisation (strip trailing *s*) converts plural nouns to their root
-        form so that "list users" → "user".
-        """
-        _STOP_WORDS = frozenset({
-            "list", "show", "get", "fetch", "find", "display", "give", "tell",
-            "me", "all", "the", "a", "an", "of", "from", "with", "where",
-            "and", "or", "by", "in", "for", "is", "are", "was", "were",
-            "have", "has", "had", "my", "your", "their", "its", "our",
-            "what", "which", "who", "how", "top", "latest", "first", "last",
-            "recent", "new", "old",
-        })
-        tokens = re.findall(r"[a-z][a-z0-9_]*", lowered)
-        for token in tokens:
-            if token in _STOP_WORDS or len(token) < 3:
-                continue
-            if token.endswith("s") and len(token) > 3:
-                return token[:-1]
-            return token
-        return "items"
-
     def _resolve_special_entity(self, lowered: str, config: NormalizedSchemaConfig) -> str | None:
         """Route compound-keyword intents to their schema entities.
 
@@ -1596,25 +1570,33 @@ class GraphQLEngine(QueryEngine):
         base_key = self._base_filter_key(key)
         arg_types = config.introspection_query_args.get(entity, {})
         arg_type = arg_types.get(base_key)
+        enum_values: set[str] = self._enum_values_for_type(arg_type, config) if arg_type else set()
         if isinstance(value, list):
             out: list[Any] = []
             for item in value:
                 coerced = self._coerce_scalar_value(item, arg_type)
-                if coerced is not None:
-                    out.append(coerced)
+                if coerced is None:
+                    continue
+                if enum_values and isinstance(coerced, str):
+                    canonical = next(
+                        (ev for ev in enum_values if ev.lower() == coerced.lower()), None
+                    )
+                    if canonical is None:
+                        notes.append(f"dropped invalid enum value '{coerced}' for '{base_key}'")
+                        continue
+                    coerced = canonical
+                out.append(coerced)
             return out
         coerced_scalar = self._coerce_scalar_value(value, arg_type)
-        if arg_type:
-            enum_values = self._enum_values_for_type(arg_type, config)
-            if enum_values and isinstance(coerced_scalar, str):
-                canonical = next(
-                    (value for value in enum_values if value.lower() == coerced_scalar.lower()),
-                    None,
-                )
-                if canonical is None:
-                    notes.append(f"dropped invalid enum value '{coerced_scalar}' for '{base_key}'")
-                    return None
-                coerced_scalar = canonical
+        if enum_values and isinstance(coerced_scalar, str):
+            canonical = next(
+                (enum_val for enum_val in enum_values if enum_val.lower() == coerced_scalar.lower()),
+                None,
+            )
+            if canonical is None:
+                notes.append(f"dropped invalid enum value '{coerced_scalar}' for '{base_key}'")
+                return None
+            coerced_scalar = canonical
         return coerced_scalar
 
     @staticmethod

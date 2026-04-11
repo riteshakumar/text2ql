@@ -212,10 +212,12 @@ class SQLEngine(QueryEngine):
             order_by=order_by, order_dir=order_dir, config=config,
         )
         exact_filter_keys = self._allowed_filter_keys(config, table, set(columns))
+        aggregations = self._detect_aggregations(prompt.lower())
         query = self._build_sql(
             table=table, columns=columns, filters=filters, joins=joins,
             order_by=order_by, order_dir=order_dir, limit=limit, offset=offset,
             exact_filter_keys=exact_filter_keys,
+            aggregations=aggregations,
         )
         return QueryResult(
             query=query,
@@ -243,6 +245,7 @@ class SQLEngine(QueryEngine):
                 "order_dir": order_dir,
                 "limit": limit,
                 "offset": offset,
+                "aggregations": aggregations,
                 "mode": "llm",
                 "language": resolved_language,
                 "raw_completion": raw,
@@ -415,7 +418,7 @@ class SQLEngine(QueryEngine):
                 return entity
         if config.default_entity:
             return config.default_entity
-        return (config.entities[0] if config.entities else "items")
+        return config.entities[0] if config.entities else self._extract_entity_from_text(lowered)
 
     @staticmethod
     def _detect_owned_asset(lowered: str) -> str | None:

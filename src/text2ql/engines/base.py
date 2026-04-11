@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -18,6 +19,32 @@ class QueryEngine(ABC):
     async def agenerate(self, request: QueryRequest) -> QueryResult:
         """Async generate — default runs sync generate in a thread pool."""
         return await asyncio.to_thread(self.generate, request)
+
+    @staticmethod
+    def _extract_entity_from_text(lowered: str) -> str:
+        """Heuristically extract the most likely entity name from raw query text.
+
+        Used only when no schema entities are declared.  Avoids hardcoded domain
+        lists by tokenising the query and skipping common stop-words; basic
+        singularisation (strip trailing *s*) converts plural nouns to their root
+        form so that "list users" → "user".
+        """
+        _STOP_WORDS = frozenset({
+            "list", "show", "get", "fetch", "find", "display", "give", "tell",
+            "me", "all", "the", "a", "an", "of", "from", "with", "where",
+            "and", "or", "by", "in", "for", "is", "are", "was", "were",
+            "have", "has", "had", "my", "your", "their", "its", "our",
+            "what", "which", "who", "how", "top", "latest", "first", "last",
+            "recent", "new", "old",
+        })
+        tokens = re.findall(r"[a-z][a-z0-9_]*", lowered)
+        for token in tokens:
+            if token in _STOP_WORDS or len(token) < 3:
+                continue
+            if token.endswith("s") and len(token) > 3:
+                return token[:-1]
+            return token
+        return "items"
 
 
 def compute_deterministic_confidence(
