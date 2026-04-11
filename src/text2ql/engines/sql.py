@@ -6,7 +6,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from text2ql.constrained import ConstrainedOutputError, parse_sql_intent
+from text2ql.renderers import SQLIRRenderer
 from text2ql.filters import (
+    AND_TOKEN as _AND_TOKEN,
+    SPURIOUS_FILTER_VALUES as _SPURIOUS_FILTER_VALUES,
     detect_between_filters,
     detect_comparison_filters,
     detect_date_range_filters,
@@ -27,7 +30,7 @@ from .base import QueryEngine, compute_deterministic_confidence
 
 logger = logging.getLogger(__name__)
 
-_SPURIOUS_FILTER_VALUES = {"where", "with", "and", "or", "for", "of", "in", "is"}
+_SQL_RENDERER = SQLIRRenderer()
 
 
 @dataclass(slots=True)
@@ -89,6 +92,7 @@ class SQLEngine(QueryEngine):
         joins = self._detect_joins(lowered, table, config)
         order_by, order_dir = self._detect_order(lowered, columns)
         limit, offset = self._detect_pagination(lowered)
+        aggregations = self._detect_aggregations(lowered)
 
         (
             table,
@@ -119,6 +123,7 @@ class SQLEngine(QueryEngine):
             limit=limit,
             offset=offset,
             exact_filter_keys=exact_filter_keys,
+            aggregations=aggregations,
         )
         confidence = compute_deterministic_confidence(
             entity=table,
@@ -126,7 +131,7 @@ class SQLEngine(QueryEngine):
             filters=filters,
             validation_notes=notes,
             config=config,
-            extra_signals={"joins": joins, "order_by": order_by},
+            extra_signals={"joins": joins, "order_by": order_by, "aggregations": aggregations},
         )
         return QueryResult(
             query=query,
@@ -150,6 +155,7 @@ class SQLEngine(QueryEngine):
                     }
                     for join in joins
                 ],
+                "aggregations": aggregations,
                 "order_by": order_by,
                 "order_dir": order_dir,
                 "limit": limit,
@@ -710,6 +716,29 @@ class SQLEngine(QueryEngine):
             offset = int(after_match.group(1))
         return limit, offset
 
+    def _detect_aggregations(self, lowered: str) -> list[dict[str, str]]:
+        """Detect aggregate expressions in *lowered* query text.
+
+        Returns a list of dicts compatible with ``QueryIR.from_components()``
+        and :class:`~text2ql.ir.IRAggregation`.
+        """
+        aggregations: list[dict[str, str]] = []
+        if re.search(r"\bcount\b", lowered):
+            aggregations.append({"function": "COUNT", "field": "*", "alias": "count"})
+            return aggregations  # count overrides other aggs — keep it simple
+        agg_patterns = [
+            (r"\bsum\s+(?:of\s+)?([a-zA-Z_]\w*)\b", "SUM"),
+            (r"\bavg(?:erage)?\s+(?:of\s+)?([a-zA-Z_]\w*)\b", "AVG"),
+            (r"\bmin(?:imum)?\s+(?:of\s+)?([a-zA-Z_]\w*)\b", "MIN"),
+            (r"\bmax(?:imum)?\s+(?:of\s+)?([a-zA-Z_]\w*)\b", "MAX"),
+        ]
+        for pattern, fn in agg_patterns:
+            m = re.search(pattern, lowered)
+            if m:
+                field = m.group(1)
+                aggregations.append({"function": fn, "field": field, "alias": f"{fn.lower()}_{field}"})
+        return aggregations
+
     def _detect_joins(self, lowered: str, table: str, config: Any) -> list[_RelationJoin]:
         relation_map = config.relations_by_entity.get(table, {})
         joins: list[_RelationJoin] = []
@@ -1026,28 +1055,43 @@ class SQLEngine(QueryEngine):
         limit: int | None,
         offset: int | None,
         exact_filter_keys: set[str] | None = None,
+        aggregations: list[dict[str, str]] | None = None,
     ) -> str:
-        select_columns = [f"{table}.{column}" for column in columns]
-        join_sql: list[str] = []
-        where_parts = self._build_where_parts(filters, table, exact_filter_keys=exact_filter_keys)
+        """Build a SQL SELECT statement via :class:`~text2ql.renderers.SQLIRRenderer`.
 
-        for join in joins:
-            join_sql.append(f"LEFT JOIN {join.target} {join.alias} ON {join.on_clause}")
-            select_columns.extend([f"{join.alias}.{field} AS {join.alias}_{field}" for field in join.fields])
-            where_parts.extend(self._build_where_parts(join.filters, join.alias))
-
-        sql = f"SELECT {', '.join(select_columns)} FROM {table}"
-        if join_sql:
-            sql += " " + " ".join(join_sql)
-        if where_parts:
-            sql += " WHERE " + " AND ".join(where_parts)
-        if order_by and order_dir:
-            sql += f" ORDER BY {table}.{order_by} {order_dir}"
-        if limit is not None:
-            sql += f" LIMIT {limit}"
-        if offset is not None:
-            sql += f" OFFSET {offset}"
-        return sql + ";"
+        The engine detects all components; the renderer assembles the final
+        string (including GROUP BY / aggregations when *aggregations* is
+        non-empty).  ``IRRenderer.render()`` is now the production path.
+        """
+        from text2ql.ir import QueryIR
+        # Convert _RelationJoin objects to the dict format expected by from_components.
+        join_dicts = [
+            {
+                "relation": j.relation,
+                "target": j.target,
+                "on_clause": j.on_clause,
+                "fields": j.fields,
+                "filters": j.filters,
+                "join_type": "LEFT",
+            }
+            for j in joins
+        ]
+        exact_keys: frozenset[str] = frozenset(exact_filter_keys) if exact_filter_keys else frozenset()
+        ir = QueryIR.from_components(
+            entity=table,
+            fields=columns,
+            filters=filters,
+            joins=join_dicts,
+            aggregations=aggregations or [],
+            order_by=order_by,
+            order_dir=order_dir,
+            limit=limit,
+            offset=offset,
+            target="sql",
+            exact_filter_keys=exact_keys,
+            metadata={"exact_filter_keys": list(exact_keys)},
+        )
+        return _SQL_RENDERER.render(ir)
 
     def _build_where_parts(
         self,

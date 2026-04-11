@@ -257,14 +257,18 @@ class QueryIR:
         target: str = "graphql",
         source_text: str = "",
         metadata: dict[str, Any] | None = None,
+        exact_filter_keys: frozenset[str] | None = None,
     ) -> "QueryIR":
         """Build a ``QueryIR`` directly from engine component dicts.
 
-        This is the bridge that lets existing engines create an IR without
-        being fully refactored.  Engines call this at the end of
-        ``generate()`` after they've resolved all their internal state.
+        Parameters
+        ----------
+        exact_filter_keys:
+            Forwarded to :func:`_split_filters`.  Pass the set of schema
+            column names so that columns whose names end in ``_ne``/``_gte``/…
+            are not mistakenly treated as comparison-operator suffixes.
         """
-        flat_filters, group_filters = _split_filters(filters)
+        flat_filters, group_filters = _split_filters(filters, exact_filter_keys)
         ir_joins = [_join_from_dict(j) for j in (joins or []) if isinstance(j, dict)]
         ir_nested = [_nested_from_dict(n) for n in (nested or []) if isinstance(n, dict)]
         ir_aggs = [_agg_from_dict(a) for a in (aggregations or []) if isinstance(a, dict)]
@@ -336,8 +340,20 @@ class IRRenderer:
 
 def _split_filters(
     raw: dict[str, Any],
+    exact_filter_keys: frozenset[str] | None = None,
 ) -> tuple[list[IRFilter], dict[str, Any]]:
     """Separate flat scalar filters from grouped AND/OR/NOT trees.
+
+    Parameters
+    ----------
+    raw:
+        Raw filter dict from the engine (keys may carry ``_gte``/``_ne``/…
+        suffixes that encode comparison operators).
+    exact_filter_keys:
+        Set of key names that are *actual schema column names* and must never
+        have their suffixes stripped.  For example, if the schema has a column
+        called ``shipped_ne``, passing it in this set prevents it from being
+        misread as a not-equal predicate on a column called ``shipped``.
 
     Returns
     -------
@@ -349,6 +365,7 @@ def _split_filters(
     """
     flat: list[IRFilter] = []
     groups: dict[str, Any] = {}
+    exact_keys: frozenset[str] = exact_filter_keys or frozenset()
 
     _SUFFIX_OP = {
         "_gte": "gte",
@@ -369,11 +386,14 @@ def _split_filters(
             continue
         op = "eq"
         canonical_key = key
-        for suffix, suffix_op in _SUFFIX_OP.items():
-            if key.endswith(suffix):
-                canonical_key = key[: -len(suffix)]
-                op = suffix_op
-                break
+        # Only attempt suffix-based operator detection when the key is not
+        # a known exact schema column name.
+        if key not in exact_keys:
+            for suffix, suffix_op in _SUFFIX_OP.items():
+                if key.endswith(suffix):
+                    canonical_key = key[: -len(suffix)]
+                    op = suffix_op
+                    break
         flat.append(IRFilter(key=canonical_key, value=value, operator=op))
 
     return flat, groups

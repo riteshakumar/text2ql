@@ -28,6 +28,9 @@ SPURIOUS_FILTER_VALUES: frozenset[str] = frozenset(
     {"where", "with", "and", "or", "for", "of", "in", "is"}
 )
 
+#: Convenience alias so engines can import the AND token from one place.
+AND_TOKEN: str = " and "
+
 # ---------------------------------------------------------------------------
 # Compiled patterns – module-level singletons for performance
 # ---------------------------------------------------------------------------

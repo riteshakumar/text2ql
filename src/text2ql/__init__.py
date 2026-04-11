@@ -6,6 +6,7 @@ from .evaluate import EvaluationReport, aevaluate_examples, evaluate_examples
 from .ir import IRAggregation, IRFilter, IRJoin, IRNested, IRRenderer, QueryIR
 from .json_execution import execute_query_result_on_json
 from .mapping import generate_hybrid_mapping
+from .renderers import GraphQLIRRenderer, SQLIRRenderer
 from .rewrite import arewrite_user_utterance, rewrite_user_utterance
 from .schema_config import infer_schema_from_json_payload
 from .sql_executor import SQLAlchemyExecutor, create_sqlite_executor
@@ -14,6 +15,7 @@ from .types import QueryRequest, QueryResult, ValidationError
 __all__ = [
     "DatasetExample",
     "EvaluationReport",
+    "GraphQLIRRenderer",
     "IRAggregation",
     "IRFilter",
     "IRJoin",
@@ -23,6 +25,7 @@ __all__ = [
     "QueryRequest",
     "QueryResult",
     "SQLAlchemyExecutor",
+    "SQLIRRenderer",
     "Text2QL",
     "ValidationError",
     "aevaluate_examples",

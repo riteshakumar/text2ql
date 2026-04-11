@@ -3,12 +3,15 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime
-from textwrap import dedent
 from typing import Any
 
 from text2ql.constrained import ConstrainedOutputError, parse_graphql_intent
+from text2ql.renderers import GraphQLIRRenderer
 from text2ql.filters import (
+    AND_TOKEN as _AND_TOKEN,
     FILTER_VALUE as _FILTER_VALUE,
+    SPURIOUS_FILTER_VALUES as _SPURIOUS_FILTER_VALUES,
+    WORD_IDENTIFIER as _WORD_IDENTIFIER,
     detect_between_filters,
     detect_comparison_filters,
     detect_date_range_filters,
@@ -33,9 +36,8 @@ from .base import QueryEngine, compute_deterministic_confidence
 
 logger = logging.getLogger(__name__)
 
-_WORD_IDENTIFIER = r"([A-Za-z_]\w*)"
-_AND_TOKEN = " and "
-_SPURIOUS_FILTER_VALUES = {"where", "with", "and", "or", "for", "of", "in", "is"}
+# Module-level renderer singleton — re-used across calls to avoid allocation.
+_GRAPHQL_RENDERER = GraphQLIRRenderer()
 
 
 class GraphQLEngine(QueryEngine):
@@ -386,31 +388,49 @@ class GraphQLEngine(QueryEngine):
         return "items"
 
     def _resolve_special_entity(self, lowered: str, config: NormalizedSchemaConfig) -> str | None:
-        if ("transaction" in lowered or "transactions" in lowered) and "as of date" in lowered:
-            return self._find_entity_with_field(
-                config,
-                candidate_fields=["asOfDate", "asOfDateTime"],
-                preferred_entity_names=["transactionsSummary"],
-            )
-        if "dividend" in lowered:
-            return self._find_entity_by_name(config, "transactions")
-        if "net worth" in lowered:
-            return self._find_entity_with_field(
-                config,
-                candidate_fields=["netWorth", "regulatoryNetWorth"],
-            )
-        if "available" in lowered and "withdraw" in lowered:
-            return self._find_entity_with_field(
-                config,
-                candidate_fields=["cashOnly", "cashWithMargin", "availBorr"],
-                preferred_entity_names=["availableToWithdrawDetail"],
-            )
-        if "buying power" in lowered:
-            return self._find_entity_with_field(
-                config,
-                candidate_fields=["cash", "margin", "withoutMarginImpact"],
-                preferred_entity_names=["buyingPowerDetail"],
-            )
+        """Route compound-keyword intents to their schema entities.
+
+        Rules are supplied via ``schema["keyword_intents"]`` — a list of dicts:
+
+        .. code-block:: json
+
+            {
+              "keywords": ["net", "worth"],
+              "find_entity_with_fields": ["netWorth", "regulatoryNetWorth"]
+            }
+
+        Each rule requires **all** ``keywords`` to appear in the lowered query.
+        The engine then looks up the best-matching schema entity using either
+        ``find_entity_by_name`` (exact name match) or ``find_entity_with_fields``
+        (field-presence score).  An optional ``preferred_entity_names`` list
+        breaks ties in favour of named entities.
+
+        Domain-specific rules (dividends, net worth, buying power, …) are **not**
+        hardcoded here — they belong in the calling schema's ``keyword_intents``
+        config so that the engine stays domain-agnostic.
+        """
+        for intent in config.keyword_intents:
+            keywords = intent.get("keywords", [])
+            if isinstance(keywords, str):
+                keywords = [keywords]
+            if not keywords:
+                continue
+            if not all(kw in lowered for kw in keywords):
+                continue
+            if "find_entity_by_name" in intent:
+                result = self._find_entity_by_name(config, str(intent["find_entity_by_name"]))
+                if result:
+                    return result
+            if "find_entity_with_fields" in intent:
+                fields = intent["find_entity_with_fields"]
+                preferred = intent.get("preferred_entity_names")
+                result = self._find_entity_with_field(
+                    config,
+                    candidate_fields=list(fields) if isinstance(fields, list) else [str(fields)],
+                    preferred_entity_names=list(preferred) if isinstance(preferred, list) else None,
+                )
+                if result:
+                    return result
         return None
 
     def _resolve_entity_by_alias_or_name(
@@ -1259,65 +1279,25 @@ class GraphQLEngine(QueryEngine):
         aggregations: list[dict[str, str]],
         nested: list[dict[str, Any]],
     ) -> str:
-        args = ""
-        if filters:
-            ordered_filters = self._order_filters(filters)
-            args_str = ", ".join(f"{k}: {self._format_arg(v)}" for k, v in ordered_filters)
-            args = f"({args_str})"
+        """Build a GraphQL query string via :class:`~text2ql.renderers.GraphQLIRRenderer`.
 
-        selection_lines = list(fields)
-        for agg in aggregations:
-            fn_name = agg.get("function", "")
-            field = agg.get("field", "")
-            if not fn_name:
-                continue
-            if fn_name == "count":
-                selection_lines.append("count")
-            else:
-                selection_lines.append(f'{fn_name}(field: "{field}")')
-
-        for nested_node in nested:
-            selection_lines.append(self._build_nested_selection(nested_node, indent=2))
-
-        selection = "\n    ".join(selection_lines)
-        return dedent(
-            f"""
-            {{
-              {entity}{args} {{
-                {selection}
-              }}
-            }}
-            """
-        ).strip()
+        The engine detects components; the renderer assembles the final string.
+        ``IRRenderer.render()`` is now the production path for query generation.
+        """
+        from text2ql.ir import QueryIR
+        ir = QueryIR.from_components(
+            entity=entity,
+            fields=fields,
+            filters=filters,
+            aggregations=aggregations,
+            nested=nested,
+            target="graphql",
+        )
+        return _GRAPHQL_RENDERER.render(ir)
 
     def _build_nested_selection(self, node: dict[str, Any], indent: int) -> str:
-        """Recursively render a nested relation node into a GraphQL selection string.
-
-        Parameters
-        ----------
-        node:
-            A nested relation node produced by :meth:`_detect_nested`, containing
-            keys ``relation``, ``fields``, ``filters``, and optionally ``nested``.
-        indent:
-            Current indentation level (number of spaces per level is 2).
-        """
-        relation = node["relation"]
-        node_filters = node.get("filters", {})
-        node_args = ""
-        if node_filters:
-            ordered = self._order_filters(node_filters)
-            args_str = ", ".join(f"{k}: {self._format_arg(v)}" for k, v in ordered)
-            node_args = f"({args_str})"
-
-        pad = " " * indent
-        child_pad = " " * (indent + 2)
-
-        field_lines: list[str] = list(node.get("fields", ["id"]))
-        for child in node.get("nested", []):
-            field_lines.append(self._build_nested_selection(child, indent + 2))
-
-        inner = f"\n{child_pad}".join(field_lines)
-        return f"{relation}{node_args} {{\n{child_pad}{inner}\n{pad}}}"
+        """Delegate nested-node rendering to :class:`~text2ql.renderers.GraphQLIRRenderer`."""
+        return _GRAPHQL_RENDERER._render_nested(node, indent)
 
     @staticmethod
     def _format_arg(value: Any) -> str:
