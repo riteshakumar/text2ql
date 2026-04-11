@@ -375,6 +375,8 @@ def _generate_result_payloads(
             "rewritten_prompt": rewritten_prompt,
             "rewrite": rewrite_meta,
             "query": result.query,
+            "confidence": result.confidence,
+            "explanation": result.explanation,
             "synthetic": dynamic_meta,
             "metadata": dynamic_meta,
             "engine_metadata": result.metadata,

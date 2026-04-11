@@ -355,6 +355,8 @@ def main() -> None:
                 "rewritten_prompt": rewritten_prompt,
                 "rewrite_meta": rewrite_meta,
                 "query": result.query,
+                "confidence": result.confidence,
+                "explanation": result.explanation,
                 "metadata": result.metadata,
                 "timing_ms": {
                     "total": total_elapsed * 1000,
@@ -409,16 +411,25 @@ def main() -> None:
         st.subheader("Results")
         for row in results:
             with st.expander(f"Variant {row['idx']}: {row['prompt']}", expanded=(row["idx"] == 1)):
+                # Confidence + timing on one line.
+                conf = row.get("confidence")
+                conf_str = f"{conf:.4f}" if isinstance(conf, float) else "—"
                 st.caption(
-                    f"timing_ms total={row['timing_ms'].get('total', 0):.3f} "
-                    f"generate={row['timing_ms'].get('generate', 0):.3f} "
-                    f"execute={row['timing_ms'].get('execute', 0):.3f}"
+                    f"confidence={conf_str}  ·  "
+                    f"generate={row['timing_ms'].get('generate', 0):.1f}ms  ·  "
+                    f"execute={row['timing_ms'].get('execute', 0):.1f}ms"
                 )
+                # Explanation directly below.
+                explanation = row.get("explanation", "")
+                if explanation:
+                    st.info(explanation)
+
                 if llm_rewrite and rewrite_provider is not None:
                     st.markdown("**Rewritten Prompt**")
                     st.code(row.get("rewritten_prompt", ""), language="text")
                     st.markdown("**Rewrite metadata**")
                     st.json(row.get("rewrite_meta", {}), expanded=False)
+
                 # Surface validation notes prominently before the query.
                 engine_meta = row.get("metadata", {})
                 validation_notes = engine_meta.get("validation_notes", [])
