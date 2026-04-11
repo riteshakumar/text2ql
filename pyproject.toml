@@ -34,6 +34,9 @@ dev = [
 app = [
   "streamlit>=1.36"
 ]
+sql = [
+  "sqlalchemy>=2.0"
+]
 
 [project.scripts]
 text2ql = "text2ql.cli:main"

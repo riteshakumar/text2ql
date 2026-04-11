@@ -1,21 +1,29 @@
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime
 from textwrap import dedent
 from typing import Any
 
 from text2ql.constrained import ConstrainedOutputError, parse_graphql_intent
-from text2ql.prompting import build_graphql_prompts, resolve_language, resolve_prompt_template
+from text2ql.prompting import (
+    GRAPHQL_INTENT_JSON_SCHEMA,
+    build_graphql_prompts,
+    resolve_language,
+    resolve_prompt_template,
+)
 from text2ql.providers.base import LLMProvider
 from text2ql.schema_config import (
     NormalizedRelation,
     NormalizedSchemaConfig,
     normalize_schema_config,
 )
-from text2ql.types import QueryRequest, QueryResult
+from text2ql.types import QueryRequest, QueryResult, ValidationError
 
 from .base import QueryEngine, compute_deterministic_confidence
+
+logger = logging.getLogger(__name__)
 
 _WORD_IDENTIFIER = r"([A-Za-z_]\w*)"
 _FILTER_VALUE = r"([\w.:-]+)"
@@ -31,10 +39,24 @@ class GraphQLEngine(QueryEngine):
     Design intent:
     - Keep the engine deterministic for testability.
     - Let LLM providers be optional, pluggable upgrades.
+
+    Parameters
+    ----------
+    provider:
+        Optional LLM provider for ``mode="llm"`` or ``mode="function_calling"``.
+    strict_validation:
+        When ``True``, raise :class:`~text2ql.types.ValidationError` on
+        contradictory filters instead of silently noting them.  Defaults to
+        ``False`` for backwards-compatible graceful degradation.
     """
 
-    def __init__(self, provider: LLMProvider | None = None) -> None:
+    def __init__(
+        self,
+        provider: LLMProvider | None = None,
+        strict_validation: bool = False,
+    ) -> None:
         self.provider = provider
+        self.strict_validation = strict_validation
         self._last_llm_error: str | None = None
 
     def generate(self, request: QueryRequest) -> QueryResult:
@@ -44,8 +66,8 @@ class GraphQLEngine(QueryEngine):
         llm_error: str | None = None
         self._last_llm_error = None
 
-        if mode == "llm" and self.provider is not None:
-            llm_result = self._generate_with_llm(prompt, config, request.context)
+        if mode in {"llm", "function_calling"} and self.provider is not None:
+            llm_result = self._generate_with_llm(prompt, config, request.context, mode=mode)
             if llm_result is not None:
                 return llm_result
             llm_error = self._last_llm_error or "LLM mode fallback to deterministic mode."
@@ -124,6 +146,7 @@ class GraphQLEngine(QueryEngine):
             intent = parse_graphql_intent(raw, config, language=resolved_language)
         except ConstrainedOutputError as exc:
             self._last_llm_error = f"LLM output parse error: {exc}"
+            logger.warning("GraphQLEngine: LLM output parse error: %s", exc)
             return None
 
         nested: list[dict[str, Any]] = []
@@ -163,15 +186,28 @@ class GraphQLEngine(QueryEngine):
         prompt: str,
         config: NormalizedSchemaConfig,
         context: dict,
+        mode: str = "llm",
     ) -> QueryResult | None:
         prepared = self._prepare_llm_prompts(prompt, config, context)
         if prepared is None:
             return None
         system_prompt, user_prompt, resolved_language = prepared
+        use_fc = mode == "function_calling"
+        logger.debug(
+            "GraphQLEngine: calling LLM provider (sync, function_calling=%s)", use_fc
+        )
         try:
-            raw = self.provider.complete(system_prompt=system_prompt, user_prompt=user_prompt)
+            if use_fc:
+                raw = self.provider.complete_structured(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    json_schema=GRAPHQL_INTENT_JSON_SCHEMA,
+                )
+            else:
+                raw = self.provider.complete(system_prompt=system_prompt, user_prompt=user_prompt)
         except (RuntimeError, ValueError, TypeError) as exc:
             self._last_llm_error = f"LLM provider error: {exc}"
+            logger.warning("GraphQLEngine: LLM provider error: %s", exc)
             return None
         return self._build_llm_result(raw, prompt, config, resolved_language)
 
@@ -180,15 +216,30 @@ class GraphQLEngine(QueryEngine):
         prompt: str,
         config: NormalizedSchemaConfig,
         context: dict,
+        mode: str = "llm",
     ) -> QueryResult | None:
         prepared = self._prepare_llm_prompts(prompt, config, context)
         if prepared is None:
             return None
         system_prompt, user_prompt, resolved_language = prepared
+        use_fc = mode == "function_calling"
+        logger.debug(
+            "GraphQLEngine: calling LLM provider (async, function_calling=%s)", use_fc
+        )
         try:
-            raw = await self.provider.acomplete(system_prompt=system_prompt, user_prompt=user_prompt)
+            if use_fc:
+                raw = await self.provider.acomplete_structured(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    json_schema=GRAPHQL_INTENT_JSON_SCHEMA,
+                )
+            else:
+                raw = await self.provider.acomplete(
+                    system_prompt=system_prompt, user_prompt=user_prompt
+                )
         except (RuntimeError, ValueError, TypeError) as exc:
             self._last_llm_error = f"LLM provider error: {exc}"
+            logger.warning("GraphQLEngine: async LLM provider error: %s", exc)
             return None
         return self._build_llm_result(raw, prompt, config, resolved_language)
 
@@ -199,8 +250,8 @@ class GraphQLEngine(QueryEngine):
         mode = str(request.context.get("mode", "deterministic")).strip().lower()
         self._last_llm_error = None
 
-        if mode == "llm" and self.provider is not None:
-            llm_result = await self._agenerate_with_llm(prompt, config, request.context)
+        if mode in {"llm", "function_calling"} and self.provider is not None:
+            llm_result = await self._agenerate_with_llm(prompt, config, request.context, mode=mode)
             if llm_result is not None:
                 return llm_result
 
@@ -1298,6 +1349,20 @@ class GraphQLEngine(QueryEngine):
             config=config,
             notes=notes,
         )
+
+        # Contradiction detection — same field with conflicting plain-equality values
+        from text2ql.engines.sql import _detect_contradictory_filters
+        contradiction_notes = _detect_contradictory_filters(validated_filters)
+        if contradiction_notes:
+            for note in contradiction_notes:
+                logger.warning("GraphQLEngine [%s]: %s", validated_entity, note)
+            notes.extend(contradiction_notes)
+            if self.strict_validation:
+                raise ValidationError(
+                    f"Contradictory filters detected for entity '{validated_entity}'",
+                    contradiction_notes,
+                )
+
         validated_aggregations = self._validate_aggregations(
             aggregations=aggregations,
             allowed_fields=allowed_fields,

@@ -1,16 +1,24 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any
 
 from text2ql.constrained import ConstrainedOutputError, parse_sql_intent
-from text2ql.prompting import build_sql_prompts, resolve_language, resolve_prompt_template
+from text2ql.prompting import (
+    SQL_INTENT_JSON_SCHEMA,
+    build_sql_prompts,
+    resolve_language,
+    resolve_prompt_template,
+)
 from text2ql.providers.base import LLMProvider
 from text2ql.schema_config import NormalizedRelation, normalize_schema_config
-from text2ql.types import QueryRequest, QueryResult
+from text2ql.types import QueryRequest, QueryResult, ValidationError
 
 from .base import QueryEngine, compute_deterministic_confidence
+
+logger = logging.getLogger(__name__)
 
 _SPURIOUS_FILTER_VALUES = {"where", "with", "and", "or", "for", "of", "in", "is"}
 
@@ -26,10 +34,26 @@ class _RelationJoin:
 
 
 class SQLEngine(QueryEngine):
-    """Deterministic SQL engine with schema validation and robust filter parsing."""
+    """Deterministic SQL engine with schema validation and robust filter parsing.
 
-    def __init__(self, provider: LLMProvider | None = None) -> None:
+    Parameters
+    ----------
+    provider:
+        Optional LLM provider for ``mode="llm"`` or ``mode="function_calling"``.
+    strict_validation:
+        When ``True``, raise :class:`~text2ql.types.ValidationError` on
+        contradictory filters or invalid JOIN ON-clause columns instead of
+        silently adding a note and continuing.  Defaults to ``False`` to
+        preserve backwards-compatible graceful degradation.
+    """
+
+    def __init__(
+        self,
+        provider: LLMProvider | None = None,
+        strict_validation: bool = False,
+    ) -> None:
         self.provider = provider
+        self.strict_validation = strict_validation
         self._last_llm_error: str | None = None
 
     def generate(self, request: QueryRequest) -> QueryResult:
@@ -38,8 +62,8 @@ class SQLEngine(QueryEngine):
         mode = str(request.context.get("mode", "deterministic")).strip().lower()
         llm_error: str | None = None
         self._last_llm_error = None
-        if mode == "llm" and self.provider is not None:
-            llm_result = self._generate_with_llm(prompt, config, request.context)
+        if mode in {"llm", "function_calling"} and self.provider is not None:
+            llm_result = self._generate_with_llm(prompt, config, request.context, mode=mode)
             if llm_result is not None:
                 return llm_result
             llm_error = self._last_llm_error or "LLM mode fallback to deterministic mode."
@@ -157,6 +181,7 @@ class SQLEngine(QueryEngine):
             intent = parse_sql_intent(raw, config, language=resolved_language)
         except ConstrainedOutputError as exc:
             self._last_llm_error = f"LLM output parse error: {exc}"
+            logger.warning("SQLEngine: LLM output parse error: %s", exc)
             return None
 
         table, columns, filters = self._reconcile_owned_asset_intent(
@@ -217,15 +242,26 @@ class SQLEngine(QueryEngine):
         prompt: str,
         config: Any,
         context: dict[str, Any],
+        mode: str = "llm",
     ) -> QueryResult | None:
         prepared = self._prepare_llm_prompts(prompt, config, context)
         if prepared is None:
             return None
         system_prompt, user_prompt, resolved_language = prepared
+        use_fc = mode == "function_calling"
+        logger.debug("SQLEngine: calling LLM provider (sync, function_calling=%s)", use_fc)
         try:
-            raw = self.provider.complete(system_prompt=system_prompt, user_prompt=user_prompt)
+            if use_fc:
+                raw = self.provider.complete_structured(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    json_schema=SQL_INTENT_JSON_SCHEMA,
+                )
+            else:
+                raw = self.provider.complete(system_prompt=system_prompt, user_prompt=user_prompt)
         except (RuntimeError, ValueError, TypeError) as exc:
             self._last_llm_error = f"LLM provider error: {exc}"
+            logger.warning("SQLEngine: LLM provider error: %s", exc)
             return None
         return self._build_llm_result(raw, prompt, config, resolved_language)
 
@@ -234,15 +270,28 @@ class SQLEngine(QueryEngine):
         prompt: str,
         config: Any,
         context: dict[str, Any],
+        mode: str = "llm",
     ) -> QueryResult | None:
         prepared = self._prepare_llm_prompts(prompt, config, context)
         if prepared is None:
             return None
         system_prompt, user_prompt, resolved_language = prepared
+        use_fc = mode == "function_calling"
+        logger.debug("SQLEngine: calling LLM provider (async, function_calling=%s)", use_fc)
         try:
-            raw = await self.provider.acomplete(system_prompt=system_prompt, user_prompt=user_prompt)
+            if use_fc:
+                raw = await self.provider.acomplete_structured(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    json_schema=SQL_INTENT_JSON_SCHEMA,
+                )
+            else:
+                raw = await self.provider.acomplete(
+                    system_prompt=system_prompt, user_prompt=user_prompt
+                )
         except (RuntimeError, ValueError, TypeError) as exc:
             self._last_llm_error = f"LLM provider error: {exc}"
+            logger.warning("SQLEngine: async LLM provider error: %s", exc)
             return None
         return self._build_llm_result(raw, prompt, config, resolved_language)
 
@@ -253,8 +302,8 @@ class SQLEngine(QueryEngine):
         mode = str(request.context.get("mode", "deterministic")).strip().lower()
         self._last_llm_error = None
 
-        if mode == "llm" and self.provider is not None:
-            llm_result = await self._agenerate_with_llm(prompt, config, request.context)
+        if mode in {"llm", "function_calling"} and self.provider is not None:
+            llm_result = await self._agenerate_with_llm(prompt, config, request.context, mode=mode)
             if llm_result is not None:
                 return llm_result
 
@@ -739,6 +788,18 @@ class SQLEngine(QueryEngine):
         filters = self._validate_filters(filters, allowed_filter_keys, notes)
         self._coerce_filter_values(filters, config, table, notes, known_filter_keys=allowed_filter_keys)
 
+        # Contradiction detection — same field assigned conflicting plain-equality values
+        contradiction_notes = _detect_contradictory_filters(filters)
+        if contradiction_notes:
+            for note in contradiction_notes:
+                logger.warning("SQLEngine [%s]: %s", table, note)
+            notes.extend(contradiction_notes)
+            if self.strict_validation:
+                raise ValidationError(
+                    f"Contradictory filters detected for table '{table}'",
+                    contradiction_notes,
+                )
+
         if order_by and order_by not in allowed_columns:
             notes.append(f"dropped invalid orderBy '{order_by}' for '{table}'")
             order_by = None
@@ -898,15 +959,39 @@ class SQLEngine(QueryEngine):
         intro_relations = config.introspection_relation_targets.get(table, {})
         strict_intro_relations = bool(intro_relations)
         relation_map = config.relations_by_entity.get(table, {})
+        parent_columns = set(self._columns_for_table(config, table))
         valid: list[_RelationJoin] = []
+        invalid_join_notes: list[str] = []
+
         for join in joins:
             relation = relation_map.get(join.relation)
             if relation is None:
-                notes.append(f"dropped invalid relation '{join.relation}' for '{table}'")
+                note = f"dropped invalid relation '{join.relation}' for '{table}'"
+                notes.append(note)
+                invalid_join_notes.append(note)
+                logger.warning("SQLEngine [%s]: %s", table, note)
                 continue
             if strict_intro_relations and join.relation not in intro_relations:
-                notes.append(f"dropped invalid relation '{join.relation}' for '{table}'")
+                note = f"dropped invalid relation '{join.relation}' for '{table}'"
+                notes.append(note)
+                invalid_join_notes.append(note)
+                logger.warning("SQLEngine [%s]: %s", table, note)
                 continue
+
+            # Validate ON-clause columns exist in both parent and target tables
+            on_notes = _validate_join_on_clause(
+                on_clause=join.on_clause,
+                parent_table=table,
+                parent_columns=parent_columns,
+                target_table=join.target,
+                target_columns=set(self._columns_for_table(config, join.target)),
+            )
+            if on_notes:
+                for note in on_notes:
+                    logger.warning("SQLEngine [%s]: JOIN ON clause: %s", table, note)
+                notes.extend(on_notes)
+                invalid_join_notes.extend(on_notes)
+
             allowed = set(relation.fields)
             if join.relation in intro_relations:
                 target_type = intro_relations[join.relation]
@@ -928,6 +1013,12 @@ class SQLEngine(QueryEngine):
                     fields=join_fields,
                     filters=join_filters,
                 )
+            )
+
+        if self.strict_validation and invalid_join_notes:
+            raise ValidationError(
+                f"Invalid JOIN configuration for table '{table}'",
+                invalid_join_notes,
             )
         return valid
 
@@ -1172,3 +1263,105 @@ class SQLEngine(QueryEngine):
             out.append(item)
             seen.add(item)
         return out
+
+
+# ---------------------------------------------------------------------------
+# Module-level validation helpers (used by SQLEngine and tests)
+# ---------------------------------------------------------------------------
+
+
+def _detect_contradictory_filters(filters: dict[str, Any]) -> list[str]:
+    """Return a list of contradiction descriptions found in *filters*.
+
+    A contradiction is defined as: the same base field assigned two distinct
+    plain-equality values at the top level (e.g. ``{"status": "active",
+    "status_ne": "active"}`` or two conflicting entries from grouped nodes
+    that reduce to the same field/value check).
+
+    This function intentionally only inspects scalar ``eq`` conflicts at the
+    top level to avoid false positives in complex OR trees.
+    """
+    # Collect plain-equality values per base field
+    eq_values: dict[str, list[Any]] = {}
+    _SUFFIXES = ("_gte", "_lte", "_gt", "_lt", "_ne", "_in", "_nin")
+
+    for key, value in filters.items():
+        if key in {"and", "or", "not"}:
+            continue
+        base = key
+        for suffix in _SUFFIXES:
+            if key.endswith(suffix):
+                base = key[: -len(suffix)]
+                break
+        else:
+            # No suffix → plain equality
+            eq_values.setdefault(base, []).append(value)
+
+    issues: list[str] = []
+    for field_name, values in eq_values.items():
+        unique = []
+        for v in values:
+            if v not in unique:
+                unique.append(v)
+        if len(unique) > 1:
+            quoted = ", ".join(repr(v) for v in unique)
+            issues.append(
+                f"contradictory equality values for field '{field_name}': {quoted}"
+            )
+    return issues
+
+
+def _validate_join_on_clause(
+    on_clause: str,
+    parent_table: str,
+    parent_columns: set[str],
+    target_table: str,
+    target_columns: set[str],
+) -> list[str]:
+    """Validate that both sides of a JOIN ON clause reference real columns.
+
+    Returns a list of issue strings (empty → no problems found).
+
+    The clause is expected to be in the form ``"table.col = other.col"``.
+    If either table's column set is empty (schema not provided) the check is
+    skipped for that side.
+
+    Parameters
+    ----------
+    on_clause:
+        Raw ON clause string, e.g. ``"order_items.orderId = orders.id"``.
+    parent_table:
+        Name of the parent (left) table.
+    parent_columns:
+        Known columns of the parent table (may be empty if schema-less).
+    target_table:
+        Name of the target (right / joined) table.
+    target_columns:
+        Known columns of the target table (may be empty if schema-less).
+    """
+    if not on_clause or "=" not in on_clause:
+        return []
+
+    issues: list[str] = []
+    left_raw, right_raw = on_clause.split("=", 1)
+    left_ref = left_raw.strip()
+    right_ref = right_raw.strip()
+
+    def _check_ref(ref: str, known_table: str, known_columns: set[str]) -> None:
+        if not known_columns:
+            return  # No schema to validate against
+        if "." in ref:
+            tbl, col = ref.rsplit(".", 1)
+            if tbl.lower() != known_table.lower():
+                return  # Different table — let the other side handle it
+            if col not in known_columns:
+                issues.append(
+                    f"JOIN ON clause references unknown column '{col}' "
+                    f"on table '{known_table}' (known: {sorted(known_columns)})"
+                )
+
+    _check_ref(left_ref, parent_table, parent_columns)
+    _check_ref(left_ref, target_table, target_columns)
+    _check_ref(right_ref, parent_table, parent_columns)
+    _check_ref(right_ref, target_table, target_columns)
+    return issues

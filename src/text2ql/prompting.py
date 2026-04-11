@@ -60,6 +60,121 @@ _LANGUAGE_ALIASES = {
     "en": "english",
 }
 
+# ---------------------------------------------------------------------------
+# JSON Schemas for function-calling / structured-output mode
+#
+# These describe the exact shape that the LLM must emit when the provider
+# supports ``response_format: json_schema`` (OpenAI Structured Outputs) or an
+# equivalent function-calling mechanism.  They mirror the fields parsed by
+# ``parse_graphql_intent()`` / ``parse_sql_intent()`` in constrained.py.
+# ---------------------------------------------------------------------------
+
+GRAPHQL_INTENT_JSON_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "entity": {
+            "type": "string",
+            "description": "The primary GraphQL entity/type to query.",
+        },
+        "fields": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Fields to select on the entity.",
+        },
+        "filters": {
+            "type": "object",
+            "additionalProperties": True,
+            "description": "Key-value filter arguments for the query.",
+        },
+        "explanation": {
+            "type": "string",
+            "description": "Human-readable explanation of the generated intent.",
+        },
+        "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Confidence score in [0, 1].",
+        },
+    },
+    "required": ["entity", "fields", "filters", "explanation", "confidence"],
+    "additionalProperties": False,
+}
+
+SQL_INTENT_JSON_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "table": {
+            "type": "string",
+            "description": "The primary SQL table to query.",
+        },
+        "columns": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Columns to SELECT.",
+        },
+        "filters": {
+            "type": "object",
+            "additionalProperties": True,
+            "description": "Key-value WHERE clause filters.",
+        },
+        "joins": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "relation": {"type": "string"},
+                    "alias": {"type": "string"},
+                    "fields": {"type": "array", "items": {"type": "string"}},
+                    "filters": {"type": "object", "additionalProperties": True},
+                },
+                "required": ["relation"],
+                "additionalProperties": True,
+            },
+            "description": "JOIN descriptors.",
+        },
+        "order_by": {
+            "anyOf": [{"type": "string"}, {"type": "null"}],
+            "description": "Column to ORDER BY, or null.",
+        },
+        "order_dir": {
+            "anyOf": [{"type": "string", "enum": ["ASC", "DESC"]}, {"type": "null"}],
+            "description": "Sort direction.",
+        },
+        "limit": {
+            "anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}],
+            "description": "LIMIT value, or null.",
+        },
+        "offset": {
+            "anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}],
+            "description": "OFFSET value, or null.",
+        },
+        "explanation": {
+            "type": "string",
+            "description": "Human-readable explanation.",
+        },
+        "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Confidence score in [0, 1].",
+        },
+    },
+    "required": [
+        "table",
+        "columns",
+        "filters",
+        "joins",
+        "order_by",
+        "order_dir",
+        "limit",
+        "offset",
+        "explanation",
+        "confidence",
+    ],
+    "additionalProperties": False,
+}
+
 
 def build_graphql_prompts(
     text: str,
