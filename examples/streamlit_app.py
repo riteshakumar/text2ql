@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import re
@@ -13,6 +14,28 @@ from pathlib import Path
 from typing import Any
 
 import streamlit as st
+
+# ---------------------------------------------------------------------------
+# Logging — configure once when Streamlit first imports this module.
+# Control via TEXT2QL_LOG_LEVEL env var (default: WARNING).
+# Examples:
+#   TEXT2QL_LOG_LEVEL=DEBUG   ./venv/bin/python -m streamlit run examples/streamlit_app.py
+#   TEXT2QL_LOG_LEVEL=WARNING ./venv/bin/python -m streamlit run examples/streamlit_app.py
+# ---------------------------------------------------------------------------
+_log_level_name = os.getenv("TEXT2QL_LOG_LEVEL", "WARNING").upper()
+_log_level = getattr(logging, _log_level_name, logging.WARNING)
+
+logging.basicConfig(
+    stream=sys.stderr,
+    level=_log_level,
+    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+    force=True,  # override any Streamlit-applied root config
+)
+# Always scope text2ql to the requested level; leave other libs at WARNING.
+logging.getLogger("text2ql").setLevel(_log_level)
+logging.getLogger("streamlit").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
 def _import_text2ql() -> tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any]:
