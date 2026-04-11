@@ -410,12 +410,20 @@ def main() -> None:
 
         st.subheader("Results")
         for row in results:
+            synth = row.get("synthetic", {})
+            conf = row.get("confidence")
+            conf_str = f"{conf:.4f}" if isinstance(conf, float) else "—"
+            synth_score = synth.get("synthetic_rewrite_score")
+            score_str = f"{synth_score:.2f}" if isinstance(synth_score, float) else "—"
+            novelty = synth.get("synthetic_rewrite_novelty")
+            novelty_str = f"{novelty:.2f}" if isinstance(novelty, float) else "—"
+            source = synth.get("synthetic_rewrite_source", "seed")
+
             with st.expander(f"Variant {row['idx']}: {row['prompt']}", expanded=(row["idx"] == 1)):
-                # Confidence + timing on one line.
-                conf = row.get("confidence")
-                conf_str = f"{conf:.4f}" if isinstance(conf, float) else "—"
+                # Confidence · synthetic · timing — all on one line at a glance.
                 st.caption(
                     f"confidence={conf_str}  ·  "
+                    f"synth_score={score_str}  ·  novelty={novelty_str}  ·  source={source}  ·  "
                     f"generate={row['timing_ms'].get('generate', 0):.1f}ms  ·  "
                     f"execute={row['timing_ms'].get('execute', 0):.1f}ms"
                 )
@@ -466,8 +474,6 @@ def main() -> None:
                         if row.get("sql_execution_note"):
                             st.info(row["sql_execution_note"])
 
-                st.markdown("**Synthetic Scores**")
-                st.json(row.get("synthetic", {}), expanded=False)
                 st.markdown("**Engine metadata**")
                 st.json(row.get("metadata", {}), expanded=False)
 
