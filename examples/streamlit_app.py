@@ -16,26 +16,34 @@ from typing import Any
 import streamlit as st
 
 # ---------------------------------------------------------------------------
-# Logging — configure once when Streamlit first imports this module.
+# Logging — attach a handler directly to the text2ql logger so Streamlit's
+# root-logger reconfiguration cannot suppress it.
+#
 # Control via TEXT2QL_LOG_LEVEL env var (default: WARNING).
 # Examples:
 #   TEXT2QL_LOG_LEVEL=DEBUG   ./venv/bin/python -m streamlit run examples/streamlit_app.py
 #   TEXT2QL_LOG_LEVEL=WARNING ./venv/bin/python -m streamlit run examples/streamlit_app.py
+#
+# Logs appear in the terminal where you launched Streamlit, not the browser.
 # ---------------------------------------------------------------------------
 _log_level_name = os.getenv("TEXT2QL_LOG_LEVEL", "WARNING").upper()
 _log_level = getattr(logging, _log_level_name, logging.WARNING)
 
-logging.basicConfig(
-    stream=sys.stderr,
-    level=_log_level,
-    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-    force=True,  # override any Streamlit-applied root config
+# Write to sys.__stderr__ — the real stderr before Streamlit redirects it.
+_t2ql_handler = logging.StreamHandler(sys.__stderr__)
+_t2ql_handler.setFormatter(
+    logging.Formatter(
+        fmt="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
 )
-# Always scope text2ql to the requested level; leave other libs at WARNING.
-logging.getLogger("text2ql").setLevel(_log_level)
-logging.getLogger("streamlit").setLevel(logging.WARNING)
-logging.getLogger("urllib3").setLevel(logging.WARNING)
+_t2ql_logger = logging.getLogger("text2ql")
+# Remove any handlers Streamlit may have already attached, then add ours.
+_t2ql_logger.handlers.clear()
+_t2ql_logger.addHandler(_t2ql_handler)
+_t2ql_logger.setLevel(_log_level)
+# Don't forward to the root logger — Streamlit controls that one.
+_t2ql_logger.propagate = False
 
 
 def _import_text2ql() -> tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any]:
