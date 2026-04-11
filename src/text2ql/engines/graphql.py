@@ -7,6 +7,14 @@ from textwrap import dedent
 from typing import Any
 
 from text2ql.constrained import ConstrainedOutputError, parse_graphql_intent
+from text2ql.filters import (
+    FILTER_VALUE as _FILTER_VALUE,
+    detect_between_filters,
+    detect_comparison_filters,
+    detect_date_range_filters,
+    detect_in_filters,
+    detect_negation_filters,
+)
 from text2ql.prompting import (
     GRAPHQL_INTENT_JSON_SCHEMA,
     build_graphql_prompts,
@@ -26,10 +34,7 @@ from .base import QueryEngine, compute_deterministic_confidence
 logger = logging.getLogger(__name__)
 
 _WORD_IDENTIFIER = r"([A-Za-z_]\w*)"
-_FILTER_VALUE = r"([\w.:-]+)"
 _AND_TOKEN = " and "
-_ISO_DATE = r"\d{4}-\d{2}-\d{2}"
-_DATE_RANGE_PATTERN = rf"\b{_WORD_IDENTIFIER}\s+from\s+({_ISO_DATE})\s+to\s+({_ISO_DATE})\b"
 _SPURIOUS_FILTER_VALUES = {"where", "with", "and", "or", "for", "of", "in", "is"}
 
 
@@ -345,10 +350,39 @@ class GraphQLEngine(QueryEngine):
         if config.default_entity:
             return config.default_entity
 
-        for entity in ["user", "customer", "order", "product", "movie", "person"]:
-            if self._contains_entity_token(lowered, entity):
-                return entity
+        # Prefer the first schema-declared entity over generic text extraction.
+        if config.entities:
+            return config.entities[0]
 
+        # Last resort when no schema is provided: extract the most noun-like token
+        # from the query text itself.  This is generic (not domain-specific) and
+        # replaces the old hardcoded list.
+        return self._extract_entity_from_text(lowered)
+
+    @staticmethod
+    def _extract_entity_from_text(lowered: str) -> str:
+        """Heuristically extract the most likely entity name from raw query text.
+
+        Used only when no schema entities are declared.  Avoids hardcoded domain
+        lists by tokenising the query and skipping common stop-words; basic
+        singularisation (strip trailing *s*) converts plural nouns to their root
+        form so that "list users" → "user".
+        """
+        _STOP_WORDS = frozenset({
+            "list", "show", "get", "fetch", "find", "display", "give", "tell",
+            "me", "all", "the", "a", "an", "of", "from", "with", "where",
+            "and", "or", "by", "in", "for", "is", "are", "was", "were",
+            "have", "has", "had", "my", "your", "their", "its", "our",
+            "what", "which", "who", "how", "top", "latest", "first", "last",
+            "recent", "new", "old",
+        })
+        tokens = re.findall(r"[a-z][a-z0-9_]*", lowered)
+        for token in tokens:
+            if token in _STOP_WORDS or len(token) < 3:
+                continue
+            if token.endswith("s") and len(token) > 3:
+                return token[:-1]
+            return token
         return "items"
 
     def _resolve_special_entity(self, lowered: str, config: NormalizedSchemaConfig) -> str | None:
@@ -613,47 +647,13 @@ class GraphQLEngine(QueryEngine):
             filters.update(grouped_filters)
 
     def _detect_comparison_filters(self, lowered: str) -> dict[str, Any]:
-        filters: dict[str, Any] = {}
-        symbolic_patterns = [
-            (rf"\b{_WORD_IDENTIFIER}\s*>=\s*{_FILTER_VALUE}\b", "_gte"),
-            (rf"\b{_WORD_IDENTIFIER}\s*<=\s*{_FILTER_VALUE}\b", "_lte"),
-            (rf"\b{_WORD_IDENTIFIER}\s*>\s*{_FILTER_VALUE}\b", "_gt"),
-            (rf"\b{_WORD_IDENTIFIER}\s*<\s*{_FILTER_VALUE}\b", "_lt"),
-        ]
-        for pattern, suffix in symbolic_patterns:
-            for match in re.finditer(pattern, lowered):
-                filters[f"{match.group(1)}{suffix}"] = match.group(2)
-
-        lexical_patterns = [
-            (rf"\b{_WORD_IDENTIFIER}\s+greater than\s+{_FILTER_VALUE}\b", "_gt"),
-            (rf"\b{_WORD_IDENTIFIER}\s+less than\s+{_FILTER_VALUE}\b", "_lt"),
-            (rf"\b{_WORD_IDENTIFIER}\s+after\s+{_FILTER_VALUE}\b", "_gt"),
-            (rf"\b{_WORD_IDENTIFIER}\s+before\s+{_FILTER_VALUE}\b", "_lt"),
-        ]
-        for pattern, suffix in lexical_patterns:
-            for match in re.finditer(pattern, lowered):
-                filters[f"{match.group(1)}{suffix}"] = match.group(2)
-        return filters
+        return detect_comparison_filters(lowered)
 
     def _detect_negation_filters(self, lowered: str) -> dict[str, Any]:
-        filters: dict[str, Any] = {}
-        for match in re.finditer(
-            rf"\b{_WORD_IDENTIFIER}\s*(?:!=|is not|not)\s*{_FILTER_VALUE}\b",
-            lowered,
-        ):
-            filters[f"{match.group(1)}_ne"] = match.group(2)
-        return filters
+        return detect_negation_filters(lowered)
 
     def _detect_date_range_filters(self, lowered: str) -> dict[str, Any]:
-        filters: dict[str, Any] = {}
-        for match in re.finditer(
-            _DATE_RANGE_PATTERN,
-            lowered,
-        ):
-            field = match.group(1)
-            filters[f"{field}_gte"] = match.group(2)
-            filters[f"{field}_lte"] = match.group(3)
-        return filters
+        return detect_date_range_filters(lowered)
 
     def _detect_ordering_filters(self, lowered: str, existing_filters: dict[str, Any]) -> dict[str, Any]:
         filters: dict[str, Any] = {}
@@ -683,28 +683,10 @@ class GraphQLEngine(QueryEngine):
         return "createdAt"
 
     def _detect_between_filters(self, lowered: str) -> dict[str, Any]:
-        filters: dict[str, Any] = {}
-        for match in re.finditer(r"\b([a-zA-Z_]+)\s+between\s+(\d+(?:\.\d+)?)\s+and\s+(\d+(?:\.\d+)?)", lowered):
-            field = match.group(1)
-            start = match.group(2)
-            end = match.group(3)
-            filters[f"{field}_gte"] = start
-            filters[f"{field}_lte"] = end
-        return filters
+        return detect_between_filters(lowered)
 
     def _detect_in_filters(self, lowered: str) -> dict[str, Any]:
-        filters: dict[str, Any] = {}
-        for match in re.finditer(r"\b([a-zA-Z_]+)\s+in\s+([a-zA-Z0-9_,\s]+)", lowered):
-            field = match.group(1)
-            values_blob = match.group(2)
-            values = [
-                token.strip()
-                for token in re.split(r",|\s+or\s+|\s+and\s+", values_blob)
-                if token.strip()
-            ]
-            if values:
-                filters[f"{field}_in"] = values
-        return filters
+        return detect_in_filters(lowered)
 
     def _detect_grouped_filters(
         self,
@@ -1166,12 +1148,43 @@ class GraphQLEngine(QueryEngine):
         text: str,
         config: NormalizedSchemaConfig,
         entity: str,
+        *,
+        max_depth: int = 3,
+        _visited: frozenset[str] | None = None,
+        _depth: int = 0,
     ) -> list[dict[str, Any]]:
+        """Detect nested relation selections, recursing up to *max_depth* hops.
+
+        Parameters
+        ----------
+        text:
+            Original (un-lowered) query text.
+        config:
+            Normalised schema configuration for the current engine instance.
+        entity:
+            The entity whose outgoing relations we are inspecting at this depth.
+        max_depth:
+            Maximum number of relation hops to follow (default 3).
+        _visited:
+            Internal set of entity names already present in the current path —
+            prevents infinite loops in schemas with cycles (e.g. ``user → posts
+            → user``).
+        _depth:
+            Internal recursion counter.
+        """
+        if _depth >= max_depth:
+            return []
+
         lowered = text.lower()
+        visited: frozenset[str] = (_visited or frozenset()) | {entity}
         relation_map = config.relations_by_entity.get(entity, {})
         nested: list[dict[str, Any]] = []
 
         for relation in relation_map.values():
+            # Skip back-edges to avoid cycles in the output tree.
+            if relation.target in visited:
+                continue
+
             aliases = [relation.name, relation.target, *relation.aliases]
             relation_mentioned = any(
                 self._contains_entity_token(lowered, alias.lower()) for alias in aliases
@@ -1191,14 +1204,26 @@ class GraphQLEngine(QueryEngine):
                 relation_filters["limit"] = 1
             relation_filters.update(self._detect_relation_local_filters(lowered, relation))
 
-            nested.append(
-                {
-                    "relation": relation.name,
-                    "target": relation.target,
-                    "fields": selected_fields,
-                    "filters": relation_filters,
-                }
+            # Recurse into the target entity's own relations.
+            child_nested = self._detect_nested(
+                text,
+                config,
+                relation.target,
+                max_depth=max_depth,
+                _visited=visited | {relation.target},
+                _depth=_depth + 1,
             )
+
+            node: dict[str, Any] = {
+                "relation": relation.name,
+                "target": relation.target,
+                "fields": selected_fields,
+                "filters": relation_filters,
+            }
+            if child_nested:
+                node["nested"] = child_nested
+
+            nested.append(node)
         return nested
 
     def _detect_relation_local_filters(
@@ -1252,26 +1277,7 @@ class GraphQLEngine(QueryEngine):
                 selection_lines.append(f'{fn_name}(field: "{field}")')
 
         for nested_node in nested:
-            relation = nested_node["relation"]
-            nested_args = ""
-            nested_filters = nested_node.get("filters", {})
-            if nested_filters:
-                ordered_nested_filters = self._order_filters(nested_filters)
-                nested_args_str = ", ".join(
-                    f"{k}: {self._format_arg(v)}" for k, v in ordered_nested_filters
-                )
-                nested_args = f"({nested_args_str})"
-            nested_fields = nested_node.get("fields", ["id"])
-            nested_selection = "\n      ".join(nested_fields)
-            selection_lines.append(
-                dedent(
-                    f"""
-                    {relation}{nested_args} {{
-                      {nested_selection}
-                    }}
-                    """
-                ).strip()
-            )
+            selection_lines.append(self._build_nested_selection(nested_node, indent=2))
 
         selection = "\n    ".join(selection_lines)
         return dedent(
@@ -1283,6 +1289,35 @@ class GraphQLEngine(QueryEngine):
             }}
             """
         ).strip()
+
+    def _build_nested_selection(self, node: dict[str, Any], indent: int) -> str:
+        """Recursively render a nested relation node into a GraphQL selection string.
+
+        Parameters
+        ----------
+        node:
+            A nested relation node produced by :meth:`_detect_nested`, containing
+            keys ``relation``, ``fields``, ``filters``, and optionally ``nested``.
+        indent:
+            Current indentation level (number of spaces per level is 2).
+        """
+        relation = node["relation"]
+        node_filters = node.get("filters", {})
+        node_args = ""
+        if node_filters:
+            ordered = self._order_filters(node_filters)
+            args_str = ", ".join(f"{k}: {self._format_arg(v)}" for k, v in ordered)
+            node_args = f"({args_str})"
+
+        pad = " " * indent
+        child_pad = " " * (indent + 2)
+
+        field_lines: list[str] = list(node.get("fields", ["id"]))
+        for child in node.get("nested", []):
+            field_lines.append(self._build_nested_selection(child, indent + 2))
+
+        inner = f"\n{child_pad}".join(field_lines)
+        return f"{relation}{node_args} {{\n{child_pad}{inner}\n{pad}}}"
 
     @staticmethod
     def _format_arg(value: Any) -> str:

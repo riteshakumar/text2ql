@@ -6,6 +6,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from text2ql.constrained import ConstrainedOutputError, parse_sql_intent
+from text2ql.filters import (
+    detect_between_filters,
+    detect_comparison_filters,
+    detect_date_range_filters,
+    detect_in_filters,
+    detect_negation_filters,
+)
 from text2ql.prompting import (
     SQL_INTENT_JSON_SCHEMA,
     build_sql_prompts,
@@ -503,8 +510,23 @@ class SQLEngine(QueryEngine):
     def _detect_filters(self, lowered: str, config: Any, table: str) -> dict[str, Any]:
         filters: dict[str, Any] = {}
         where_clause = self._extract_where_clause(lowered) or lowered
+        self._apply_alias_filters(filters, where_clause, lowered, config, table)
+        self._apply_advanced_filters(filters, lowered)
+        grouped = self._parse_grouped_filters(lowered)
+        if grouped:
+            filters.update(grouped)
+        return filters
 
-        filter_key_aliases = {"status": "status"}
+    def _apply_alias_filters(
+        self,
+        filters: dict[str, Any],
+        where_clause: str,
+        lowered: str,
+        config: Any,
+        table: str,
+    ) -> None:
+        """Populate *filters* from schema-defined key/value aliases."""
+        filter_key_aliases: dict[str, str] = {"status": "status"}
         filter_key_aliases.update(config.filter_key_aliases)
         for alias, canonical in self._sorted_alias_pairs(filter_key_aliases):
             value = self._extract_filter_value(alias, where_clause)
@@ -523,42 +545,13 @@ class SQLEngine(QueryEngine):
                     filters[str(resolved)] = mapped_value
                     break
 
-        for match in re.finditer(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*>=\s*([a-zA-Z0-9_.:-]+)\b", lowered):
-            filters[f"{match.group(1)}_gte"] = match.group(2)
-        for match in re.finditer(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*<=\s*([a-zA-Z0-9_.:-]+)\b", lowered):
-            filters[f"{match.group(1)}_lte"] = match.group(2)
-        for match in re.finditer(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*>\s*([a-zA-Z0-9_.:-]+)\b", lowered):
-            filters[f"{match.group(1)}_gt"] = match.group(2)
-        for match in re.finditer(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*<\s*([a-zA-Z0-9_.:-]+)\b", lowered):
-            filters[f"{match.group(1)}_lt"] = match.group(2)
-        for match in re.finditer(
-            r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:!=|is not|not)\s*([a-zA-Z0-9_.:-]+)\b",
-            lowered,
-        ):
-            filters[f"{match.group(1)}_ne"] = match.group(2)
-
-        for match in re.finditer(
-            r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s+between\s+([0-9]{1,4}(?:-[0-9]{2}-[0-9]{2})?)\s+and\s+([0-9]{1,4}(?:-[0-9]{2}-[0-9]{2})?)\b",
-            lowered,
-        ):
-            field = match.group(1)
-            filters[f"{field}_gte"] = match.group(2)
-            filters[f"{field}_lte"] = match.group(3)
-
-        for match in re.finditer(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s+in\s+([a-zA-Z0-9_,\s]+)", lowered):
-            field = match.group(1)
-            values = [
-                token.strip()
-                for token in re.split(r",|\s+or\s+|\s+and\s+", match.group(2))
-                if token.strip()
-            ]
-            if values:
-                filters[f"{field}_in"] = values
-
-        grouped = self._parse_grouped_filters(lowered)
-        if grouped:
-            filters.update(grouped)
-        return filters
+    def _apply_advanced_filters(self, filters: dict[str, Any], lowered: str) -> None:
+        """Populate *filters* from comparison, range, negation, and IN expressions."""
+        filters.update(detect_comparison_filters(lowered))
+        filters.update(detect_negation_filters(lowered))
+        filters.update(detect_between_filters(lowered))
+        filters.update(detect_in_filters(lowered))
+        filters.update(detect_date_range_filters(lowered))
 
     def _resolve_filter_key_for_table(self, config: Any, table: str, candidate_key: str) -> str:
         table_args = config.args_by_entity.get(table, [])
