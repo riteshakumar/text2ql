@@ -26,24 +26,15 @@ import streamlit as st
 #
 # Logs appear in the terminal where you launched Streamlit, not the browser.
 # ---------------------------------------------------------------------------
-_log_level_name = os.getenv("TEXT2QL_LOG_LEVEL", "WARNING").upper()
-_log_level = getattr(logging, _log_level_name, logging.WARNING)
+_log_level_name = os.getenv("TEXT2QL_LOG_LEVEL", "DEBUG").upper()
+_log_level = getattr(logging, _log_level_name, logging.DEBUG)
 
-# Write to sys.__stderr__ — the real stderr before Streamlit redirects it.
-_t2ql_handler = logging.StreamHandler(sys.__stderr__)
-_t2ql_handler.setFormatter(
-    logging.Formatter(
-        fmt="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+logging.basicConfig(
+    level=_log_level,
+    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+    force=True,
 )
-_t2ql_logger = logging.getLogger("text2ql")
-# Remove any handlers Streamlit may have already attached, then add ours.
-_t2ql_logger.handlers.clear()
-_t2ql_logger.addHandler(_t2ql_handler)
-_t2ql_logger.setLevel(_log_level)
-# Don't forward to the root logger — Streamlit controls that one.
-_t2ql_logger.propagate = False
 
 
 def _import_text2ql() -> tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any]:

@@ -72,16 +72,24 @@ class GraphQLEngine(QueryEngine):
                 return llm_result
             llm_error = self._last_llm_error or "LLM mode fallback to deterministic mode."
 
+        logger.debug("GraphQLEngine.generate: prompt=%r", prompt)
         entity = self._detect_entity(prompt, config)
+        logger.debug("GraphQLEngine: detected entity=%r", entity)
         fields = self._detect_fields(prompt, config, entity)
+        logger.debug("GraphQLEngine: detected fields=%r", fields)
         filters = self._detect_filters(prompt, config, entity)
+        logger.debug("GraphQLEngine: detected filters=%r", filters)
         aggregations = self._detect_aggregations(prompt, config, entity)
+        logger.debug("GraphQLEngine: detected aggregations=%r", aggregations)
         nested = self._detect_nested(prompt, config, entity)
+        logger.debug("GraphQLEngine: detected nested=%r", nested)
         entity, fields, filters, aggregations, nested, validation_notes = self._validate_components(
             entity, fields, filters, aggregations, nested, config
         )
+        logger.debug("GraphQLEngine: after validation entity=%r fields=%r notes=%r", entity, fields, validation_notes)
 
         query = self._build_query(entity, fields, filters, aggregations, nested)
+        logger.debug("GraphQLEngine: built query=%r", query)
         validation_notes.extend(self._validate_generated_query_against_introspection(query, config))
 
         explanation = (

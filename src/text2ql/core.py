@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -9,6 +10,8 @@ from text2ql.engines.sql import SQLEngine
 from text2ql.providers.base import LLMProvider
 from text2ql.providers.rule_based import RuleBasedProvider
 from text2ql.types import QueryRequest, QueryResult
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -56,7 +59,10 @@ class Text2QL:
         context: dict | None = None,
     ) -> QueryResult:
         normalized_target, request = self._make_request(text, target, schema, mapping, context)
-        return self._engines[normalized_target].generate(request)
+        logger.debug("Text2QL.generate: target=%r text=%r mode=%r", normalized_target, text, (context or {}).get("mode", "deterministic"))
+        result = self._engines[normalized_target].generate(request)
+        logger.debug("Text2QL.generate: query=%r confidence=%.2f", result.query, result.confidence or 0)
+        return result
 
     async def agenerate(
         self,
