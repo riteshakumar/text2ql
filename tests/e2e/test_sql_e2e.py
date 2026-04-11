@@ -10,6 +10,67 @@ from text2ql.cli import main
 pytestmark = pytest.mark.e2e
 
 
+def test_sql_join_e2e() -> None:
+    """SQL JOIN is produced when the query mentions a related entity."""
+    service = Text2QL()
+
+    result = service.generate(
+        text="show orders with their customers",
+        target="sql",
+        schema={
+            "entities": ["orders", "customers"],
+            "fields": {
+                "orders": ["id", "status", "total"],
+                "customers": ["id", "name", "email"],
+            },
+            "relations": {
+                "orders": {
+                    "customers": {
+                        "target": "customers",
+                        "fields": ["name", "email"],
+                    }
+                }
+            },
+        },
+    )
+
+    assert result.target == "sql"
+    assert "FROM orders" in result.query
+    assert "JOIN customers" in result.query
+    assert "customers.name" in result.query or "customers.email" in result.query
+
+
+def test_sql_aggregation_count_e2e() -> None:
+    """COUNT(*) aggregation is rendered when the query asks for a count."""
+    service = Text2QL()
+
+    result = service.generate(
+        text="count all orders",
+        target="sql",
+        schema={"entities": ["orders"], "fields": {"orders": ["id", "status", "total"]}},
+    )
+
+    assert result.target == "sql"
+    assert "COUNT(*)" in result.query
+    assert "FROM orders" in result.query
+
+
+def test_sql_aggregation_sum_e2e() -> None:
+    """SUM aggregation is rendered when the query asks for a sum of a field."""
+    service = Text2QL()
+
+    result = service.generate(
+        text="sum of total for orders",
+        target="sql",
+        schema={"entities": ["orders"], "fields": {"orders": ["id", "status", "total"]}},
+    )
+
+    assert result.target == "sql"
+    # SUM renders the raw field name without table prefix (IRAggregation.field = "total").
+    assert "SUM(total)" in result.query
+    assert "FROM orders" in result.query
+
+
 def test_sql_generate_with_schema_mapping_e2e() -> None:
     service = Text2QL()
 

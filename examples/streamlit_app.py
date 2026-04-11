@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import re
@@ -13,6 +14,27 @@ from pathlib import Path
 from typing import Any
 
 import streamlit as st
+
+# ---------------------------------------------------------------------------
+# Logging — attach a handler directly to the text2ql logger so Streamlit's
+# root-logger reconfiguration cannot suppress it.
+#
+# Control via TEXT2QL_LOG_LEVEL env var (default: WARNING).
+# Examples:
+#   TEXT2QL_LOG_LEVEL=DEBUG   ./venv/bin/python -m streamlit run examples/streamlit_app.py
+#   TEXT2QL_LOG_LEVEL=WARNING ./venv/bin/python -m streamlit run examples/streamlit_app.py
+#
+# Logs appear in the terminal where you launched Streamlit, not the browser.
+# ---------------------------------------------------------------------------
+_log_level_name = os.getenv("TEXT2QL_LOG_LEVEL", "DEBUG").upper()
+_log_level = getattr(logging, _log_level_name, logging.DEBUG)
+
+logging.basicConfig(
+    level=_log_level,
+    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+    force=True,
+)
 
 
 def _import_text2ql() -> tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any]:

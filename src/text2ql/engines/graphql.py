@@ -1,28 +1,43 @@
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime
-from textwrap import dedent
 from typing import Any
 
 from text2ql.constrained import ConstrainedOutputError, parse_graphql_intent
-from text2ql.prompting import build_graphql_prompts, resolve_language, resolve_prompt_template
+from text2ql.renderers import GraphQLIRRenderer
+from text2ql.filters import (
+    AND_TOKEN as _AND_TOKEN,
+    FILTER_VALUE as _FILTER_VALUE,
+    SPURIOUS_FILTER_VALUES as _SPURIOUS_FILTER_VALUES,
+    WORD_IDENTIFIER as _WORD_IDENTIFIER,
+    detect_between_filters,
+    detect_comparison_filters,
+    detect_date_range_filters,
+    detect_in_filters,
+    detect_negation_filters,
+)
+from text2ql.prompting import (
+    GRAPHQL_INTENT_JSON_SCHEMA,
+    build_graphql_prompts,
+    resolve_language,
+    resolve_prompt_template,
+)
 from text2ql.providers.base import LLMProvider
 from text2ql.schema_config import (
     NormalizedRelation,
     NormalizedSchemaConfig,
     normalize_schema_config,
 )
-from text2ql.types import QueryRequest, QueryResult
+from text2ql.types import QueryRequest, QueryResult, ValidationError
 
 from .base import QueryEngine, compute_deterministic_confidence
 
-_WORD_IDENTIFIER = r"([A-Za-z_]\w*)"
-_FILTER_VALUE = r"([\w.:-]+)"
-_AND_TOKEN = " and "
-_ISO_DATE = r"\d{4}-\d{2}-\d{2}"
-_DATE_RANGE_PATTERN = rf"\b{_WORD_IDENTIFIER}\s+from\s+({_ISO_DATE})\s+to\s+({_ISO_DATE})\b"
-_SPURIOUS_FILTER_VALUES = {"where", "with", "and", "or", "for", "of", "in", "is"}
+logger = logging.getLogger(__name__)
+
+# Module-level renderer singleton — re-used across calls to avoid allocation.
+_GRAPHQL_RENDERER = GraphQLIRRenderer()
 
 
 class GraphQLEngine(QueryEngine):
@@ -31,10 +46,24 @@ class GraphQLEngine(QueryEngine):
     Design intent:
     - Keep the engine deterministic for testability.
     - Let LLM providers be optional, pluggable upgrades.
+
+    Parameters
+    ----------
+    provider:
+        Optional LLM provider for ``mode="llm"`` or ``mode="function_calling"``.
+    strict_validation:
+        When ``True``, raise :class:`~text2ql.types.ValidationError` on
+        contradictory filters instead of silently noting them.  Defaults to
+        ``False`` for backwards-compatible graceful degradation.
     """
 
-    def __init__(self, provider: LLMProvider | None = None) -> None:
+    def __init__(
+        self,
+        provider: LLMProvider | None = None,
+        strict_validation: bool = False,
+    ) -> None:
         self.provider = provider
+        self.strict_validation = strict_validation
         self._last_llm_error: str | None = None
 
     def generate(self, request: QueryRequest) -> QueryResult:
@@ -44,22 +73,30 @@ class GraphQLEngine(QueryEngine):
         llm_error: str | None = None
         self._last_llm_error = None
 
-        if mode == "llm" and self.provider is not None:
-            llm_result = self._generate_with_llm(prompt, config, request.context)
+        if mode in {"llm", "function_calling"} and self.provider is not None:
+            llm_result = self._generate_with_llm(prompt, config, request.context, mode=mode)
             if llm_result is not None:
                 return llm_result
             llm_error = self._last_llm_error or "LLM mode fallback to deterministic mode."
 
+        logger.debug("GraphQLEngine.generate: prompt=%r", prompt)
         entity = self._detect_entity(prompt, config)
+        logger.debug("GraphQLEngine: detected entity=%r", entity)
         fields = self._detect_fields(prompt, config, entity)
+        logger.debug("GraphQLEngine: detected fields=%r", fields)
         filters = self._detect_filters(prompt, config, entity)
+        logger.debug("GraphQLEngine: detected filters=%r", filters)
         aggregations = self._detect_aggregations(prompt, config, entity)
+        logger.debug("GraphQLEngine: detected aggregations=%r", aggregations)
         nested = self._detect_nested(prompt, config, entity)
+        logger.debug("GraphQLEngine: detected nested=%r", nested)
         entity, fields, filters, aggregations, nested, validation_notes = self._validate_components(
             entity, fields, filters, aggregations, nested, config
         )
+        logger.debug("GraphQLEngine: after validation entity=%r fields=%r notes=%r", entity, fields, validation_notes)
 
         query = self._build_query(entity, fields, filters, aggregations, nested)
+        logger.debug("GraphQLEngine: built query=%r", query)
         validation_notes.extend(self._validate_generated_query_against_introspection(query, config))
 
         explanation = (
@@ -124,6 +161,7 @@ class GraphQLEngine(QueryEngine):
             intent = parse_graphql_intent(raw, config, language=resolved_language)
         except ConstrainedOutputError as exc:
             self._last_llm_error = f"LLM output parse error: {exc}"
+            logger.warning("GraphQLEngine: LLM output parse error: %s", exc)
             return None
 
         nested: list[dict[str, Any]] = []
@@ -163,15 +201,28 @@ class GraphQLEngine(QueryEngine):
         prompt: str,
         config: NormalizedSchemaConfig,
         context: dict,
+        mode: str = "llm",
     ) -> QueryResult | None:
         prepared = self._prepare_llm_prompts(prompt, config, context)
         if prepared is None:
             return None
         system_prompt, user_prompt, resolved_language = prepared
+        use_fc = mode == "function_calling"
+        logger.debug(
+            "GraphQLEngine: calling LLM provider (sync, function_calling=%s)", use_fc
+        )
         try:
-            raw = self.provider.complete(system_prompt=system_prompt, user_prompt=user_prompt)
+            if use_fc:
+                raw = self.provider.complete_structured(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    json_schema=GRAPHQL_INTENT_JSON_SCHEMA,
+                )
+            else:
+                raw = self.provider.complete(system_prompt=system_prompt, user_prompt=user_prompt)
         except (RuntimeError, ValueError, TypeError) as exc:
             self._last_llm_error = f"LLM provider error: {exc}"
+            logger.warning("GraphQLEngine: LLM provider error: %s", exc)
             return None
         return self._build_llm_result(raw, prompt, config, resolved_language)
 
@@ -180,15 +231,30 @@ class GraphQLEngine(QueryEngine):
         prompt: str,
         config: NormalizedSchemaConfig,
         context: dict,
+        mode: str = "llm",
     ) -> QueryResult | None:
         prepared = self._prepare_llm_prompts(prompt, config, context)
         if prepared is None:
             return None
         system_prompt, user_prompt, resolved_language = prepared
+        use_fc = mode == "function_calling"
+        logger.debug(
+            "GraphQLEngine: calling LLM provider (async, function_calling=%s)", use_fc
+        )
         try:
-            raw = await self.provider.acomplete(system_prompt=system_prompt, user_prompt=user_prompt)
+            if use_fc:
+                raw = await self.provider.acomplete_structured(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    json_schema=GRAPHQL_INTENT_JSON_SCHEMA,
+                )
+            else:
+                raw = await self.provider.acomplete(
+                    system_prompt=system_prompt, user_prompt=user_prompt
+                )
         except (RuntimeError, ValueError, TypeError) as exc:
             self._last_llm_error = f"LLM provider error: {exc}"
+            logger.warning("GraphQLEngine: async LLM provider error: %s", exc)
             return None
         return self._build_llm_result(raw, prompt, config, resolved_language)
 
@@ -199,8 +265,8 @@ class GraphQLEngine(QueryEngine):
         mode = str(request.context.get("mode", "deterministic")).strip().lower()
         self._last_llm_error = None
 
-        if mode == "llm" and self.provider is not None:
-            llm_result = await self._agenerate_with_llm(prompt, config, request.context)
+        if mode in {"llm", "function_calling"} and self.provider is not None:
+            llm_result = await self._agenerate_with_llm(prompt, config, request.context, mode=mode)
             if llm_result is not None:
                 return llm_result
 
@@ -286,38 +352,59 @@ class GraphQLEngine(QueryEngine):
         if config.default_entity:
             return config.default_entity
 
-        for entity in ["user", "customer", "order", "product", "movie", "person"]:
-            if self._contains_entity_token(lowered, entity):
-                return entity
+        # Prefer the first schema-declared entity over generic text extraction.
+        if config.entities:
+            return config.entities[0]
 
-        return "items"
+        # Last resort when no schema is provided: extract the most noun-like token
+        # from the query text itself.  This is generic (not domain-specific) and
+        # replaces the old hardcoded list.
+        return self._extract_entity_from_text(lowered)
 
     def _resolve_special_entity(self, lowered: str, config: NormalizedSchemaConfig) -> str | None:
-        if ("transaction" in lowered or "transactions" in lowered) and "as of date" in lowered:
-            return self._find_entity_with_field(
-                config,
-                candidate_fields=["asOfDate", "asOfDateTime"],
-                preferred_entity_names=["transactionsSummary"],
-            )
-        if "dividend" in lowered:
-            return self._find_entity_by_name(config, "transactions")
-        if "net worth" in lowered:
-            return self._find_entity_with_field(
-                config,
-                candidate_fields=["netWorth", "regulatoryNetWorth"],
-            )
-        if "available" in lowered and "withdraw" in lowered:
-            return self._find_entity_with_field(
-                config,
-                candidate_fields=["cashOnly", "cashWithMargin", "availBorr"],
-                preferred_entity_names=["availableToWithdrawDetail"],
-            )
-        if "buying power" in lowered:
-            return self._find_entity_with_field(
-                config,
-                candidate_fields=["cash", "margin", "withoutMarginImpact"],
-                preferred_entity_names=["buyingPowerDetail"],
-            )
+        """Route compound-keyword intents to their schema entities.
+
+        Rules are supplied via ``schema["keyword_intents"]`` — a list of dicts:
+
+        .. code-block:: json
+
+            {
+              "keywords": ["net", "worth"],
+              "find_entity_with_fields": ["netWorth", "regulatoryNetWorth"]
+            }
+
+        Each rule requires **all** ``keywords`` to appear in the lowered query.
+        The engine then looks up the best-matching schema entity using either
+        ``find_entity_by_name`` (exact name match) or ``find_entity_with_fields``
+        (field-presence score).  An optional ``preferred_entity_names`` list
+        breaks ties in favour of named entities.
+
+        Domain-specific rules (dividends, net worth, buying power, …) are **not**
+        hardcoded here — they belong in the calling schema's ``keyword_intents``
+        config so that the engine stays domain-agnostic.
+        """
+        for intent in config.keyword_intents:
+            keywords = intent.get("keywords", [])
+            if isinstance(keywords, str):
+                keywords = [keywords]
+            if not keywords:
+                continue
+            if not all(kw in lowered for kw in keywords):
+                continue
+            if "find_entity_by_name" in intent:
+                result = self._find_entity_by_name(config, str(intent["find_entity_by_name"]))
+                if result:
+                    return result
+            if "find_entity_with_fields" in intent:
+                fields = intent["find_entity_with_fields"]
+                preferred = intent.get("preferred_entity_names")
+                result = self._find_entity_with_field(
+                    config,
+                    candidate_fields=list(fields) if isinstance(fields, list) else [str(fields)],
+                    preferred_entity_names=list(preferred) if isinstance(preferred, list) else None,
+                )
+                if result:
+                    return result
         return None
 
     def _resolve_entity_by_alias_or_name(
@@ -554,47 +641,13 @@ class GraphQLEngine(QueryEngine):
             filters.update(grouped_filters)
 
     def _detect_comparison_filters(self, lowered: str) -> dict[str, Any]:
-        filters: dict[str, Any] = {}
-        symbolic_patterns = [
-            (rf"\b{_WORD_IDENTIFIER}\s*>=\s*{_FILTER_VALUE}\b", "_gte"),
-            (rf"\b{_WORD_IDENTIFIER}\s*<=\s*{_FILTER_VALUE}\b", "_lte"),
-            (rf"\b{_WORD_IDENTIFIER}\s*>\s*{_FILTER_VALUE}\b", "_gt"),
-            (rf"\b{_WORD_IDENTIFIER}\s*<\s*{_FILTER_VALUE}\b", "_lt"),
-        ]
-        for pattern, suffix in symbolic_patterns:
-            for match in re.finditer(pattern, lowered):
-                filters[f"{match.group(1)}{suffix}"] = match.group(2)
-
-        lexical_patterns = [
-            (rf"\b{_WORD_IDENTIFIER}\s+greater than\s+{_FILTER_VALUE}\b", "_gt"),
-            (rf"\b{_WORD_IDENTIFIER}\s+less than\s+{_FILTER_VALUE}\b", "_lt"),
-            (rf"\b{_WORD_IDENTIFIER}\s+after\s+{_FILTER_VALUE}\b", "_gt"),
-            (rf"\b{_WORD_IDENTIFIER}\s+before\s+{_FILTER_VALUE}\b", "_lt"),
-        ]
-        for pattern, suffix in lexical_patterns:
-            for match in re.finditer(pattern, lowered):
-                filters[f"{match.group(1)}{suffix}"] = match.group(2)
-        return filters
+        return detect_comparison_filters(lowered)
 
     def _detect_negation_filters(self, lowered: str) -> dict[str, Any]:
-        filters: dict[str, Any] = {}
-        for match in re.finditer(
-            rf"\b{_WORD_IDENTIFIER}\s*(?:!=|is not|not)\s*{_FILTER_VALUE}\b",
-            lowered,
-        ):
-            filters[f"{match.group(1)}_ne"] = match.group(2)
-        return filters
+        return detect_negation_filters(lowered)
 
     def _detect_date_range_filters(self, lowered: str) -> dict[str, Any]:
-        filters: dict[str, Any] = {}
-        for match in re.finditer(
-            _DATE_RANGE_PATTERN,
-            lowered,
-        ):
-            field = match.group(1)
-            filters[f"{field}_gte"] = match.group(2)
-            filters[f"{field}_lte"] = match.group(3)
-        return filters
+        return detect_date_range_filters(lowered)
 
     def _detect_ordering_filters(self, lowered: str, existing_filters: dict[str, Any]) -> dict[str, Any]:
         filters: dict[str, Any] = {}
@@ -624,28 +677,10 @@ class GraphQLEngine(QueryEngine):
         return "createdAt"
 
     def _detect_between_filters(self, lowered: str) -> dict[str, Any]:
-        filters: dict[str, Any] = {}
-        for match in re.finditer(r"\b([a-zA-Z_]+)\s+between\s+(\d+(?:\.\d+)?)\s+and\s+(\d+(?:\.\d+)?)", lowered):
-            field = match.group(1)
-            start = match.group(2)
-            end = match.group(3)
-            filters[f"{field}_gte"] = start
-            filters[f"{field}_lte"] = end
-        return filters
+        return detect_between_filters(lowered)
 
     def _detect_in_filters(self, lowered: str) -> dict[str, Any]:
-        filters: dict[str, Any] = {}
-        for match in re.finditer(r"\b([a-zA-Z_]+)\s+in\s+([a-zA-Z0-9_,\s]+)", lowered):
-            field = match.group(1)
-            values_blob = match.group(2)
-            values = [
-                token.strip()
-                for token in re.split(r",|\s+or\s+|\s+and\s+", values_blob)
-                if token.strip()
-            ]
-            if values:
-                filters[f"{field}_in"] = values
-        return filters
+        return detect_in_filters(lowered)
 
     def _detect_grouped_filters(
         self,
@@ -1107,12 +1142,43 @@ class GraphQLEngine(QueryEngine):
         text: str,
         config: NormalizedSchemaConfig,
         entity: str,
+        *,
+        max_depth: int = 3,
+        _visited: frozenset[str] | None = None,
+        _depth: int = 0,
     ) -> list[dict[str, Any]]:
+        """Detect nested relation selections, recursing up to *max_depth* hops.
+
+        Parameters
+        ----------
+        text:
+            Original (un-lowered) query text.
+        config:
+            Normalised schema configuration for the current engine instance.
+        entity:
+            The entity whose outgoing relations we are inspecting at this depth.
+        max_depth:
+            Maximum number of relation hops to follow (default 3).
+        _visited:
+            Internal set of entity names already present in the current path —
+            prevents infinite loops in schemas with cycles (e.g. ``user → posts
+            → user``).
+        _depth:
+            Internal recursion counter.
+        """
+        if _depth >= max_depth:
+            return []
+
         lowered = text.lower()
+        visited: frozenset[str] = (_visited or frozenset()) | {entity}
         relation_map = config.relations_by_entity.get(entity, {})
         nested: list[dict[str, Any]] = []
 
         for relation in relation_map.values():
+            # Skip back-edges to avoid cycles in the output tree.
+            if relation.target in visited:
+                continue
+
             aliases = [relation.name, relation.target, *relation.aliases]
             relation_mentioned = any(
                 self._contains_entity_token(lowered, alias.lower()) for alias in aliases
@@ -1132,14 +1198,26 @@ class GraphQLEngine(QueryEngine):
                 relation_filters["limit"] = 1
             relation_filters.update(self._detect_relation_local_filters(lowered, relation))
 
-            nested.append(
-                {
-                    "relation": relation.name,
-                    "target": relation.target,
-                    "fields": selected_fields,
-                    "filters": relation_filters,
-                }
+            # Recurse into the target entity's own relations.
+            child_nested = self._detect_nested(
+                text,
+                config,
+                relation.target,
+                max_depth=max_depth,
+                _visited=visited | {relation.target},
+                _depth=_depth + 1,
             )
+
+            node: dict[str, Any] = {
+                "relation": relation.name,
+                "target": relation.target,
+                "fields": selected_fields,
+                "filters": relation_filters,
+            }
+            if child_nested:
+                node["nested"] = child_nested
+
+            nested.append(node)
         return nested
 
     def _detect_relation_local_filters(
@@ -1175,55 +1253,25 @@ class GraphQLEngine(QueryEngine):
         aggregations: list[dict[str, str]],
         nested: list[dict[str, Any]],
     ) -> str:
-        args = ""
-        if filters:
-            ordered_filters = self._order_filters(filters)
-            args_str = ", ".join(f"{k}: {self._format_arg(v)}" for k, v in ordered_filters)
-            args = f"({args_str})"
+        """Build a GraphQL query string via :class:`~text2ql.renderers.GraphQLIRRenderer`.
 
-        selection_lines = list(fields)
-        for agg in aggregations:
-            fn_name = agg.get("function", "")
-            field = agg.get("field", "")
-            if not fn_name:
-                continue
-            if fn_name == "count":
-                selection_lines.append("count")
-            else:
-                selection_lines.append(f'{fn_name}(field: "{field}")')
+        The engine detects components; the renderer assembles the final string.
+        ``IRRenderer.render()`` is now the production path for query generation.
+        """
+        from text2ql.ir import QueryIR
+        ir = QueryIR.from_components(
+            entity=entity,
+            fields=fields,
+            filters=filters,
+            aggregations=aggregations,
+            nested=nested,
+            target="graphql",
+        )
+        return _GRAPHQL_RENDERER.render(ir)
 
-        for nested_node in nested:
-            relation = nested_node["relation"]
-            nested_args = ""
-            nested_filters = nested_node.get("filters", {})
-            if nested_filters:
-                ordered_nested_filters = self._order_filters(nested_filters)
-                nested_args_str = ", ".join(
-                    f"{k}: {self._format_arg(v)}" for k, v in ordered_nested_filters
-                )
-                nested_args = f"({nested_args_str})"
-            nested_fields = nested_node.get("fields", ["id"])
-            nested_selection = "\n      ".join(nested_fields)
-            selection_lines.append(
-                dedent(
-                    f"""
-                    {relation}{nested_args} {{
-                      {nested_selection}
-                    }}
-                    """
-                ).strip()
-            )
-
-        selection = "\n    ".join(selection_lines)
-        return dedent(
-            f"""
-            {{
-              {entity}{args} {{
-                {selection}
-              }}
-            }}
-            """
-        ).strip()
+    def _build_nested_selection(self, node: dict[str, Any], indent: int) -> str:
+        """Delegate nested-node rendering to :class:`~text2ql.renderers.GraphQLIRRenderer`."""
+        return _GRAPHQL_RENDERER._render_nested(node, indent)
 
     @staticmethod
     def _format_arg(value: Any) -> str:
@@ -1298,6 +1346,20 @@ class GraphQLEngine(QueryEngine):
             config=config,
             notes=notes,
         )
+
+        # Contradiction detection — same field with conflicting plain-equality values
+        from text2ql.engines.sql import _detect_contradictory_filters
+        contradiction_notes = _detect_contradictory_filters(validated_filters)
+        if contradiction_notes:
+            for note in contradiction_notes:
+                logger.warning("GraphQLEngine [%s]: %s", validated_entity, note)
+            notes.extend(contradiction_notes)
+            if self.strict_validation:
+                raise ValidationError(
+                    f"Contradictory filters detected for entity '{validated_entity}'",
+                    contradiction_notes,
+                )
+
         validated_aggregations = self._validate_aggregations(
             aggregations=aggregations,
             allowed_fields=allowed_fields,
@@ -1508,25 +1570,33 @@ class GraphQLEngine(QueryEngine):
         base_key = self._base_filter_key(key)
         arg_types = config.introspection_query_args.get(entity, {})
         arg_type = arg_types.get(base_key)
+        enum_values: set[str] = self._enum_values_for_type(arg_type, config) if arg_type else set()
         if isinstance(value, list):
             out: list[Any] = []
             for item in value:
                 coerced = self._coerce_scalar_value(item, arg_type)
-                if coerced is not None:
-                    out.append(coerced)
+                if coerced is None:
+                    continue
+                if enum_values and isinstance(coerced, str):
+                    canonical = next(
+                        (ev for ev in enum_values if ev.lower() == coerced.lower()), None
+                    )
+                    if canonical is None:
+                        notes.append(f"dropped invalid enum value '{coerced}' for '{base_key}'")
+                        continue
+                    coerced = canonical
+                out.append(coerced)
             return out
         coerced_scalar = self._coerce_scalar_value(value, arg_type)
-        if arg_type:
-            enum_values = self._enum_values_for_type(arg_type, config)
-            if enum_values and isinstance(coerced_scalar, str):
-                canonical = next(
-                    (value for value in enum_values if value.lower() == coerced_scalar.lower()),
-                    None,
-                )
-                if canonical is None:
-                    notes.append(f"dropped invalid enum value '{coerced_scalar}' for '{base_key}'")
-                    return None
-                coerced_scalar = canonical
+        if enum_values and isinstance(coerced_scalar, str):
+            canonical = next(
+                (enum_val for enum_val in enum_values if enum_val.lower() == coerced_scalar.lower()),
+                None,
+            )
+            if canonical is None:
+                notes.append(f"dropped invalid enum value '{coerced_scalar}' for '{base_key}'")
+                return None
+            coerced_scalar = canonical
         return coerced_scalar
 
     @staticmethod
@@ -1646,12 +1716,22 @@ class GraphQLEngine(QueryEngine):
                     f"dropped invalid nested args for relation '{relation_name}': {invalid_nested_args}"
                 )
 
-        return {
+        validated: dict[str, Any] = {
             "relation": relation.name,
             "target": relation.target,
             "fields": filtered_nested_fields,
             "filters": nested_filters,
         }
+        # Recursively validate and carry through any deeper nested children.
+        raw_children: list[dict[str, Any]] = node.get("nested", [])
+        if raw_children:
+            validated_children = self._validate_nested_nodes(
+                raw_children, relation.target, config, notes
+            )
+            if validated_children:
+                validated["nested"] = validated_children
+
+        return validated
 
     def _resolve_relation(
         self,

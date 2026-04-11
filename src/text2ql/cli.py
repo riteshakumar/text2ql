@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -160,6 +161,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Execute generated query on --data-file payload without requiring expected-query comparison.",
     )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable debug logging.",
+    )
     return parser
 
 
@@ -186,6 +192,11 @@ def _load_json_object(inline_value: str, file_path: str) -> dict[str, Any] | Non
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.WARNING,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
 
     if args.generate_hybrid_mapping:
         mapping = _build_hybrid_mapping_from_args(args)

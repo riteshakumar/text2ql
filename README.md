@@ -24,6 +24,12 @@ Install from PyPI:
 pip install text2ql
 ```
 
+With SQLAlchemy backend execution support:
+
+```bash
+pip install text2ql[sql]
+```
+
 Quick smoke test:
 
 ```bash
@@ -43,6 +49,12 @@ For local development and tests:
 
 ```bash
 pip install -e ".[dev]"
+```
+
+For SQL execution support:
+
+```bash
+pip install -e ".[sql]"
 ```
 
 ## Getting Started
@@ -159,17 +171,23 @@ Operational notes:
 | Deterministic generation | Yes | Yes |
 | Runtime confidence scoring | Yes | Yes |
 | LLM mode + constrained parsing | Yes | Yes |
+| **Function-calling / structured output mode** | **Yes** | **Yes** |
 | Schema/introspection validation | Yes | Yes |
+| **Strict validation (`ValidationError` on contradictions)** | **Yes** | **Yes** |
 | Enum/type coercion | Yes | Yes |
 | Advanced filters (`not`, `!=`, ranges, grouped precedence) | Yes | Yes |
 | Order parsing (`latest/highest/lowest`) | Yes | Yes |
 | Pagination (`limit`, `offset`, `first`, `after`) | Yes | Yes |
-| Nested/relation safety | Yes | Yes |
+| Nested/relation safety | **Recursive (up to 3 hops, cycle-safe)** | Yes |
+| **JOIN ON-clause column validation** | — | **Yes** |
 | Async generation (`agenerate`, `agenerate_many`) | Yes | Yes |
 | Structural execution match (no backend) | Yes | Yes |
+| **SQLAlchemy real backend execution** | — | **Yes** |
 | Real backend execution accuracy hook | Yes | Yes (via `evaluate_examples(..., execution_backend=...)`) |
 | Concurrent evaluation (`aevaluate_examples`) | Yes | Yes |
 | Synthetic rewrite plugins | Yes | Yes (target-agnostic dataset API) |
+| **Abstract IR layer (`QueryIR`, `IRRenderer`, `GraphQLIRRenderer`, `SQLIRRenderer`)** | **Yes** | **Yes** |
+| **Structured logging (`TEXT2QL_LOG_LEVEL`)** | **Yes** | **Yes** |
 
 ## CLI-First Workflow
 
@@ -455,6 +473,295 @@ export TEXT2QL_API_KEY=...
 
 If LLM output fails constrained JSON validation, `text2ql` falls back to deterministic mode.
 
+## Function-Calling Mode (Structured Output)
+
+For models that support native structured output (e.g. OpenAI `gpt-4o-2024-08-06` and later), enable `use_structured_output` on the provider. The engine sends the intent JSON schema via `response_format: json_schema`, forcing the model to emit valid JSON rather than relying on regex extraction as a fallback.
+
+```python
+from text2ql import Text2QL
+from text2ql.providers.openai_compatible import OpenAICompatibleProvider
+
+service = Text2QL(
+    provider=OpenAICompatibleProvider(
+        model="gpt-4o",
+        use_structured_output=True,   # sends response_format: json_schema
+    )
+)
+
+result = service.generate(
+    text="show top 5 active orders by total",
+    target="sql",
+    schema={"entities": ["orders"], "fields": {"orders": ["id", "status", "total", "createdAt"]}},
+    context={"mode": "function_calling"},   # use complete_structured() path
+)
+print(result.query)
+```
+
+When the model or endpoint does not support structured output the provider falls back to plain `complete()` automatically — no change needed on the caller side.
+
+You can also use `mode="function_calling"` interchangeably with `mode="llm"` when `use_structured_output=False`; the difference is only visible when the provider supports and enables native structured output.
+
+### Custom providers
+
+`LLMProvider` base now exposes `complete_structured()` and `acomplete_structured()`. Override them in custom providers to use tool-call / function-calling APIs:
+
+```python
+from text2ql.providers.base import LLMProvider
+
+class MyProvider(LLMProvider):
+    def complete(self, system_prompt, user_prompt):
+        ...
+
+    def complete_structured(self, system_prompt, user_prompt, json_schema):
+        # Use your API's native structured output / function-calling here.
+        return self._call_with_schema(system_prompt, user_prompt, json_schema)
+```
+
+## Validation Hardening (Strict Mode)
+
+By default both engines degrade gracefully: invalid filters are dropped and join issues are recorded in `result.metadata["validation_notes"]`. Enable `strict_validation=True` to raise instead.
+
+```python
+from text2ql.engines.sql import SQLEngine
+from text2ql.types import ValidationError
+
+engine = SQLEngine(strict_validation=True)
+
+try:
+    result = engine.generate(request)
+except ValidationError as exc:
+    print("Validation failed:", exc.issues)
+    # exc.issues is a list of individual problem strings
+```
+
+`ValidationError` is raised for:
+
+- **Contradictory equality filters** — same field assigned two different plain-equality values (e.g. `{"status": "active"}` and `{"status": "inactive"}` in the same filter dict).
+- **Invalid JOIN ON-clause columns** — a JOIN references a column that does not exist in the parent or target table according to the provided schema.
+- **Invalid relations** — a JOIN references a relation not declared in `schema["relations"]`.
+
+Both `SQLEngine` and `GraphQLEngine` accept `strict_validation`. In non-strict mode (the default) the same checks run and log at `WARNING` level, but execution continues.
+
+## Real SQL Execution (SQLAlchemy)
+
+`SQLAlchemyExecutor` connects to any SQLAlchemy-compatible database and plugs directly into the evaluation framework as an `execution_backend`.
+
+Install the optional dependency first:
+
+```bash
+pip install text2ql[sql]   # or: pip install sqlalchemy>=2.0
+```
+
+### Evaluate against a real database
+
+```python
+from text2ql import evaluate_examples
+from text2ql.sql_executor import SQLAlchemyExecutor
+
+executor = SQLAlchemyExecutor("postgresql+psycopg2://user:pw@host/mydb")
+report = evaluate_examples(service, examples, execution_backend=executor)
+print(report.execution_accuracy)
+```
+
+### In-memory SQLite for tests (no external DB)
+
+```python
+from text2ql.sql_executor import create_sqlite_executor
+
+executor = create_sqlite_executor({
+    "orders": [
+        {"id": 1, "status": "active",   "total": 250.0},
+        {"id": 2, "status": "inactive", "total":  80.0},
+    ],
+    "users": [
+        {"id": 1, "name": "Alice", "status": "active"},
+    ],
+})
+
+rows = executor.execute("SELECT id, total FROM orders WHERE status = 'active';")
+# [{"id": 1, "total": 250.0}]
+```
+
+`create_sqlite_executor` also accepts `pandas` for bulk-loading if installed; falls back to raw DDL otherwise.
+
+### Execute directly
+
+```python
+executor = SQLAlchemyExecutor("sqlite:///sales.db")
+rows = executor.execute("SELECT COUNT(*) AS cnt FROM orders;")
+# [{"cnt": 42}]
+```
+
+Use as a context manager to release the connection pool:
+
+```python
+with SQLAlchemyExecutor("sqlite:///sales.db") as executor:
+    rows = executor.execute("SELECT * FROM users LIMIT 10;")
+```
+
+## Abstract IR Layer
+
+`text2ql` defines a canonical **Intermediate Representation** (`QueryIR`) that sits between natural-language parsing and target-language rendering.  Both engines now build a `QueryIR` internally and call a concrete `IRRenderer` to produce the final query string — the renderer is the **live production path**, not just an inspection helper.
+
+### Core types
+
+| Type | Purpose |
+|---|---|
+| `QueryIR` | Top-level IR: entity, fields, filters, joins, nested, aggregations, ordering, pagination |
+| `IRFilter` | Single predicate — `key`, `value`, `operator` (`eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `nin`, `is_null`) |
+| `IRJoin` | JOIN between two tables — left/right ON-clause refs, fields, filters |
+| `IRNested` | GraphQL nested selection — relation, target entity, fields, filters |
+| `IRAggregation` | Aggregate expression — `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` |
+| `IRRenderer` | Abstract base — implement `render(ir: QueryIR) -> str` to add a new query language |
+| `GraphQLIRRenderer` | **Concrete** renderer for GraphQL (used by `GraphQLEngine` in production) |
+| `SQLIRRenderer` | **Concrete** renderer for SQL — also emits `GROUP BY` when aggregations are present (used by `SQLEngine` in production) |
+
+### Inspect a result as IR
+
+```python
+from text2ql import QueryIR, Text2QL
+
+result = Text2QL().generate(
+    text="show active orders over 100 sorted by total",
+    target="sql",
+    schema={"entities": ["orders"], "fields": {"orders": ["id", "status", "total"]}},
+)
+
+ir = QueryIR.from_query_result(result, source_text=result.query)
+print(ir.entity)          # "orders"
+print(ir.filters)         # [IRFilter(key='status', value='active', operator='eq'), ...]
+print(ir.order_by)        # "total"
+```
+
+### Build IR from engine components
+
+```python
+from text2ql import QueryIR
+
+ir = QueryIR.from_components(
+    entity="orders",
+    fields=["id", "status", "total"],
+    filters={"status": "active", "total_gte": 100},
+    order_by="total",
+    order_dir="DESC",
+    target="sql",
+    source_text="show active orders over 100 sorted by total",
+)
+# ir.filters → [IRFilter(key='status', operator='eq'), IRFilter(key='total', operator='gte')]
+```
+
+### Add a new query language
+
+Subclass `IRRenderer` — that's the only requirement:
+
+```python
+from text2ql.ir import IRRenderer, QueryIR
+
+class CypherRenderer(IRRenderer):
+    def render(self, ir: QueryIR) -> str:
+        label = ir.entity.capitalize()
+        where = self._build_where(ir.filters)
+        fields = ", ".join(f"n.{f}" for f in ir.fields) or "n"
+        match = f"MATCH (n:{label})"
+        where_clause = f" WHERE {where}" if where else ""
+        return f"{match}{where_clause} RETURN {fields}"
+
+    def _build_where(self, filters):
+        parts = []
+        for f in filters:
+            if f.operator == "eq":
+                parts.append(f"n.{f.key} = '{f.value}'")
+            elif f.operator == "gte":
+                parts.append(f"n.{f.key} >= {f.value}")
+        return " AND ".join(parts)
+
+renderer = CypherRenderer()
+print(renderer.render(ir))
+# MATCH (n:Orders) WHERE n.status = 'active' AND n.total >= 100 RETURN n.id, n.status, n.total
+```
+
+### SQL aggregations
+
+`SQLIRRenderer` emits `COUNT(*)`, `SUM()`, `AVG()`, `MIN()`, `MAX()` automatically when the SQL engine detects aggregate intent words:
+
+```python
+result = Text2QL().generate(
+    "count all orders with status active",
+    target="sql",
+    schema={"entities": ["orders"], "fields": {"orders": ["id", "status"]}},
+)
+print(result.query)
+# SELECT orders.status, COUNT(*) AS count FROM orders
+# WHERE orders.status = 'active' GROUP BY orders.status;
+```
+
+### Domain-specific entity routing via `keyword_intents`
+
+Instead of hardcoding domain keywords inside the engine, declare routing rules in your schema config.  The engine evaluates these before falling back to alias and semantic matching:
+
+```python
+result = Text2QL().generate(
+    "show my dividend history",
+    target="graphql",
+    schema={
+        "entities": ["transactions", "positions"],
+        "fields": {"transactions": ["id", "amount", "type", "date"]},
+        "keyword_intents": [
+            {
+                "keywords": ["dividend"],
+                "find_entity_by_name": "transactions"
+            },
+            {
+                "keywords": ["net", "worth"],
+                "find_entity_with_fields": ["netWorth", "regulatoryNetWorth"]
+            },
+            {
+                "keywords": ["buying", "power"],
+                "find_entity_with_fields": ["cash", "margin"],
+                "preferred_entity_names": ["buyingPowerDetail"]
+            }
+        ],
+    },
+)
+print(result.metadata["entity"])  # "transactions"
+```
+
+Each intent requires **all** listed `keywords` to appear in the query.  Use `find_entity_by_name` for an exact entity name match, or `find_entity_with_fields` to pick the entity whose schema contains the most candidate fields (with optional `preferred_entity_names` as a tiebreaker).
+
+## Structured Logging
+
+All engines and providers emit structured log records via Python's standard `logging` module under the `text2ql` namespace. No handlers are installed by default — configure them in your application.
+
+### Basic setup
+
+```python
+import logging
+logging.getLogger("text2ql").setLevel(logging.DEBUG)
+logging.basicConfig(format="%(levelname)s %(name)s: %(message)s")
+```
+
+### Log levels
+
+| Level | What fires |
+|---|---|
+| `DEBUG` | Every LLM provider call, SQL queries executed, IR traces |
+| `WARNING` | LLM fallbacks to deterministic mode, retry attempts (429), contradictory filter detections, dropped invalid JOINs |
+| `ERROR` | Network failures after all retries exhausted |
+
+### Streamlit
+
+Logs go to the terminal where you launched the app, not the browser. Control via the `TEXT2QL_LOG_LEVEL` environment variable:
+
+```bash
+# See fallbacks and validation warnings
+TEXT2QL_LOG_LEVEL=WARNING ./venv/bin/python -m streamlit run examples/streamlit_app.py
+
+# See every provider call and SQL query
+TEXT2QL_LOG_LEVEL=DEBUG ./venv/bin/python -m streamlit run examples/streamlit_app.py
+```
+
+The Streamlit app wires a `StreamHandler` directly to the `text2ql` logger with `propagate=False` so Streamlit's root-logger reconfiguration cannot suppress it.
+
 ## CLI
 
 ```bash
@@ -649,7 +956,8 @@ result = service.generate(
 
 Behavior:
 
-- Detects nested intents (e.g. `latest order total`) and emits nested selections.
+- Detects nested intents (e.g. `latest order total`) and emits nested selections **recursively up to 3 relation hops** (configurable via `max_depth`).
+- Cycle-safe: if the schema has back-edges (e.g. `user → posts → user`), the traversal stops at the repeated entity — no infinite loops.
 - Validates entity, fields, and args against schema before returning query.
 - Drops invalid fields/args and records notes in `result.metadata["validation_notes"]`.
 
@@ -884,20 +1192,30 @@ python -m twine check dist/*
 ## Current architecture
 
 - `text2ql.core.Text2QL`: orchestrator/facade — `generate()`, `agenerate()`, `agenerate_many()`.
-- `text2ql.types`: request/result schemas (`QueryRequest`, `QueryResult`).
+- `text2ql.types`: request/result schemas (`QueryRequest`, `QueryResult`, `ValidationError`).
+- `text2ql.ir`: abstract IR layer — `QueryIR`, `IRFilter`, `IRJoin`, `IRNested`, `IRAggregation`, `IRRenderer`.
+- `text2ql.renderers`: concrete renderers — `GraphQLIRRenderer` and `SQLIRRenderer`.  Both engines build a `QueryIR` internally and call `renderer.render(ir)` to produce the final query string.  `SQLIRRenderer` also handles `SELECT COUNT(*)/SUM()/AVG()` + `GROUP BY` when aggregations are detected.
+- `text2ql.filters`: shared compiled regex singletons and stateless helpers (`detect_comparison_filters`, `detect_negation_filters`, `detect_between_filters`, `detect_in_filters`, `detect_date_range_filters`) — imported by both engines to eliminate regex duplication.
 - `text2ql.engines.*`: per-target query generators — each exposes both `generate()` and `agenerate()`.
+  - `strict_validation=True` raises `ValidationError` on contradictory filters or invalid JOIN ON-clause columns.
+  - Entity detection is fully schema-driven: alias → name → semantic field match → `schema.keyword_intents` → first schema entity → generic text extraction (no hardcoded domain lists).
+  - GraphQL nested detection is recursive (up to `max_depth=3` hops) with cycle prevention.
 - `text2ql.engines.base.compute_deterministic_confidence`: runtime confidence scoring (schema, entity, fields, filters, validation).
 - `text2ql.providers.*`: pluggable LLM provider adapters — implement `complete()`, get `acomplete()` for free (or override for native async).
+  - `complete_structured()` / `acomplete_structured()` for function-calling / structured output mode.
+  - `OpenAICompatibleProvider(use_structured_output=True)` uses `response_format: json_schema`.
+- `text2ql.prompting`: prompt templates + `GRAPHQL_INTENT_JSON_SCHEMA` / `SQL_INTENT_JSON_SCHEMA` for structured output.
+- `text2ql.sql_executor`: `SQLAlchemyExecutor` and `create_sqlite_executor()` for real SQL execution.
 - `text2ql.evaluate`: `evaluate_examples()` (serial) + `aevaluate_examples()` (concurrent async).
 - `text2ql.rewrite`: `rewrite_user_utterance()` + `arewrite_user_utterance()` (async).
 
 ## Roadmap
 
-1. Add `Cypher`, `Jsonata`, `Jq` and `SPARQL` engines.  
+1. Add `Cypher`, `Jsonata`, `Jq` and `SPARQL` engines using the `IRRenderer` base class. *(IR layer is ready — only `render()` needs implementing per language.)*
 2. Expand prompts and constraints per target language.
 3. Add richer synthetic generation using domain-specific rewrite plugins.
-4. Add execution evaluation hooks for real backends (e.g. GraphQL endpoint, SQL database).
-5. Add more provider adapters and support for provider-specific features (e.g. function calling).
+4. ~~Add execution evaluation hooks for real backends~~ *(done — `SQLAlchemyExecutor` + `create_sqlite_executor`)*.
+5. ~~Add function-calling / structured output support~~ *(done — `use_structured_output`, `mode="function_calling"`, `complete_structured()`)*.
 6. Add few-shot example support in LLM mode with dynamic example retrieval based on schema/mapping similarity.
-7. Add a playground interface for interactive experimentation and debugging.
-    
+7. Multilingual prompt support (currently English only).
+

@@ -2,6 +2,10 @@
 venv/
 .venv/
 
+# Environment variables
+.env
+.env.*
+
 # Python cache/artifacts
 __pycache__/
 *.pyc

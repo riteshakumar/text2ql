@@ -30,6 +30,13 @@ class NormalizedSchemaConfig:
     introspection_enum_values: dict[str, set[str]] = field(default_factory=dict)
     default_entity: str | None = None
     default_fields: list[str] = field(default_factory=list)
+    #: Domain-specific keyword → entity routing rules.  Each entry is a dict
+    #: with a ``"keywords"`` key (str or list[str]) that must all appear in the
+    #: lowered query, plus either ``"find_entity_by_name"`` (str) or
+    #: ``"find_entity_with_fields"`` (list[str]) and an optional
+    #: ``"preferred_entity_names"`` (list[str]).  Replaces the old hardcoded
+    #: financial-domain rules in ``GraphQLEngine._resolve_special_entity``.
+    keyword_intents: list[dict] = field(default_factory=list)
 
 
 def normalize_schema_config(
@@ -64,6 +71,10 @@ def normalize_schema_config(
     default_fields = schema.get("default_fields")
     if isinstance(default_fields, list):
         config.default_fields = [str(v) for v in default_fields if str(v).strip()]
+
+    keyword_intents = schema.get("keyword_intents")
+    if isinstance(keyword_intents, list):
+        config.keyword_intents = [ki for ki in keyword_intents if isinstance(ki, dict)]
 
     _infer_from_arbitrary_payload(config, schema)
 
