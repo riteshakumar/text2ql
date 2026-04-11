@@ -4,11 +4,16 @@ import argparse
 import json
 import logging
 import os
-import re
-import sqlite3
+import sys
 from pathlib import Path
 from typing import Any
 
+from text2ql._cli_utils import (
+    as_unit_float,
+    dynamic_synthetic_meta,
+    execute_sql_on_json,
+    stable_json,
+)
 from text2ql.core import Text2QL
 from text2ql.dataset import DatasetExample, generate_synthetic_examples
 from text2ql.json_execution import execute_query_result_on_json
@@ -24,6 +29,7 @@ from text2ql.types import QueryResult
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Text to Query Language CLI")
     parser.add_argument("text", nargs="?", default="", help="Natural language request")
+    parser.add_argument("--version", action="store_true", help="Print version and exit")
     parser.add_argument("--target", default="graphql", help="Target query language")
     parser.add_argument(
         "--mode",
@@ -198,6 +204,14 @@ def main() -> None:
         format="%(levelname)s %(name)s: %(message)s",
     )
 
+    if args.version:
+        try:
+            from importlib.metadata import version
+            print(f"text2ql {version('text2ql')}")
+        except Exception:
+            print("text2ql 0.2.0")
+        return
+
     if args.generate_hybrid_mapping:
         mapping = _build_hybrid_mapping_from_args(args)
         _emit_json_output(mapping, args.mapping_output_file)
@@ -230,6 +244,7 @@ def main() -> None:
 
     if len(results) == 1 and not use_synthetic and not execution_eval_enabled:
         print(results[0]["query"])
+        _warn_validation_notes(results[0].get("engine_metadata", {}))
         return
 
     summary = {
@@ -348,11 +363,11 @@ def _generate_result_payloads(
                 "system_context": args.system_context,
             },
         )
-        dynamic_meta = _dynamic_synthetic_meta(
+        dynamic_meta = dynamic_synthetic_meta(
             base_meta=metadata[idx] if idx < len(metadata) else {},
             seed_prompt=args.text,
             active_prompt=prompt,
-            engine_confidence=_as_unit_float(result.confidence, default=0.5),
+            engine_confidence=as_unit_float(result.confidence, default=0.5),
             rewrite_meta=rewrite_meta if (args.llm_rewrite == "on" and rewrite_provider is not None) else None,
         )
         payload: dict[str, Any] = {
@@ -360,6 +375,8 @@ def _generate_result_payloads(
             "rewritten_prompt": rewritten_prompt,
             "rewrite": rewrite_meta,
             "query": result.query,
+            "confidence": result.confidence,
+            "explanation": result.explanation,
             "synthetic": dynamic_meta,
             "metadata": dynamic_meta,
             "engine_metadata": result.metadata,
@@ -393,7 +410,7 @@ def _apply_execution_evaluation(
         payload["execution_eval_warning"] = "execution evaluation requires --data-file JSON payload"
         return
     if str(target).strip().lower() == "sql":
-        rows, note = _execute_sql_on_json(result.query, execution_data_payload, root_key="portfolio_data")
+        rows, note = execute_sql_on_json(result.query, execution_data_payload, root_key="portfolio_data")
     else:
         rows, note = execute_query_result_on_json(result, execution_data_payload, root_key="portfolio_data")
     payload["execution_rows"] = rows
@@ -403,7 +420,7 @@ def _apply_execution_evaluation(
     expected_note = None
     if expected_rows is None and expected_query:
         if str(target).strip().lower() == "sql":
-            expected_rows, expected_note = _execute_sql_on_json(
+            expected_rows, expected_note = execute_sql_on_json(
                 expected_query, execution_data_payload, root_key="portfolio_data"
             )
         else:
@@ -421,7 +438,7 @@ def _apply_execution_evaluation(
         return
     if expected_rows is None:
         return
-    payload["execution_match"] = _stable_json(rows) == _stable_json(expected_rows)
+    payload["execution_match"] = stable_json(rows) == stable_json(expected_rows)
 
 
 def _build_hybrid_mapping_from_args(args: argparse.Namespace) -> dict[str, Any]:
@@ -486,133 +503,12 @@ def _build_rewrite_provider(args: argparse.Namespace) -> LLMProvider | None:
     )
 
 
-def _stable_json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
-
-
-def _tokenize(text: str) -> set[str]:
-    return {token for token in re.findall(r"[a-z0-9_]+", str(text).lower()) if token}
-
-
-def _compute_novelty(seed_prompt: str, candidate_prompt: str) -> float:
-    seed_tokens = _tokenize(seed_prompt)
-    cand_tokens = _tokenize(candidate_prompt)
-    if not seed_tokens and not cand_tokens:
-        return 0.0
-    union = seed_tokens | cand_tokens
-    if not union:
-        return 0.0
-    overlap = seed_tokens & cand_tokens
-    return max(0.0, min(1.0, 1.0 - (len(overlap) / len(union))))
-
-
-def _as_unit_float(value: Any, default: float = 0.5) -> float:
-    try:
-        return max(0.0, min(1.0, float(value)))
-    except (TypeError, ValueError):
-        return default
-
-
-def _dynamic_synthetic_meta(
-    base_meta: dict[str, Any],
-    seed_prompt: str,
-    active_prompt: str,
-    engine_confidence: float,
-    rewrite_meta: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    meta = dict(base_meta or {})
-    novelty = _compute_novelty(seed_prompt, active_prompt)
-    fallback_conf = _as_unit_float(engine_confidence, default=0.5)
-    if rewrite_meta and isinstance(rewrite_meta, dict):
-        confidence = _as_unit_float(
-            rewrite_meta.get("synthetic_rewrite_confidence", rewrite_meta.get("confidence", fallback_conf)),
-            default=fallback_conf,
-        )
-    else:
-        confidence = _as_unit_float(meta.get("synthetic_rewrite_confidence", fallback_conf), default=fallback_conf)
-    score = _as_unit_float(0.65 * confidence + 0.35 * novelty)
-    meta["synthetic_rewrite_confidence"] = confidence
-    meta["synthetic_rewrite_novelty"] = novelty
-    meta["synthetic_rewrite_score"] = score
-    meta.setdefault("synthetic_rewrite_source", "seed" if novelty == 0 else "synthetic")
-    return meta
-
-
-def _collect_entity_rows(node: Any, out: dict[str, list[dict[str, Any]]] | None = None) -> dict[str, list[dict[str, Any]]]:
-    if out is None:
-        out = {}
-    if isinstance(node, dict):
-        for key, value in node.items():
-            if isinstance(value, dict):
-                out.setdefault(str(key), []).append(value)
-                _collect_entity_rows(value, out)
-            elif isinstance(value, list):
-                dict_items = [item for item in value if isinstance(item, dict)]
-                if dict_items:
-                    out.setdefault(str(key), []).extend(dict_items)
-                    for item in dict_items:
-                        _collect_entity_rows(item, out)
-                else:
-                    for item in value:
-                        _collect_entity_rows(item, out)
-    elif isinstance(node, list):
-        for item in node:
-            _collect_entity_rows(item, out)
-    return out
-
-
-def _quote_ident(name: str) -> str:
-    return '"' + str(name).replace('"', '""') + '"'
-
-
-def _to_sql_scalar(value: Any) -> Any:
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=True, default=str)
-    return value
-
-
-def _execute_sql_on_json(
-    query: str,
-    data_payload: dict[str, Any],
-    root_key: str = "portfolio_data",
-) -> tuple[list[dict[str, Any]], str | None]:
-    root = data_payload.get(root_key, data_payload)
-    if not isinstance(root, dict):
-        return [], "SQL execution skipped: payload must be a JSON object."
-
-    entity_rows = _collect_entity_rows(root)
-    if not entity_rows:
-        return [], "SQL execution skipped: no tabular entities found in payload."
-
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    try:
-        created_tables = 0
-        for table_name, rows in entity_rows.items():
-            if not rows:
-                continue
-            columns = sorted({str(key) for row in rows for key in row.keys()})
-            if not columns:
-                continue
-            conn.execute(
-                f"CREATE TABLE {_quote_ident(table_name)} ({', '.join(f'{_quote_ident(col)} TEXT' for col in columns)});"
-            )
-            insert_sql = (
-                f"INSERT INTO {_quote_ident(table_name)} ({', '.join(_quote_ident(col) for col in columns)}) "
-                f"VALUES ({', '.join(['?'] * len(columns))});"
-            )
-            values = [[_to_sql_scalar(row.get(column)) for column in columns] for row in rows]
-            conn.executemany(insert_sql, values)
-            created_tables += 1
-
-        if created_tables == 0:
-            return [], "SQL execution skipped: no usable tables were created."
-        cursor = conn.execute(query)
-        return [dict(row) for row in cursor.fetchall()], None
-    except sqlite3.Error as exc:
-        return [], f"SQL execution error: {exc}"
-    finally:
-        conn.close()
+def _warn_validation_notes(engine_metadata: dict[str, Any]) -> None:
+    """Print any validation notes from the engine to stderr as warnings."""
+    notes = engine_metadata.get("validation_notes", [])
+    if notes:
+        for note in notes:
+            print(f"warning: {note}", file=sys.stderr)
 
 
 if __name__ == "__main__":

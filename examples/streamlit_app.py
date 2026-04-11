@@ -6,8 +6,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import sqlite3
-import re
 import sys
 import time
 from pathlib import Path
@@ -35,7 +33,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
     force=True,
 )
-
 
 def _import_text2ql() -> tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any]:
     try:
@@ -112,6 +109,14 @@ def _import_text2ql() -> tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any]:
     OpenAICompatibleProvider,
 ) = _import_text2ql()
 
+# Import shared utilities after _import_text2ql() has resolved the package path.
+from text2ql._cli_utils import (  # noqa: E402
+    as_unit_float as _as_unit_float,
+    dynamic_synthetic_meta as _dynamic_synthetic_meta,
+    execute_sql_on_json as _execute_sql_on_json,
+    stable_json as _stable_json,
+)
+
 
 PLUGIN_OPTIONS = ["generic", "portfolio", "banking", "ecommerce", "crm", "healthcare"]
 DOMAIN_OPTIONS = ["", "portfolio", "banking", "ecommerce", "crm", "healthcare"]
@@ -130,133 +135,6 @@ def _load_uploaded_json(uploaded: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("Expected top-level JSON object in uploaded file")
     return payload
-
-
-def _stable_json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
-
-
-def _tokenize(text: str) -> set[str]:
-    return {token for token in re.findall(r"[a-z0-9_]+", text.lower()) if token}
-
-
-def _compute_novelty(seed_prompt: str, candidate_prompt: str) -> float:
-    seed_tokens = _tokenize(seed_prompt)
-    cand_tokens = _tokenize(candidate_prompt)
-    if not seed_tokens and not cand_tokens:
-        return 0.0
-    union = seed_tokens | cand_tokens
-    if not union:
-        return 0.0
-    overlap = seed_tokens & cand_tokens
-    jaccard = len(overlap) / len(union)
-    return max(0.0, min(1.0, 1.0 - jaccard))
-
-
-def _as_unit_float(value: Any, default: float = 0.5) -> float:
-    try:
-        return max(0.0, min(1.0, float(value)))
-    except (TypeError, ValueError):
-        return default
-
-
-def _dynamic_synthetic_meta(
-    base_meta: dict[str, Any],
-    seed_prompt: str,
-    active_prompt: str,
-    engine_confidence: float,
-    rewrite_meta: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    meta = dict(base_meta)
-    novelty = _compute_novelty(seed_prompt, active_prompt)
-    if rewrite_meta and isinstance(rewrite_meta, dict):
-        confidence = _as_unit_float(
-            rewrite_meta.get("synthetic_rewrite_confidence", rewrite_meta.get("confidence", engine_confidence)),
-            default=engine_confidence,
-        )
-    else:
-        confidence = _as_unit_float(meta.get("synthetic_rewrite_confidence", engine_confidence), default=engine_confidence)
-    score = _as_unit_float(0.65 * confidence + 0.35 * novelty)
-    meta["synthetic_rewrite_confidence"] = confidence
-    meta["synthetic_rewrite_novelty"] = novelty
-    meta["synthetic_rewrite_score"] = score
-    return meta
-
-
-def _collect_entity_rows(node: Any, out: dict[str, list[dict[str, Any]]] | None = None) -> dict[str, list[dict[str, Any]]]:
-    if out is None:
-        out = {}
-    if isinstance(node, dict):
-        for key, value in node.items():
-            if isinstance(value, dict):
-                out.setdefault(str(key), []).append(value)
-                _collect_entity_rows(value, out)
-            elif isinstance(value, list):
-                dict_items = [item for item in value if isinstance(item, dict)]
-                if dict_items:
-                    out.setdefault(str(key), []).extend(dict_items)
-                    for item in dict_items:
-                        _collect_entity_rows(item, out)
-                else:
-                    for item in value:
-                        _collect_entity_rows(item, out)
-    elif isinstance(node, list):
-        for item in node:
-            _collect_entity_rows(item, out)
-    return out
-
-
-def _quote_ident(name: str) -> str:
-    return '"' + name.replace('"', '""') + '"'
-
-
-def _to_sql_scalar(value: Any) -> Any:
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=True, default=str)
-    return value
-
-
-def _execute_sql_on_json(
-    query: str,
-    data_payload: dict[str, Any],
-    root_key: str = "portfolio_data",
-) -> tuple[list[dict[str, Any]], str | None]:
-    root = data_payload.get(root_key, data_payload)
-    if not isinstance(root, dict):
-        return [], "SQL execution skipped: payload must be a JSON object."
-
-    entity_rows = _collect_entity_rows(root)
-    if not entity_rows:
-        return [], "SQL execution skipped: no tabular entities found in payload."
-
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    try:
-        created_tables = 0
-        for table_name, rows in entity_rows.items():
-            if not rows:
-                continue
-            columns = sorted({str(key) for row in rows for key in row.keys()})
-            if not columns:
-                continue
-            create_sql = f"CREATE TABLE {_quote_ident(table_name)} ({', '.join(f'{_quote_ident(col)} TEXT' for col in columns)});"
-            conn.execute(create_sql)
-            placeholders = ", ".join(["?"] * len(columns))
-            insert_sql = f"INSERT INTO {_quote_ident(table_name)} ({', '.join(_quote_ident(col) for col in columns)}) VALUES ({placeholders});"
-            values = [[_to_sql_scalar(row.get(column)) for column in columns] for row in rows]
-            conn.executemany(insert_sql, values)
-            created_tables += 1
-
-        if created_tables == 0:
-            return [], "SQL execution skipped: no usable tables were created."
-
-        cursor = conn.execute(query)
-        result_rows = [dict(row) for row in cursor.fetchall()]
-        return result_rows, None
-    except sqlite3.Error as exc:
-        return [], f"SQL execution error: {exc}"
-    finally:
-        conn.close()
 
 
 def _default_api_key() -> str:
@@ -325,7 +203,7 @@ def _build_prompts(
 def main() -> None:
     st.set_page_config(page_title="text2ql Playground", layout="wide")
     st.title("text2ql Playground")
-    st.caption("Test GraphQL and SQL generation in deterministic or LLM mode.")
+    st.caption("v0.2.0 · GraphQL and SQL query generation from natural language · deterministic or LLM mode")
 
     with st.sidebar:
         st.header("Settings")
@@ -375,11 +253,22 @@ def main() -> None:
     with right:
         st.subheader("Run Notes")
         st.markdown(
+            "**Modes**\n"
             "- `deterministic`: no LLM calls, fully rule-based\n"
             "- `llm`: uses provider then validates against schema\n"
-            "- `LLM Utterance Rewrite`: optional pre-generation rewrite step\n"
+            "- `LLM Utterance Rewrite`: optional pre-generation rewrite step\n\n"
+            "**Auto-detected features** (deterministic mode)\n"
+            "- Aggregations: COUNT / SUM / AVG / MIN / MAX from natural language\n"
+            "- SQL JOIN: when query mentions a related entity declared in `schema.relations`\n"
+            "- GraphQL nested: up to 3-hop nested selections via `schema.relations`\n"
+            "- Pagination: LIMIT / OFFSET / first / after\n"
+            "- Ordering: ORDER BY ASC/DESC\n\n"
+            "**Schema keys**\n"
+            "- `entities`, `fields`, `relations`, `args`, `introspection`\n"
+            "- `keyword_intents` for compound-keyword → entity routing\n\n"
+            "**Execution**\n"
             "- `Execute on JSON Payload`: toggle between query-only and query+execution\n"
-            "- GraphQL mode can execute against JSON payload\n"
+            "- GraphQL mode executes against JSON payload\n"
             "- SQL mode supports signature match against expected query"
         )
 
@@ -466,6 +355,8 @@ def main() -> None:
                 "rewritten_prompt": rewritten_prompt,
                 "rewrite_meta": rewrite_meta,
                 "query": result.query,
+                "confidence": result.confidence,
+                "explanation": result.explanation,
                 "metadata": result.metadata,
                 "timing_ms": {
                     "total": total_elapsed * 1000,
@@ -519,19 +410,49 @@ def main() -> None:
 
         st.subheader("Results")
         for row in results:
+            synth = row.get("synthetic", {})
+            conf = row.get("confidence")
+            conf_str = f"{conf:.4f}" if isinstance(conf, float) else "—"
+            synth_score = synth.get("synthetic_rewrite_score")
+            score_str = f"{synth_score:.2f}" if isinstance(synth_score, float) else "—"
+            novelty = synth.get("synthetic_rewrite_novelty")
+            novelty_str = f"{novelty:.2f}" if isinstance(novelty, float) else "—"
+            source = synth.get("synthetic_rewrite_source", "seed")
+
             with st.expander(f"Variant {row['idx']}: {row['prompt']}", expanded=(row["idx"] == 1)):
+                # Confidence · synthetic · timing — all on one line at a glance.
                 st.caption(
-                    f"timing_ms total={row['timing_ms'].get('total', 0):.3f} "
-                    f"generate={row['timing_ms'].get('generate', 0):.3f} "
-                    f"execute={row['timing_ms'].get('execute', 0):.3f}"
+                    f"confidence={conf_str}  ·  "
+                    f"synth_score={score_str}  ·  novelty={novelty_str}  ·  source={source}  ·  "
+                    f"generate={row['timing_ms'].get('generate', 0):.1f}ms  ·  "
+                    f"execute={row['timing_ms'].get('execute', 0):.1f}ms"
                 )
+                # Explanation directly below.
+                explanation = row.get("explanation", "")
+                if explanation:
+                    st.info(explanation)
+
                 if llm_rewrite and rewrite_provider is not None:
                     st.markdown("**Rewritten Prompt**")
                     st.code(row.get("rewritten_prompt", ""), language="text")
                     st.markdown("**Rewrite metadata**")
                     st.json(row.get("rewrite_meta", {}), expanded=False)
+
+                # Surface validation notes prominently before the query.
+                engine_meta = row.get("metadata", {})
+                validation_notes = engine_meta.get("validation_notes", [])
+                if validation_notes:
+                    for note in validation_notes:
+                        st.warning(f"Validation: {note}")
+
                 st.markdown("**Generated Query**")
                 st.code(row["query"], language="graphql" if target == "graphql" else "sql")
+
+                # Show aggregations when present.
+                aggregations = engine_meta.get("aggregations", [])
+                if aggregations:
+                    st.markdown("**Aggregations**")
+                    st.json(aggregations, expanded=True)
 
                 if target == "graphql":
                     if execute_on_payload:
@@ -553,8 +474,6 @@ def main() -> None:
                         if row.get("sql_execution_note"):
                             st.info(row["sql_execution_note"])
 
-                st.markdown("**Synthetic Scores**")
-                st.json(row.get("synthetic", {}), expanded=False)
                 st.markdown("**Engine metadata**")
                 st.json(row.get("metadata", {}), expanded=False)
 
