@@ -1716,12 +1716,22 @@ class GraphQLEngine(QueryEngine):
                     f"dropped invalid nested args for relation '{relation_name}': {invalid_nested_args}"
                 )
 
-        return {
+        validated: dict[str, Any] = {
             "relation": relation.name,
             "target": relation.target,
             "fields": filtered_nested_fields,
             "filters": nested_filters,
         }
+        # Recursively validate and carry through any deeper nested children.
+        raw_children: list[dict[str, Any]] = node.get("nested", [])
+        if raw_children:
+            validated_children = self._validate_nested_nodes(
+                raw_children, relation.target, config, notes
+            )
+            if validated_children:
+                validated["nested"] = validated_children
+
+        return validated
 
     def _resolve_relation(
         self,

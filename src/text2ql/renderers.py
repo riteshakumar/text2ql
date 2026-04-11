@@ -122,7 +122,7 @@ class GraphQLIRRenderer(IRRenderer):
             relation = nested.relation
             node_args = self._build_args(nested.filters, {})
             field_lines = list(nested.fields) or ["id"]
-            child_nodes = []
+            child_nodes = list(nested.children)
 
         pad = " " * indent
         child_pad = " " * (indent + 2)

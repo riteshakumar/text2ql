@@ -103,12 +103,17 @@ class IRNested:
         Fields to select from the nested type.
     filters:
         Arguments/filters applied to the nested selection.
+    children:
+        Deeper nested selections (multi-hop relations).  Each child is an
+        :class:`IRNested` that is rendered as a sub-selection inside this one,
+        enabling arbitrarily deep but cycle-free relation trees.
     """
 
     relation: str
     target: str
     fields: list[str] = field(default_factory=list)
     filters: list[IRFilter] = field(default_factory=list)
+    children: list["IRNested"] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -418,11 +423,13 @@ def _join_from_dict(d: dict[str, Any]) -> IRJoin:
 def _nested_from_dict(d: dict[str, Any]) -> IRNested:
     raw_filters = d.get("filters", d.get("args", {}))
     flat_filters, _ = _split_filters(raw_filters if isinstance(raw_filters, dict) else {})
+    children = [_nested_from_dict(child) for child in d.get("nested", []) if isinstance(child, dict)]
     return IRNested(
         relation=str(d.get("relation", d.get("name", ""))),
         target=str(d.get("target", d.get("entity", ""))),
         fields=list(d.get("fields") or []),
         filters=flat_filters,
+        children=children,
     )
 
 
