@@ -178,7 +178,7 @@ Operational notes:
 | Advanced filters (`not`, `!=`, ranges, grouped precedence) | Yes | Yes |
 | Order parsing (`latest/highest/lowest`) | Yes | Yes |
 | Pagination (`limit`, `offset`, `first`, `after`) | Yes | Yes |
-| Nested/relation safety | Yes | Yes |
+| Nested/relation safety | **Recursive (up to 3 hops, cycle-safe)** | Yes |
 | **JOIN ON-clause column validation** | — | **Yes** |
 | Async generation (`agenerate`, `agenerate_many`) | Yes | Yes |
 | Structural execution match (no backend) | Yes | Yes |
@@ -906,7 +906,8 @@ result = service.generate(
 
 Behavior:
 
-- Detects nested intents (e.g. `latest order total`) and emits nested selections.
+- Detects nested intents (e.g. `latest order total`) and emits nested selections **recursively up to 3 relation hops** (configurable via `max_depth`).
+- Cycle-safe: if the schema has back-edges (e.g. `user → posts → user`), the traversal stops at the repeated entity — no infinite loops.
 - Validates entity, fields, and args against schema before returning query.
 - Drops invalid fields/args and records notes in `result.metadata["validation_notes"]`.
 
@@ -1143,8 +1144,11 @@ python -m twine check dist/*
 - `text2ql.core.Text2QL`: orchestrator/facade — `generate()`, `agenerate()`, `agenerate_many()`.
 - `text2ql.types`: request/result schemas (`QueryRequest`, `QueryResult`, `ValidationError`).
 - `text2ql.ir`: abstract IR layer — `QueryIR`, `IRFilter`, `IRJoin`, `IRNested`, `IRAggregation`, `IRRenderer`.
+- `text2ql.filters`: shared compiled regex singletons and stateless helpers (`detect_comparison_filters`, `detect_negation_filters`, `detect_between_filters`, `detect_in_filters`, `detect_date_range_filters`) — imported by both engines to eliminate regex duplication.
 - `text2ql.engines.*`: per-target query generators — each exposes both `generate()` and `agenerate()`.
   - `strict_validation=True` raises `ValidationError` on contradictory filters or invalid JOIN ON-clause columns.
+  - Entity detection is schema-driven; falls back to generic text extraction (no hardcoded domain lists).
+  - GraphQL nested detection is recursive (up to `max_depth=3` hops) with cycle prevention.
 - `text2ql.engines.base.compute_deterministic_confidence`: runtime confidence scoring (schema, entity, fields, filters, validation).
 - `text2ql.providers.*`: pluggable LLM provider adapters — implement `complete()`, get `acomplete()` for free (or override for native async).
   - `complete_structured()` / `acomplete_structured()` for function-calling / structured output mode.
