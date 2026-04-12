@@ -148,6 +148,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable schema-aware LLM utterance rewrite before query generation.",
     )
     parser.add_argument(
+        "--benchmark",
+        default="",
+        choices=["", "spider", "bird"],
+        help="Run a standard benchmark (spider or bird) and print report.",
+    )
+    parser.add_argument(
+        "--benchmark-path",
+        default="",
+        help="Path to the benchmark dataset root directory.",
+    )
+    parser.add_argument(
+        "--benchmark-split",
+        default="dev",
+        help="Benchmark split to evaluate (dev, train).",
+    )
+    parser.add_argument(
+        "--benchmark-limit",
+        type=int,
+        default=0,
+        help="Limit the number of benchmark examples (0 = all).",
+    )
+    parser.add_argument(
+        "--benchmark-db",
+        default="",
+        help="Only evaluate benchmark examples for this db_id.",
+    )
+    parser.add_argument(
+        "--benchmark-mode",
+        default="execution",
+        choices=["exact", "structural", "execution"],
+        help="Benchmark evaluation mode.",
+    )
+    parser.add_argument(
+        "--benchmark-verbose",
+        action="store_true",
+        help="Show per-example failure details in benchmark report.",
+    )
+    parser.add_argument(
         "--expected-query",
         default="",
         help="Expected query for execution-match evaluation.",
@@ -217,8 +255,12 @@ def main() -> None:
         _emit_json_output(mapping, args.mapping_output_file)
         return
 
+    if args.benchmark:
+        _run_benchmark_from_args(args)
+        return
+
     if not args.text.strip():
-        parser.error("text is required unless --generate-hybrid-mapping is used")
+        parser.error("text is required unless --generate-hybrid-mapping or --benchmark is used")
 
     schema = _load_json_object(args.schema, args.schema_file)
     mapping = _load_json_object(args.mapping, args.mapping_file)
@@ -254,6 +296,68 @@ def main() -> None:
         "execution_accuracy": (execution_matches / execution_total) if execution_total else 0.0,
     }
     print(json.dumps({"results": results, "summary": summary}, indent=2))
+
+
+def _run_benchmark_from_args(args: argparse.Namespace) -> None:
+    """Load and run a Spider or BIRD benchmark from CLI args."""
+    from text2ql.benchmarks.runner import BenchmarkConfig, format_report, run_benchmark
+
+    if not args.benchmark_path:
+        print("error: --benchmark-path is required when using --benchmark", file=sys.stderr)
+        sys.exit(1)
+
+    limit = args.benchmark_limit if args.benchmark_limit > 0 else None
+    db_filter = args.benchmark_db or None
+
+    if args.benchmark == "spider":
+        from text2ql.benchmarks.spider import load_spider
+
+        examples = load_spider(
+            args.benchmark_path,
+            split=args.benchmark_split,
+            limit=limit,
+            db_filter=db_filter,
+        )
+    elif args.benchmark == "bird":
+        from text2ql.benchmarks.bird import load_bird
+
+        examples = load_bird(
+            args.benchmark_path,
+            split=args.benchmark_split,
+            limit=limit,
+            db_filter=db_filter,
+        )
+    else:
+        print(f"error: unknown benchmark '{args.benchmark}'", file=sys.stderr)
+        sys.exit(1)
+
+    if not examples:
+        print("No benchmark examples loaded. Check --benchmark-path and filters.", file=sys.stderr)
+        sys.exit(1)
+
+    service = Text2QL(provider=_build_provider(args))
+    config = BenchmarkConfig(
+        mode=args.benchmark_mode,
+        service=service,
+    )
+
+    print(f"Running {args.benchmark.upper()} benchmark ({len(examples)} examples, mode={args.benchmark_mode})...", file=sys.stderr)
+    report = run_benchmark(examples, config=config)
+    print(format_report(report, verbose=args.benchmark_verbose))
+
+    # Also emit machine-readable JSON summary to stdout
+    summary = {
+        "benchmark": report.benchmark,
+        "split": report.split,
+        "total": report.total,
+        "exact_match_accuracy": report.exact_match_accuracy,
+        "structural_accuracy": report.structural_accuracy,
+        "execution_accuracy": report.execution_accuracy,
+        "errors": report.errors,
+        "elapsed_seconds": round(report.elapsed_seconds, 2),
+        "accuracy_by_difficulty": report.accuracy_by_difficulty,
+    }
+    print(json.dumps(summary, indent=2))
 
 
 def _resolve_generation_schema_mapping(
