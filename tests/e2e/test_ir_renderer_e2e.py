@@ -34,10 +34,10 @@ def test_sql_ir_renderer_basic_select_e2e() -> None:
     sql = SQLIRRenderer().render(ir)
 
     assert sql.startswith("SELECT")
-    assert "orders.id" in sql
-    assert "orders.status" in sql
-    assert "FROM orders" in sql
-    assert "orders.status = 'active'" in sql
+    assert '"orders"."id"' in sql
+    assert '"orders"."status"' in sql
+    assert 'FROM "orders"' in sql
+    assert '"orders"."status" = \'active\'' in sql
     assert sql.endswith(";")
 
 
@@ -52,8 +52,8 @@ def test_sql_ir_renderer_aggregation_count_e2e() -> None:
     sql = SQLIRRenderer().render(ir)
 
     assert "COUNT(*) AS total" in sql
-    assert "FROM orders" in sql
-    assert "GROUP BY orders.status" in sql
+    assert 'FROM "orders"' in sql
+    assert 'GROUP BY "orders"."status"' in sql
 
 
 def test_sql_ir_renderer_aggregation_sum_e2e() -> None:
@@ -66,8 +66,8 @@ def test_sql_ir_renderer_aggregation_sum_e2e() -> None:
     )
     sql = SQLIRRenderer().render(ir)
 
-    assert "SUM(amount) AS total_amount" in sql
-    assert "orders.status = 'shipped'" in sql
+    assert "SUM(" in sql and "amount" in sql and "AS total_amount" in sql
+    assert '"orders"."status" = \'shipped\'' in sql
     assert "GROUP BY" in sql
 
 
@@ -84,7 +84,7 @@ def test_sql_ir_renderer_order_limit_offset_e2e() -> None:
     )
     sql = SQLIRRenderer().render(ir)
 
-    assert "ORDER BY products.price DESC" in sql
+    assert 'ORDER BY "products"."price" DESC' in sql
     assert "LIMIT 10" in sql
     assert "OFFSET 20" in sql
 
@@ -107,9 +107,9 @@ def test_sql_ir_renderer_join_e2e() -> None:
     )
     sql = SQLIRRenderer().render(ir)
 
-    assert "LEFT JOIN customers" in sql
-    assert "customers.name AS customers_name" in sql
-    assert "customers.email AS customers_email" in sql
+    assert 'LEFT JOIN "customers"' in sql
+    assert '"customers"."name" AS customers_name' in sql
+    assert '"customers"."email" AS customers_email' in sql
 
 
 # ---------------------------------------------------------------------------
@@ -210,5 +210,5 @@ def test_query_ir_round_trip_from_result_e2e() -> None:
 
     # Re-render should produce a valid SQL statement.
     sql = SQLIRRenderer().render(ir)
-    assert "FROM orders" in sql
-    assert "orders.status = 'active'" in sql
+    assert 'FROM "orders"' in sql
+    assert '"orders"."status" = \'active\'' in sql

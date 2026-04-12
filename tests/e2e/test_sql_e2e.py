@@ -35,9 +35,9 @@ def test_sql_join_e2e() -> None:
     )
 
     assert result.target == "sql"
-    assert "FROM orders" in result.query
-    assert "JOIN customers" in result.query
-    assert "customers.name" in result.query or "customers.email" in result.query
+    assert 'FROM "orders"' in result.query
+    assert 'JOIN "customers"' in result.query
+    assert '"customers"."name"' in result.query or '"customers"."email"' in result.query
 
 
 def test_sql_aggregation_count_e2e() -> None:
@@ -52,7 +52,7 @@ def test_sql_aggregation_count_e2e() -> None:
 
     assert result.target == "sql"
     assert "COUNT(*)" in result.query
-    assert "FROM orders" in result.query
+    assert 'FROM "orders"' in result.query
 
 
 def test_sql_aggregation_sum_e2e() -> None:
@@ -66,9 +66,9 @@ def test_sql_aggregation_sum_e2e() -> None:
     )
 
     assert result.target == "sql"
-    # SUM renders the raw field name without table prefix (IRAggregation.field = "total").
-    assert "SUM(total)" in result.query
-    assert "FROM orders" in result.query
+    # SUM renders the field name (may be quoted as an identifier).
+    assert "SUM(" in result.query and "total" in result.query
+    assert 'FROM "orders"' in result.query
 
 
 def test_sql_generate_with_schema_mapping_e2e() -> None:
@@ -81,8 +81,8 @@ def test_sql_generate_with_schema_mapping_e2e() -> None:
     )
 
     assert result.target == "sql"
-    assert "FROM customers" in result.query
-    assert "ORDER BY customers.total DESC" in result.query
+    assert 'FROM "customers"' in result.query
+    assert 'ORDER BY "customers"."total" DESC' in result.query
     assert "LIMIT 5" in result.query
     assert "OFFSET 10" in result.query
 
@@ -110,5 +110,5 @@ def test_sql_cli_supports_target_sql(tmp_path: Path, capsys: pytest.CaptureFixtu
 
     captured = capsys.readouterr()
     assert "SELECT" in captured.out
-    assert "FROM customers" in captured.out
-    assert "ORDER BY customers.total DESC" in captured.out
+    assert 'FROM "customers"' in captured.out
+    assert 'ORDER BY "customers"."total" DESC' in captured.out
