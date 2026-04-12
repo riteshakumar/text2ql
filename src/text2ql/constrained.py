@@ -238,10 +238,13 @@ def _load_intent_payload(raw: str) -> dict[str, Any]:
 
 
 def _extract_fenced_json(raw: str) -> str | None:
-    match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", raw, flags=re.S | re.I)
+    # Non-greedy outer match captures only the FIRST fenced block; delegate to
+    # _extract_first_json_object so nested braces are handled correctly instead
+    # of the greedy {.*} pattern spanning across multiple code blocks.
+    match = re.search(r"```(?:json)?\s*(.*?)\s*```", raw, flags=re.S | re.I)
     if not match:
         return None
-    return match.group(1).strip()
+    return _extract_first_json_object(match.group(1))
 
 
 def _extract_first_json_object(raw: str) -> str | None:

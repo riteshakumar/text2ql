@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from abc import ABC, abstractmethod
 from typing import Any
 
 from text2ql.schema_config import NormalizedSchemaConfig
 from text2ql.types import QueryRequest, QueryResult
+
+logger = logging.getLogger(__name__)
 
 
 class QueryEngine(ABC):
@@ -19,6 +22,17 @@ class QueryEngine(ABC):
     async def agenerate(self, request: QueryRequest) -> QueryResult:
         """Async generate — default runs sync generate in a thread pool."""
         return await asyncio.to_thread(self.generate, request)
+
+    @staticmethod
+    def _apply_system_context(system_prompt: str, context: dict[str, Any]) -> str:
+        """Append optional caller-supplied system context to the base system prompt."""
+        extra = context.get("system_context")
+        if not isinstance(extra, str):
+            return system_prompt
+        cleaned = extra.strip()
+        if not cleaned:
+            return system_prompt
+        return f"{system_prompt}\n\nAdditional system context:\n{cleaned}"
 
     @staticmethod
     def _extract_entity_from_text(lowered: str) -> str:

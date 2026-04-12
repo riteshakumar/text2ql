@@ -174,10 +174,13 @@ class OpenAICompatibleProvider(LLMProvider):
             )
             return self.complete(system_prompt, user_prompt)
 
-    async def acomplete(self, system_prompt: str, user_prompt: str) -> str:
-        """Async completion with non-blocking retries — no thread held during backoff."""
-        logger.debug("acomplete(): model=%s", self.model)
-        request = self._build_request(system_prompt, user_prompt)
+    async def _aretry_request(self, request: urllib.request.Request) -> str:
+        """Execute an HTTP request asynchronously with retry/backoff logic.
+
+        Shared by :meth:`acomplete` and :meth:`acomplete_structured` to avoid
+        duplicating the retry loop.  Raises :exc:`RuntimeError` when all
+        attempts are exhausted.
+        """
         attempts = self.max_retries + 1
         last_error: Exception | None = None
 
@@ -186,12 +189,12 @@ class OpenAICompatibleProvider(LLMProvider):
                 raw = await asyncio.to_thread(
                     urllib.request.urlopen, request, self.timeout_seconds
                 )
-                return self._parse_response(raw.read().decode("utf-8"))
+                return raw.read().decode("utf-8")
             except urllib.error.HTTPError as exc:
                 last_error = exc
                 if exc.code != 429 or attempt == attempts - 1:
                     logger.warning(
-                        "acomplete(): HTTP %d on attempt %d/%d",
+                        "_aretry_request(): HTTP %d on attempt %d/%d",
                         exc.code,
                         attempt + 1,
                         attempts,
@@ -200,7 +203,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 retry_after = exc.headers.get("Retry-After")
                 delay = self._retry_delay(attempt, retry_after)
                 logger.warning(
-                    "acomplete(): rate-limited (429) on attempt %d/%d; "
+                    "_aretry_request(): rate-limited (429) on attempt %d/%d; "
                     "retrying in %.1fs",
                     attempt + 1,
                     attempts,
@@ -211,14 +214,14 @@ class OpenAICompatibleProvider(LLMProvider):
                 last_error = exc
                 if attempt == attempts - 1:
                     logger.error(
-                        "acomplete(): network error on final attempt %d: %s",
+                        "_aretry_request(): network error on final attempt %d: %s",
                         attempt + 1,
                         exc,
                     )
                     break
                 delay = self._retry_delay(attempt, None)
                 logger.warning(
-                    "acomplete(): network error on attempt %d/%d; retrying in %.1fs: %s",
+                    "_aretry_request(): network error on attempt %d/%d; retrying in %.1fs: %s",
                     attempt + 1,
                     attempts,
                     delay,
@@ -227,6 +230,13 @@ class OpenAICompatibleProvider(LLMProvider):
                 await asyncio.sleep(delay)
 
         raise RuntimeError(f"LLM provider request failed: {last_error}") from last_error
+
+    async def acomplete(self, system_prompt: str, user_prompt: str) -> str:
+        """Async completion with non-blocking retries — no thread held during backoff."""
+        logger.debug("acomplete(): model=%s", self.model)
+        request = self._build_request(system_prompt, user_prompt)
+        raw = await self._aretry_request(request)
+        return self._parse_response(raw)
 
     async def acomplete_structured(
         self,
@@ -244,27 +254,9 @@ class OpenAICompatibleProvider(LLMProvider):
         )
         try:
             request = self._build_structured_request(system_prompt, user_prompt, json_schema)
-            attempts = self.max_retries + 1
-            last_error: Exception | None = None
-            for attempt in range(attempts):
-                try:
-                    raw = await asyncio.to_thread(
-                        urllib.request.urlopen, request, self.timeout_seconds
-                    )
-                    return self._parse_response(raw.read().decode("utf-8"))
-                except urllib.error.HTTPError as exc:
-                    last_error = exc
-                    if exc.code != 429 or attempt == attempts - 1:
-                        break
-                    retry_after = exc.headers.get("Retry-After")
-                    await asyncio.sleep(self._retry_delay(attempt, retry_after))
-                except urllib.error.URLError as exc:
-                    last_error = exc
-                    if attempt == attempts - 1:
-                        break
-                    await asyncio.sleep(self._retry_delay(attempt, None))
-            raise RuntimeError(f"LLM provider structured request failed: {last_error}") from last_error
-        except (RuntimeError, urllib.error.HTTPError) as exc:
+            raw = await self._aretry_request(request)
+            return self._parse_response(raw)
+        except (RuntimeError, urllib.error.URLError) as exc:
             logger.warning(
                 "acomplete_structured(): falling back to plain acomplete(): %s", exc
             )

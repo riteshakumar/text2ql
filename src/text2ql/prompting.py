@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from text2ql.schema_config import NormalizedSchemaConfig
 
@@ -53,6 +56,13 @@ Field mapping aliases:
 Filter mapping aliases:
 {filter_aliases}
 """
+
+# Maximum number of entities/fields/aliases to include per prompt.  Large
+# schemas would otherwise exceed the model's context window and cause silent
+# truncation or an API error that falls through to deterministic mode.
+_MAX_PROMPT_ENTITIES = 50
+_MAX_PROMPT_FIELDS = 100
+_MAX_PROMPT_ALIASES = 100
 
 SUPPORTED_PROMPT_LANGUAGES = {"english"}
 _LANGUAGE_ALIASES = {
@@ -185,13 +195,31 @@ def build_graphql_prompts(
     resolved_language = resolve_language(language)
     entities = config.entities or ["user", "customer", "order", "product", "items"]
     fields = config.fields or ["id", "name", "title", "email", "status", "price"]
+    field_aliases = config.field_aliases
+    filter_aliases = config.filter_key_aliases
+    if len(entities) > _MAX_PROMPT_ENTITIES:
+        logger.warning(
+            "build_graphql_prompts: truncating entities from %d to %d",
+            len(entities), _MAX_PROMPT_ENTITIES,
+        )
+        entities = entities[:_MAX_PROMPT_ENTITIES]
+    if len(fields) > _MAX_PROMPT_FIELDS:
+        logger.warning(
+            "build_graphql_prompts: truncating fields from %d to %d",
+            len(fields), _MAX_PROMPT_FIELDS,
+        )
+        fields = fields[:_MAX_PROMPT_FIELDS]
+    if len(field_aliases) > _MAX_PROMPT_ALIASES:
+        field_aliases = dict(list(field_aliases.items())[:_MAX_PROMPT_ALIASES])
+    if len(filter_aliases) > _MAX_PROMPT_ALIASES:
+        filter_aliases = dict(list(filter_aliases.items())[:_MAX_PROMPT_ALIASES])
     user_template = template or ENGLISH_GRAPHQL_USER_TEMPLATE
     user_prompt = user_template.format(
         text=text.strip(),
         entities=json.dumps(entities),
         fields=json.dumps(fields),
-        field_aliases=json.dumps(config.field_aliases),
-        filter_aliases=json.dumps(config.filter_key_aliases),
+        field_aliases=json.dumps(field_aliases),
+        filter_aliases=json.dumps(filter_aliases),
     )
     if resolved_language != "english":
         # Future extension point once additional languages are introduced.
@@ -208,13 +236,31 @@ def build_sql_prompts(
     resolved_language = resolve_language(language)
     entities = config.entities or ["users", "customers", "orders", "products", "items"]
     fields = config.fields or ["id", "name", "createdAt", "status", "price", "amount"]
+    field_aliases = config.field_aliases
+    filter_aliases = config.filter_key_aliases
+    if len(entities) > _MAX_PROMPT_ENTITIES:
+        logger.warning(
+            "build_sql_prompts: truncating entities from %d to %d",
+            len(entities), _MAX_PROMPT_ENTITIES,
+        )
+        entities = entities[:_MAX_PROMPT_ENTITIES]
+    if len(fields) > _MAX_PROMPT_FIELDS:
+        logger.warning(
+            "build_sql_prompts: truncating fields from %d to %d",
+            len(fields), _MAX_PROMPT_FIELDS,
+        )
+        fields = fields[:_MAX_PROMPT_FIELDS]
+    if len(field_aliases) > _MAX_PROMPT_ALIASES:
+        field_aliases = dict(list(field_aliases.items())[:_MAX_PROMPT_ALIASES])
+    if len(filter_aliases) > _MAX_PROMPT_ALIASES:
+        filter_aliases = dict(list(filter_aliases.items())[:_MAX_PROMPT_ALIASES])
     user_template = template or ENGLISH_SQL_USER_TEMPLATE
     user_prompt = user_template.format(
         text=text.strip(),
         entities=json.dumps(entities),
         fields=json.dumps(fields),
-        field_aliases=json.dumps(config.field_aliases),
-        filter_aliases=json.dumps(config.filter_key_aliases),
+        field_aliases=json.dumps(field_aliases),
+        filter_aliases=json.dumps(filter_aliases),
     )
     if resolved_language != "english":
         raise ValueError(f"Unsupported prompt language '{language}'")

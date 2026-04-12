@@ -64,19 +64,17 @@ class SQLEngine(QueryEngine):
     ) -> None:
         self.provider = provider
         self.strict_validation = strict_validation
-        self._last_llm_error: str | None = None
 
     def generate(self, request: QueryRequest) -> QueryResult:
         prompt = request.text.strip()
         config = normalize_schema_config(request.schema, request.mapping)
         mode = str(request.context.get("mode", "deterministic")).strip().lower()
         llm_error: str | None = None
-        self._last_llm_error = None
         if mode in {"llm", "function_calling"} and self.provider is not None:
-            llm_result = self._generate_with_llm(prompt, config, request.context, mode=mode)
+            llm_result, llm_error = self._generate_with_llm(prompt, config, request.context, mode=mode)
             if llm_result is not None:
                 return llm_result
-            llm_error = self._last_llm_error or "LLM mode fallback to deterministic mode."
+            llm_error = llm_error or "LLM mode fallback to deterministic mode."
         lowered = prompt.lower()
 
         table = self._detect_table(lowered, config)
@@ -178,6 +176,11 @@ class SQLEngine(QueryEngine):
         try:
             resolved_language = resolve_language(language)
         except ValueError:
+            logger.warning(
+                "SQLEngine: unsupported language %r; falling back to deterministic mode. "
+                "Supported languages: english",
+                language,
+            )
             return None
         system_prompt, user_prompt = build_sql_prompts(prompt, config, template, language=resolved_language)
         return self._apply_system_context(system_prompt, context), user_prompt, resolved_language
@@ -188,14 +191,14 @@ class SQLEngine(QueryEngine):
         prompt: str,
         config: Any,
         resolved_language: str,
-    ) -> QueryResult | None:
-        """Parse raw LLM output and assemble a QueryResult, or return None on parse error."""
+    ) -> tuple[QueryResult | None, str | None]:
+        """Parse raw LLM output and assemble a QueryResult, or return (None, error) on failure."""
         try:
             intent = parse_sql_intent(raw, config, language=resolved_language)
         except ConstrainedOutputError as exc:
-            self._last_llm_error = f"LLM output parse error: {exc}"
-            logger.warning("SQLEngine: LLM output parse error: %s", exc)
-            return None
+            error = f"LLM output parse error: {exc}"
+            logger.warning("SQLEngine: %s", error)
+            return None, error
 
         table, columns, filters = self._reconcile_owned_asset_intent(
             prompt=prompt,
@@ -219,10 +222,19 @@ class SQLEngine(QueryEngine):
             exact_filter_keys=exact_filter_keys,
             aggregations=aggregations,
         )
+        # Use calibrated schema-aware confidence instead of the LLM's self-report.
+        confidence = compute_deterministic_confidence(
+            entity=table,
+            fields=columns,
+            filters=filters,
+            validation_notes=notes,
+            config=config,
+            extra_signals={"joins": joins, "order_by": order_by, "aggregations": aggregations},
+        )
         return QueryResult(
             query=query,
             target="sql",
-            confidence=intent.confidence,
+            confidence=confidence,
             explanation=intent.explanation,
             metadata={
                 "table": table,
@@ -249,9 +261,10 @@ class SQLEngine(QueryEngine):
                 "mode": "llm",
                 "language": resolved_language,
                 "raw_completion": raw,
+                "llm_confidence": intent.confidence,
                 "validation_notes": notes,
             },
-        )
+        ), None
 
     def _generate_with_llm(
         self,
@@ -259,10 +272,10 @@ class SQLEngine(QueryEngine):
         config: Any,
         context: dict[str, Any],
         mode: str = "llm",
-    ) -> QueryResult | None:
+    ) -> tuple[QueryResult | None, str | None]:
         prepared = self._prepare_llm_prompts(prompt, config, context)
         if prepared is None:
-            return None
+            return None, "Failed to prepare LLM prompts (invalid language or template)."
         system_prompt, user_prompt, resolved_language = prepared
         use_fc = mode == "function_calling"
         logger.debug("SQLEngine: calling LLM provider (sync, function_calling=%s)", use_fc)
@@ -276,9 +289,9 @@ class SQLEngine(QueryEngine):
             else:
                 raw = self.provider.complete(system_prompt=system_prompt, user_prompt=user_prompt)
         except (RuntimeError, ValueError, TypeError) as exc:
-            self._last_llm_error = f"LLM provider error: {exc}"
-            logger.warning("SQLEngine: LLM provider error: %s", exc)
-            return None
+            error = f"LLM provider error: {exc}"
+            logger.warning("SQLEngine: %s", error)
+            return None, error
         return self._build_llm_result(raw, prompt, config, resolved_language)
 
     async def _agenerate_with_llm(
@@ -287,10 +300,10 @@ class SQLEngine(QueryEngine):
         config: Any,
         context: dict[str, Any],
         mode: str = "llm",
-    ) -> QueryResult | None:
+    ) -> tuple[QueryResult | None, str | None]:
         prepared = self._prepare_llm_prompts(prompt, config, context)
         if prepared is None:
-            return None
+            return None, "Failed to prepare LLM prompts (invalid language or template)."
         system_prompt, user_prompt, resolved_language = prepared
         use_fc = mode == "function_calling"
         logger.debug("SQLEngine: calling LLM provider (async, function_calling=%s)", use_fc)
@@ -306,9 +319,9 @@ class SQLEngine(QueryEngine):
                     system_prompt=system_prompt, user_prompt=user_prompt
                 )
         except (RuntimeError, ValueError, TypeError) as exc:
-            self._last_llm_error = f"LLM provider error: {exc}"
-            logger.warning("SQLEngine: async LLM provider error: %s", exc)
-            return None
+            error = f"LLM provider error: {exc}"
+            logger.warning("SQLEngine: async LLM provider error: %s", error)
+            return None, error
         return self._build_llm_result(raw, prompt, config, resolved_language)
 
     async def agenerate(self, request: QueryRequest) -> QueryResult:
@@ -316,12 +329,13 @@ class SQLEngine(QueryEngine):
         prompt = request.text.strip()
         config = normalize_schema_config(request.schema, request.mapping)
         mode = str(request.context.get("mode", "deterministic")).strip().lower()
-        self._last_llm_error = None
 
+        llm_error: str | None = None
         if mode in {"llm", "function_calling"} and self.provider is not None:
-            llm_result = await self._agenerate_with_llm(prompt, config, request.context, mode=mode)
+            llm_result, llm_error = await self._agenerate_with_llm(prompt, config, request.context, mode=mode)
             if llm_result is not None:
                 return llm_result
+            llm_error = llm_error or "LLM mode fallback to deterministic mode."
 
         # Deterministic path is pure CPU — safe to run inline in async context
         det_request = QueryRequest(
@@ -331,7 +345,10 @@ class SQLEngine(QueryEngine):
             mapping=request.mapping,
             context={**request.context, "mode": "deterministic"},
         )
-        return self.generate(det_request)
+        det_result = self.generate(det_request)
+        if llm_error:
+            det_result.metadata["llm_error"] = llm_error
+        return det_result
 
     def _reconcile_owned_asset_intent(
         self,
@@ -369,16 +386,6 @@ class SQLEngine(QueryEngine):
             resolved_columns = preferred or table_columns[:2]
         return resolved_table, resolved_columns, resolved_filters
 
-    @staticmethod
-    def _apply_system_context(system_prompt: str, context: dict[str, Any]) -> str:
-        extra = context.get("system_context")
-        if not isinstance(extra, str):
-            return system_prompt
-        cleaned = extra.strip()
-        if not cleaned:
-            return system_prompt
-        return f"{system_prompt}\n\nAdditional system context:\n{cleaned}"
-
     def _materialize_llm_joins(
         self,
         payload_joins: list[dict[str, Any]],
@@ -391,6 +398,11 @@ class SQLEngine(QueryEngine):
             relation_name = str(item.get("relation", "")).strip()
             relation = relation_map.get(relation_name)
             if relation is None:
+                logger.warning(
+                    "SQLEngine: LLM requested unknown relation %r for table %r; skipping join.",
+                    relation_name,
+                    table,
+                )
                 continue
             alias = str(item.get("alias", relation.name)).strip() or relation.name
             fields = [str(field) for field in item.get("fields", relation.fields[:1]) if str(field).strip()]

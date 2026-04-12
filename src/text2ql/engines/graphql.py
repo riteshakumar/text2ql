@@ -64,20 +64,18 @@ class GraphQLEngine(QueryEngine):
     ) -> None:
         self.provider = provider
         self.strict_validation = strict_validation
-        self._last_llm_error: str | None = None
 
     def generate(self, request: QueryRequest) -> QueryResult:
         prompt = request.text.strip()
         config = normalize_schema_config(request.schema, request.mapping)
         mode = str(request.context.get("mode", "deterministic")).strip().lower()
         llm_error: str | None = None
-        self._last_llm_error = None
 
         if mode in {"llm", "function_calling"} and self.provider is not None:
-            llm_result = self._generate_with_llm(prompt, config, request.context, mode=mode)
+            llm_result, llm_error = self._generate_with_llm(prompt, config, request.context, mode=mode)
             if llm_result is not None:
                 return llm_result
-            llm_error = self._last_llm_error or "LLM mode fallback to deterministic mode."
+            llm_error = llm_error or "LLM mode fallback to deterministic mode."
 
         logger.debug("GraphQLEngine.generate: prompt=%r", prompt)
         entity = self._detect_entity(prompt, config)
@@ -143,6 +141,11 @@ class GraphQLEngine(QueryEngine):
         try:
             resolved_language = resolve_language(language)
         except ValueError:
+            logger.warning(
+                "GraphQLEngine: unsupported language %r; falling back to deterministic mode. "
+                "Supported languages: english",
+                language,
+            )
             return None
         system_prompt, user_prompt = build_graphql_prompts(
             prompt, config, template, language=resolved_language,
@@ -155,17 +158,15 @@ class GraphQLEngine(QueryEngine):
         prompt: str,
         config: NormalizedSchemaConfig,
         resolved_language: str,
-    ) -> QueryResult | None:
-        """Parse raw LLM output and assemble a QueryResult, or return None on parse error."""
+    ) -> tuple[QueryResult | None, str | None]:
+        """Parse raw LLM output and assemble a QueryResult, or return (None, error) on failure."""
         try:
             intent = parse_graphql_intent(raw, config, language=resolved_language)
         except ConstrainedOutputError as exc:
-            self._last_llm_error = f"LLM output parse error: {exc}"
-            logger.warning("GraphQLEngine: LLM output parse error: %s", exc)
-            return None
+            error = f"LLM output parse error: {exc}"
+            logger.warning("GraphQLEngine: %s", error)
+            return None, error
 
-        nested: list[dict[str, Any]] = []
-        aggregations: list[dict[str, str]] = []
         reconciled_entity, reconciled_fields, reconciled_filters = self._reconcile_owned_asset_intent(
             prompt=prompt,
             entity=intent.entity,
@@ -173,15 +174,29 @@ class GraphQLEngine(QueryEngine):
             filters=dict(intent.filters),
             config=config,
         )
+        # Detect aggregations and nested from the original prompt so LLM mode
+        # produces the same richness as deterministic mode.
+        aggregations = self._detect_aggregations(prompt, config, reconciled_entity)
+        nested = self._detect_nested(prompt, config, reconciled_entity)
         entity, fields, filters, aggregations, nested, validation_notes = self._validate_components(
             reconciled_entity, reconciled_fields, reconciled_filters, aggregations, nested, config,
         )
         query = self._build_query(entity, fields, filters, aggregations, nested)
         validation_notes.extend(self._validate_generated_query_against_introspection(query, config))
+        # Use calibrated schema-aware confidence instead of the LLM's self-report,
+        # which is an uncalibrated guess that produces incomparable scores across modes.
+        confidence = compute_deterministic_confidence(
+            entity=entity,
+            fields=fields,
+            filters=filters,
+            validation_notes=validation_notes,
+            config=config,
+            extra_signals={"aggregations": aggregations, "nested": nested},
+        )
         return QueryResult(
             query=query,
             target="graphql",
-            confidence=intent.confidence,
+            confidence=confidence,
             explanation=intent.explanation,
             metadata={
                 "entity": entity,
@@ -192,9 +207,10 @@ class GraphQLEngine(QueryEngine):
                 "mode": "llm",
                 "language": resolved_language,
                 "raw_completion": raw,
+                "llm_confidence": intent.confidence,
                 "validation_notes": validation_notes,
             },
-        )
+        ), None
 
     def _generate_with_llm(
         self,
@@ -202,10 +218,10 @@ class GraphQLEngine(QueryEngine):
         config: NormalizedSchemaConfig,
         context: dict,
         mode: str = "llm",
-    ) -> QueryResult | None:
+    ) -> tuple[QueryResult | None, str | None]:
         prepared = self._prepare_llm_prompts(prompt, config, context)
         if prepared is None:
-            return None
+            return None, "Failed to prepare LLM prompts (invalid language or template)."
         system_prompt, user_prompt, resolved_language = prepared
         use_fc = mode == "function_calling"
         logger.debug(
@@ -221,9 +237,9 @@ class GraphQLEngine(QueryEngine):
             else:
                 raw = self.provider.complete(system_prompt=system_prompt, user_prompt=user_prompt)
         except (RuntimeError, ValueError, TypeError) as exc:
-            self._last_llm_error = f"LLM provider error: {exc}"
-            logger.warning("GraphQLEngine: LLM provider error: %s", exc)
-            return None
+            error = f"LLM provider error: {exc}"
+            logger.warning("GraphQLEngine: %s", error)
+            return None, error
         return self._build_llm_result(raw, prompt, config, resolved_language)
 
     async def _agenerate_with_llm(
@@ -232,10 +248,10 @@ class GraphQLEngine(QueryEngine):
         config: NormalizedSchemaConfig,
         context: dict,
         mode: str = "llm",
-    ) -> QueryResult | None:
+    ) -> tuple[QueryResult | None, str | None]:
         prepared = self._prepare_llm_prompts(prompt, config, context)
         if prepared is None:
-            return None
+            return None, "Failed to prepare LLM prompts (invalid language or template)."
         system_prompt, user_prompt, resolved_language = prepared
         use_fc = mode == "function_calling"
         logger.debug(
@@ -253,9 +269,9 @@ class GraphQLEngine(QueryEngine):
                     system_prompt=system_prompt, user_prompt=user_prompt
                 )
         except (RuntimeError, ValueError, TypeError) as exc:
-            self._last_llm_error = f"LLM provider error: {exc}"
-            logger.warning("GraphQLEngine: async LLM provider error: %s", exc)
-            return None
+            error = f"LLM provider error: {exc}"
+            logger.warning("GraphQLEngine: async LLM provider error: %s", error)
+            return None, error
         return self._build_llm_result(raw, prompt, config, resolved_language)
 
     async def agenerate(self, request: QueryRequest) -> QueryResult:
@@ -263,12 +279,13 @@ class GraphQLEngine(QueryEngine):
         prompt = request.text.strip()
         config = normalize_schema_config(request.schema, request.mapping)
         mode = str(request.context.get("mode", "deterministic")).strip().lower()
-        self._last_llm_error = None
 
+        llm_error: str | None = None
         if mode in {"llm", "function_calling"} and self.provider is not None:
-            llm_result = await self._agenerate_with_llm(prompt, config, request.context, mode=mode)
+            llm_result, llm_error = await self._agenerate_with_llm(prompt, config, request.context, mode=mode)
             if llm_result is not None:
                 return llm_result
+            llm_error = llm_error or "LLM mode fallback to deterministic mode."
 
         # Deterministic path is pure CPU — safe to run inline in async context
         det_request = QueryRequest(
@@ -278,7 +295,10 @@ class GraphQLEngine(QueryEngine):
             mapping=request.mapping,
             context={**request.context, "mode": "deterministic"},
         )
-        return self.generate(det_request)
+        det_result = self.generate(det_request)
+        if llm_error:
+            det_result.metadata["llm_error"] = llm_error
+        return det_result
 
     def _reconcile_owned_asset_intent(
         self,
@@ -320,16 +340,6 @@ class GraphQLEngine(QueryEngine):
         if not resolved_fields:
             resolved_fields = owned_fields or schema_fields[:2]
         return resolved_entity, resolved_fields, resolved_filters
-
-    @staticmethod
-    def _apply_system_context(system_prompt: str, context: dict[str, Any]) -> str:
-        extra = context.get("system_context")
-        if not isinstance(extra, str):
-            return system_prompt
-        cleaned = extra.strip()
-        if not cleaned:
-            return system_prompt
-        return f"{system_prompt}\n\nAdditional system context:\n{cleaned}"
 
     def _detect_entity(self, text: str, config: NormalizedSchemaConfig) -> str:
         lowered = text.lower()
