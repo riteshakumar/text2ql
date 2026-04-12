@@ -16,6 +16,8 @@ class GraphQLIntent:
     filters: dict[str, str]
     explanation: str
     confidence: float
+    aggregations: list[dict]
+    nested: list[dict]
 
 
 @dataclass(slots=True)
@@ -66,6 +68,19 @@ def parse_graphql_intent(
     if not isinstance(confidence, (int, float)):
         raise ConstrainedOutputError("Field 'confidence' must be a number")
 
+    aggregations = payload.get("aggregations", [])
+    if not isinstance(aggregations, list):
+        aggregations = []
+    aggregations = [
+        a for a in aggregations
+        if isinstance(a, dict) and "function" in a and "field" in a
+    ]
+
+    nested = payload.get("nested", [])
+    if not isinstance(nested, list):
+        nested = []
+    nested = [n for n in nested if isinstance(n, dict) and "relation" in n]
+
     canonical_entity = _canonicalize_entity(entity.strip(), config)
     canonical_fields = [_canonicalize_field(field.strip(), config) for field in fields]
     canonical_filters = {
@@ -74,6 +89,7 @@ def parse_graphql_intent(
         )
         for key, value in filters.items()
     }
+    canonical_filters = _expand_operator_filter_dicts(canonical_filters)
 
     normalized_confidence = max(0.0, min(1.0, float(confidence)))
     return GraphQLIntent(
@@ -82,6 +98,8 @@ def parse_graphql_intent(
         filters=canonical_filters,
         explanation=explanation,
         confidence=normalized_confidence,
+        aggregations=aggregations,
+        nested=nested,
     )
 
 

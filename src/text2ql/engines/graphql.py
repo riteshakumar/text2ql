@@ -174,10 +174,23 @@ class GraphQLEngine(QueryEngine):
             filters=dict(intent.filters),
             config=config,
         )
-        # Detect aggregations and nested from the original prompt so LLM mode
-        # produces the same richness as deterministic mode.
-        aggregations = self._detect_aggregations(prompt, config, reconciled_entity)
-        nested = self._detect_nested(prompt, config, reconciled_entity)
+        # Prefer LLM-provided aggregations; fall back to text detection.
+        if intent.aggregations:
+            aggregations = [
+                {
+                    "function": str(a.get("function", "COUNT")).upper(),
+                    "field": str(a.get("field", "*")),
+                    "alias": a.get("alias"),
+                }
+                for a in intent.aggregations
+            ]
+        else:
+            aggregations = self._detect_aggregations(prompt, config, reconciled_entity)
+        # Prefer LLM-provided nested relations; fall back to text detection.
+        if intent.nested:
+            nested = intent.nested
+        else:
+            nested = self._detect_nested(prompt, config, reconciled_entity)
         entity, fields, filters, aggregations, nested, validation_notes = self._validate_components(
             reconciled_entity, reconciled_fields, reconciled_filters, aggregations, nested, config,
         )

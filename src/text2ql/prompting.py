@@ -11,7 +11,14 @@ from text2ql.schema_config import NormalizedSchemaConfig
 ENGLISH_GRAPHQL_SYSTEM_PROMPT = (
     "You are a GraphQL intent extractor. Return only valid JSON with keys: "
     "entity (string), fields (array of strings), filters (object), "
-    "explanation (string), confidence (number in [0,1])."
+    "aggregations (array of objects with function and field), "
+    "nested (array of objects with relation and fields), "
+    "explanation (string), confidence (number in [0,1]). "
+    "For aggregations use: {\"function\": \"COUNT\", \"field\": \"*\"} or "
+    "{\"function\": \"SUM\", \"field\": \"amount\"}. "
+    "For filters with comparisons use suffix keys: age_gt (>), age_gte (>=), price_lt (<), price_lte (<=), field_ne (!=). "
+    "For nested relations use the exact relation name from the schema. "
+    "Example filter: {\"age_gt\": 20, \"status\": \"active\"}."
 )
 
 ENGLISH_SQL_SYSTEM_PROMPT = (
@@ -38,11 +45,20 @@ Available entities:
 Available fields:
 {fields}
 
+Available relations (for nested, use these exact relation names):
+{relations}
+
 Field mapping aliases:
 {field_aliases}
 
 Filter mapping aliases:
 {filter_aliases}
+
+Rules:
+- For filter comparisons use suffix keys: age_gt (>), age_gte (>=), price_lt (<), price_lte (<=), field_ne (!=)
+- For aggregations like COUNT, SUM, AVG, MIN, MAX — add them to the "aggregations" array
+- For nested relation fetches use the exact relation name from "Available relations"
+- fields should only list non-aggregated scalar fields
 """
 
 ENGLISH_SQL_USER_TEMPLATE = """Convert this request into SQL intent JSON.
@@ -104,12 +120,40 @@ GRAPHQL_INTENT_JSON_SCHEMA: dict = {
         "fields": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "Fields to select on the entity.",
+            "description": "Non-aggregated fields to select on the entity.",
         },
         "filters": {
             "type": "object",
             "additionalProperties": True,
-            "description": "Key-value filter arguments for the query.",
+            "description": "Key-value filter arguments. Use suffix keys for comparisons: age_gt, price_lte, field_ne.",
+        },
+        "aggregations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "function": {"type": "string", "enum": ["COUNT", "SUM", "AVG", "MIN", "MAX"]},
+                    "field": {"type": "string"},
+                    "alias": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                },
+                "required": ["function", "field"],
+                "additionalProperties": False,
+            },
+            "description": "Aggregation expressions like COUNT(*), SUM(amount).",
+        },
+        "nested": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "relation": {"type": "string"},
+                    "fields": {"type": "array", "items": {"type": "string"}},
+                    "filters": {"type": "object", "additionalProperties": True},
+                },
+                "required": ["relation"],
+                "additionalProperties": True,
+            },
+            "description": "Nested relation fetches. Use exact relation names from the schema.",
         },
         "explanation": {
             "type": "string",
@@ -122,7 +166,7 @@ GRAPHQL_INTENT_JSON_SCHEMA: dict = {
             "description": "Confidence score in [0, 1].",
         },
     },
-    "required": ["entity", "fields", "filters", "explanation", "confidence"],
+    "required": ["entity", "fields", "filters", "aggregations", "nested", "explanation", "confidence"],
     "additionalProperties": False,
 }
 
@@ -243,11 +287,21 @@ def build_graphql_prompts(
         field_aliases = dict(list(field_aliases.items())[:_MAX_PROMPT_ALIASES])
     if len(filter_aliases) > _MAX_PROMPT_ALIASES:
         filter_aliases = dict(list(filter_aliases.items())[:_MAX_PROMPT_ALIASES])
+
+    # Build relations dict: {entity: [relation_name, ...]}
+    relations_by_entity = getattr(config, "relations_by_entity", {})
+    relations: dict[str, list[str]] = {
+        ent: list(rel_map.keys())
+        for ent, rel_map in relations_by_entity.items()
+        if rel_map
+    }
+
     user_template = template or ENGLISH_GRAPHQL_USER_TEMPLATE
     user_prompt = user_template.format(
         text=text.strip(),
         entities=json.dumps(entities),
         fields=json.dumps(fields),
+        relations=json.dumps(relations),
         field_aliases=json.dumps(field_aliases),
         filter_aliases=json.dumps(filter_aliases),
     )
