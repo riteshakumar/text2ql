@@ -215,7 +215,15 @@ class SQLEngine(QueryEngine):
             order_by=order_by, order_dir=order_dir, config=config,
         )
         exact_filter_keys = self._allowed_filter_keys(config, table, set(columns))
-        aggregations = self._detect_aggregations(prompt.lower())
+        # Prefer LLM-provided aggregations; fall back to text detection
+        aggregations = [
+            {
+                "function": str(a.get("function", "COUNT")).upper(),
+                "field": str(a.get("field", "*")),
+                "alias": a.get("alias"),
+            }
+            for a in intent.aggregations
+        ] if intent.aggregations else self._detect_aggregations(prompt.lower())
         query = self._build_sql(
             table=table, columns=columns, filters=filters, joins=joins,
             order_by=order_by, order_dir=order_dir, limit=limit, offset=offset,
@@ -392,11 +400,38 @@ class SQLEngine(QueryEngine):
         config: Any,
         table: str,
     ) -> list[_RelationJoin]:
-        relation_map = config.relations_by_entity.get(table, {})
         joins: list[_RelationJoin] = []
         for item in payload_joins:
             relation_name = str(item.get("relation", "")).strip()
+            if not relation_name:
+                continue
+
+            relation = None
+            # 1. Direct lookup by relation name on primary table
+            relation_map = config.relations_by_entity.get(table, {})
             relation = relation_map.get(relation_name)
+
+            # 2. Fallback: match by target table name on primary table
+            if relation is None:
+                for rel in relation_map.values():
+                    if rel.target.lower() == relation_name.lower():
+                        relation = rel
+                        break
+
+            # 3. Fallback: search across all tables
+            if relation is None:
+                for ent_relations in config.relations_by_entity.values():
+                    rel = ent_relations.get(relation_name)
+                    if rel is not None:
+                        relation = rel
+                        break
+                    for rel in ent_relations.values():
+                        if rel.target.lower() == relation_name.lower():
+                            relation = rel
+                            break
+                    if relation is not None:
+                        break
+
             if relation is None:
                 logger.warning(
                     "SQLEngine: LLM requested unknown relation %r for table %r; skipping join.",
@@ -404,6 +439,7 @@ class SQLEngine(QueryEngine):
                     table,
                 )
                 continue
+
             alias = str(item.get("alias", relation.name)).strip() or relation.name
             fields = [str(field) for field in item.get("fields", relation.fields[:1]) if str(field).strip()]
             filters = item.get("filters", {})

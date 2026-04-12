@@ -17,8 +17,14 @@ ENGLISH_GRAPHQL_SYSTEM_PROMPT = (
 ENGLISH_SQL_SYSTEM_PROMPT = (
     "You are a SQL intent extractor. Return only valid JSON with keys: "
     "table (string), columns (array of strings), filters (object), joins (array), "
+    "aggregations (array of objects with function and field), "
     "order_by (string|null), order_dir (ASC|DESC|null), limit (number|null), "
-    "offset (number|null), explanation (string), confidence (number in [0,1])."
+    "offset (number|null), explanation (string), confidence (number in [0,1]). "
+    "For aggregations use: {\"function\": \"COUNT\", \"field\": \"*\"} or "
+    "{\"function\": \"SUM\", \"field\": \"amount\"}. "
+    "For filters with comparisons use suffix keys: age_gt, salary_gte, price_lt, credits_lte. "
+    "For joins, use the relation name exactly as it appears in the schema relations. "
+    "Example filter: {\"age_gt\": 20, \"status\": \"active\"}."
 )
 
 ENGLISH_GRAPHQL_USER_TEMPLATE = """Convert this request into GraphQL intent JSON.
@@ -50,11 +56,20 @@ Available tables:
 Available columns:
 {fields}
 
+Available relations (for joins, use these exact relation names):
+{relations}
+
 Field mapping aliases:
 {field_aliases}
 
 Filter mapping aliases:
 {filter_aliases}
+
+Rules:
+- For WHERE comparisons use suffix keys in filters: age_gt (>), age_gte (>=), age_lt (<), age_lte (<=), field_ne (!=)
+- For aggregations like COUNT, SUM, AVG, MIN, MAX — add them to the "aggregations" array
+- For JOINs use the exact relation name from "Available relations"
+- columns should only list non-aggregated SELECT columns
 """
 
 # Maximum number of entities/fields/aliases to include per prompt.  Large
@@ -169,12 +184,27 @@ SQL_INTENT_JSON_SCHEMA: dict = {
             "maximum": 1,
             "description": "Confidence score in [0, 1].",
         },
+        "aggregations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "function": {"type": "string", "enum": ["COUNT", "SUM", "AVG", "MIN", "MAX"]},
+                    "field": {"type": "string"},
+                    "alias": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                },
+                "required": ["function", "field"],
+                "additionalProperties": False,
+            },
+            "description": "Aggregation expressions like COUNT(*), SUM(amount).",
+        },
     },
     "required": [
         "table",
         "columns",
         "filters",
         "joins",
+        "aggregations",
         "order_by",
         "order_dir",
         "limit",
@@ -254,11 +284,21 @@ def build_sql_prompts(
         field_aliases = dict(list(field_aliases.items())[:_MAX_PROMPT_ALIASES])
     if len(filter_aliases) > _MAX_PROMPT_ALIASES:
         filter_aliases = dict(list(filter_aliases.items())[:_MAX_PROMPT_ALIASES])
+
+    # Build relations dict: {table: [relation_name, ...]}
+    relations_by_entity = getattr(config, "relations_by_entity", {})
+    relations: dict[str, list[str]] = {
+        tbl: list(rel_map.keys())
+        for tbl, rel_map in relations_by_entity.items()
+        if rel_map
+    }
+
     user_template = template or ENGLISH_SQL_USER_TEMPLATE
     user_prompt = user_template.format(
         text=text.strip(),
         entities=json.dumps(entities),
         fields=json.dumps(fields),
+        relations=json.dumps(relations),
         field_aliases=json.dumps(field_aliases),
         filter_aliases=json.dumps(filter_aliases),
     )

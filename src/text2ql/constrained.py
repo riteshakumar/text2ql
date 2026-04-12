@@ -30,6 +30,7 @@ class SQLIntent:
     offset: int | None
     explanation: str
     confidence: float
+    aggregations: list[dict]
 
 
 class ConstrainedOutputError(ValueError):
@@ -127,6 +128,14 @@ def parse_sql_intent(
     if not isinstance(confidence, (int, float)):
         raise ConstrainedOutputError("Field 'confidence' must be a number")
 
+    aggregations = payload.get("aggregations", [])
+    if not isinstance(aggregations, list):
+        aggregations = []
+    aggregations = [
+        a for a in aggregations
+        if isinstance(a, dict) and "function" in a and "field" in a
+    ]
+
     canonical_table = _canonicalize_entity(table.strip(), config)
     canonical_columns = [_canonicalize_field(column.strip(), config) for column in columns]
     canonical_filters = {
@@ -135,6 +144,7 @@ def parse_sql_intent(
         )
         for key, value in filters.items()
     }
+    canonical_filters = _expand_operator_filter_dicts(canonical_filters)
     normalized_confidence = max(0.0, min(1.0, float(confidence)))
     normalized_limit = _coerce_optional_int(limit)
     normalized_offset = _coerce_optional_int(offset)
@@ -153,7 +163,40 @@ def parse_sql_intent(
         offset=normalized_offset,
         explanation=explanation,
         confidence=normalized_confidence,
+        aggregations=aggregations,
     )
+
+
+def _expand_operator_filter_dicts(filters: dict) -> dict:
+    """Convert dict-style comparison values like ``{"operator": ">", "value": 60}``
+    into the suffix-key format understood by the engine (e.g. ``age_gt: 60``).
+    """
+    _OP_TO_SUFFIX: dict[str, str] = {
+        ">": "_gt",
+        ">=": "_gte",
+        "<": "_lt",
+        "<=": "_lte",
+        "!=": "_ne",
+    }
+    result: dict = {}
+    for key, value in filters.items():
+        if (
+            isinstance(value, dict)
+            and "operator" in value
+            and "value" in value
+            and len(value) == 2
+        ):
+            op = value["operator"]
+            scalar = value["value"]
+            suffix = _OP_TO_SUFFIX.get(op)
+            if suffix is not None:
+                result[f"{key}{suffix}"] = scalar
+            else:
+                # operator "=" or unknown — keep key as-is with scalar value
+                result[key] = scalar
+        else:
+            result[key] = value
+    return result
 
 
 def _canonicalize_entity(entity: str, config: NormalizedSchemaConfig) -> str:

@@ -18,6 +18,16 @@ from typing import Any
 from text2ql.ir import IRAggregation, IRFilter, IRJoin, IRNested, IRRenderer, QueryIR
 
 # ---------------------------------------------------------------------------
+# SQL identifier quoting helper
+# ---------------------------------------------------------------------------
+
+
+def _q(name: str) -> str:
+    """Wrap *name* in double-quotes so it is safe to use as a SQL identifier."""
+    return f'"{name}"'
+
+
+# ---------------------------------------------------------------------------
 # GraphQL renderer
 # ---------------------------------------------------------------------------
 
@@ -200,22 +210,22 @@ class SQLIRRenderer(IRRenderer):
 
         for join in ir.joins:
             join_clauses.append(
-                f"{join.join_type} JOIN {join.target} {join.target} ON {join.on_left} = {join.on_right}"
+                f"{join.join_type} JOIN {_q(join.target)} {_q(join.target)} ON {join.on_left} = {join.on_right}"
             )
             join_select_cols.extend(
-                f"{join.target}.{f} AS {join.target}_{f}" for f in join.fields
+                f"{_q(join.target)}.{_q(f)} AS {join.target}_{f}" for f in join.fields
             )
             join_where_parts.extend(self._build_where_parts(join.filters, {}, join.target, exact_keys))
 
-        base_cols = [f"{table}.{col}" for col in ir.fields]
+        base_cols = [f"{_q(table)}.{_q(col)}" for col in ir.fields]
         agg_cols = [self._render_agg_column(agg) for agg in ir.aggregations]
 
-        select_cols = base_cols + join_select_cols + agg_cols or [f"{table}.*"]
+        select_cols = base_cols + join_select_cols + agg_cols or [f"{_q(table)}.*"]
 
         where_parts = self._build_where_parts(ir.filters, ir.group_filters, table, exact_keys)
         where_parts.extend(join_where_parts)
 
-        sql = f"SELECT {', '.join(select_cols)} FROM {table}"
+        sql = f"SELECT {', '.join(select_cols)} FROM {_q(table)}"
         if join_clauses:
             sql += " " + " ".join(join_clauses)
         if where_parts:
@@ -223,13 +233,13 @@ class SQLIRRenderer(IRRenderer):
 
         # GROUP BY is needed when mixing aggregate and non-aggregate columns.
         if ir.aggregations and ir.fields:
-            group_cols = [f"{table}.{col}" for col in ir.fields]
+            group_cols = [f"{_q(table)}.{_q(col)}" for col in ir.fields]
             if join_select_cols:
                 group_cols += join_select_cols
             sql += " GROUP BY " + ", ".join(group_cols)
 
         if ir.order_by and ir.order_dir:
-            sql += f" ORDER BY {table}.{ir.order_by} {ir.order_dir}"
+            sql += f" ORDER BY {_q(table)}.{_q(ir.order_by)} {ir.order_dir}"
         if ir.limit is not None:
             sql += f" LIMIT {ir.limit}"
         if ir.offset is not None:
@@ -243,7 +253,8 @@ class SQLIRRenderer(IRRenderer):
 
     @staticmethod
     def _render_agg_column(agg: IRAggregation) -> str:
-        expr = f"{agg.function}({agg.field})"
+        field_expr = agg.field if agg.field == "*" else _q(agg.field)
+        expr = f"{agg.function}({field_expr})"
         return f"{expr} AS {agg.alias}" if agg.alias else expr
 
     def _build_where_parts(
@@ -292,7 +303,7 @@ class SQLIRRenderer(IRRenderer):
 
     @staticmethod
     def _ir_filter_condition(alias: str, f: IRFilter) -> str:
-        col = f"{alias}.{f.key}"
+        col = f"{_q(alias)}.{_q(f.key)}"
         if f.operator == "eq":
             if f.value is None:
                 return f"{col} IS NULL"
@@ -336,18 +347,18 @@ class SQLIRRenderer(IRRenderer):
             for suffix, op in mapping.items():
                 if key.endswith(suffix):
                     col = key[: -len(suffix)]
-                    return f"{alias}.{col} {op} {SQLIRRenderer._sql_literal(value)}"
+                    return f"{_q(alias)}.{_q(col)} {op} {SQLIRRenderer._sql_literal(value)}"
             if key.endswith("_in"):
                 col = key[:-3]
                 vals = value if isinstance(value, list) else [value]
-                return f"{alias}.{col} IN ({', '.join(SQLIRRenderer._sql_literal(v) for v in vals)})"
+                return f"{_q(alias)}.{_q(col)} IN ({', '.join(SQLIRRenderer._sql_literal(v) for v in vals)})"
             if key.endswith("_nin"):
                 col = key[:-4]
                 vals = value if isinstance(value, list) else [value]
-                return f"{alias}.{col} NOT IN ({', '.join(SQLIRRenderer._sql_literal(v) for v in vals)})"
+                return f"{_q(alias)}.{_q(col)} NOT IN ({', '.join(SQLIRRenderer._sql_literal(v) for v in vals)})"
         if value is None:
-            return f"{alias}.{key} IS NULL"
-        return f"{alias}.{key} = {SQLIRRenderer._sql_literal(value)}"
+            return f"{_q(alias)}.{_q(key)} IS NULL"
+        return f"{_q(alias)}.{_q(key)} = {SQLIRRenderer._sql_literal(value)}"
 
     @staticmethod
     def _sql_literal(value: Any) -> str:

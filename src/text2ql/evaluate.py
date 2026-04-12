@@ -242,10 +242,19 @@ def sql_execution_match(predicted_query: str, expected_query: str) -> bool:
     return pred == exp and pred is not None
 
 
+def _strip_sql_quotes(name: str) -> str:
+    """Remove surrounding double-quotes from a quoted SQL identifier."""
+    name = name.strip()
+    if name.startswith('"') and name.endswith('"'):
+        return name[1:-1]
+    return name
+
+
 def _parse_sql_signature(
     query: str,
 ) -> tuple[str, tuple[str, ...], tuple[tuple[str, str], ...], tuple[str, ...]] | None:
-    table_match = re.search(r"\bfrom\s+([A-Za-z_]\w*)\b", query, re.I)
+    # Support both quoted ("table") and unquoted (table) identifiers after FROM
+    table_match = re.search(r'\bfrom\s+"?([A-Za-z_]\w*)"?\b', query, re.I)
     if not table_match:
         return None
     table = table_match.group(1).lower()
@@ -253,13 +262,15 @@ def _parse_sql_signature(
     select_match = re.search(r"\bselect\s+(.*?)\s+\bfrom\b", query, re.I | re.S)
     if not select_match:
         return None
-    fields = tuple(
-        sorted(
-            _dedupe(
-                [segment.strip().lower() for segment in select_match.group(1).split(",") if segment.strip()]
-            )
-        )
-    )
+    # Normalise field tokens: strip double-quotes and table prefix quotes
+    raw_fields = [segment.strip() for segment in select_match.group(1).split(",") if segment.strip()]
+    normalised_fields: list[str] = []
+    for f in raw_fields:
+        # Remove double-quote wrapping from each dot-separated part
+        parts = f.split(".")
+        unquoted = ".".join(_strip_sql_quotes(p) for p in parts)
+        normalised_fields.append(unquoted.lower())
+    fields = tuple(sorted(_dedupe(normalised_fields)))
 
     where_match = re.search(r"\bwhere\s+(.*?)(?:\border by\b|\blimit\b|\boffset\b|;|$)", query, re.I | re.S)
     filters: dict[str, str] = {}
@@ -270,16 +281,27 @@ def _parse_sql_signature(
                 continue
             parts = re.split(r"\s*(>=|<=|!=|=|>|<|in|not in|is null|is not null)\s*", condition, maxsplit=1, flags=re.I)
             if len(parts) >= 2:
-                key = parts[0].strip().lower()
+                # Strip quotes from key (column reference)
+                raw_key = parts[0].strip()
+                key_parts = raw_key.split(".")
+                key = ".".join(_strip_sql_quotes(p) for p in key_parts).lower()
                 op = parts[1].strip().lower()
                 value = parts[2].strip().lower() if len(parts) > 2 else ""
                 filters[f"{key} {op}"] = value
 
-    order_match = re.search(r"\border by\s+([A-Za-z_][\w.]*)\s*(asc|desc)?\b", query, re.I)
+    # Support both quoted and unquoted identifiers in ORDER BY
+    order_match = re.search(r'\border by\s+"?([A-Za-z_]\w*)"?\."?([A-Za-z_][\w]*)"?\s*(asc|desc)?\b', query, re.I)
+    if not order_match:
+        order_match = re.search(r'\border by\s+"?([A-Za-z_][\w.]*)"?\s*(asc|desc)?\b', query, re.I)
     ordering: list[str] = []
     if order_match:
-        direction = (order_match.group(2) or "asc").lower()
-        ordering.append(f"{order_match.group(1).lower()} {direction}")
+        if order_match.lastindex == 3:
+            col = f"{order_match.group(1).lower()}.{order_match.group(2).lower()}"
+            direction = (order_match.group(3) or "asc").lower()
+        else:
+            col = order_match.group(1).lower()
+            direction = (order_match.group(2) or "asc").lower()
+        ordering.append(f"{col} {direction}")
 
     return (table, fields, tuple(sorted(filters.items())), tuple(ordering))
 

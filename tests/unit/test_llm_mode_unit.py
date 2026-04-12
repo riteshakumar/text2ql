@@ -131,8 +131,8 @@ def test_sql_llm_mode_uses_provider_with_constrained_output() -> None:
     )
 
     assert result.target == "sql"
-    assert "FROM orders" in result.query
-    assert "ORDER BY orders.createdAt DESC" in result.query
+    assert 'FROM "orders"' in result.query
+    assert 'ORDER BY "orders"."createdAt" DESC' in result.query
     assert "LIMIT 5" in result.query
     assert result.metadata["mode"] == "llm"
     # confidence is now calibrated from schema signals; raw LLM value is preserved in metadata
@@ -312,4 +312,4 @@ def test_sql_llm_mode_skips_unknown_join_relation() -> None:
     # Invalid join must be silently dropped — query must still be valid SQL
     assert result.metadata["mode"] == "llm"
     assert "JOIN" not in result.query
-    assert "FROM orders" in result.query
+    assert 'FROM "orders"' in result.query
