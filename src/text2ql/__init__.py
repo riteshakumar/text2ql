@@ -12,6 +12,9 @@ from .schema_config import infer_schema_from_json_payload
 from .sql_executor import SQLAlchemyExecutor, create_sqlite_executor
 from .types import QueryRequest, QueryResult, ValidationError
 
+# Lazy-loaded benchmark subpackage — import from text2ql.benchmarks directly
+# to avoid pulling in sqlite3/json at import time for non-benchmark users.
+
 __all__ = [
     "DatasetExample",
     "EvaluationReport",

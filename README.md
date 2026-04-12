@@ -188,6 +188,7 @@ Operational notes:
 | Synthetic rewrite plugins | Yes | Yes (target-agnostic dataset API) |
 | **Abstract IR layer (`QueryIR`, `IRRenderer`, `GraphQLIRRenderer`, `SQLIRRenderer`)** | **Yes** | **Yes** |
 | **Structured logging (`TEXT2QL_LOG_LEVEL`)** | **Yes** | **Yes** |
+| **Spider/BIRD benchmark evaluation** | — | **Yes** |
 
 ## CLI-First Workflow
 
@@ -1208,6 +1209,134 @@ python -m twine check dist/*
 - `text2ql.sql_executor`: `SQLAlchemyExecutor` and `create_sqlite_executor()` for real SQL execution.
 - `text2ql.evaluate`: `evaluate_examples()` (serial) + `aevaluate_examples()` (concurrent async).
 - `text2ql.rewrite`: `rewrite_user_utterance()` + `arewrite_user_utterance()` (async).
+- `text2ql.benchmarks`: Spider and BIRD benchmark adapters — `load_spider()`, `load_bird()`, `run_benchmark()`, `arun_benchmark()`, `format_report()`.
+
+## Benchmarking (Spider & BIRD)
+
+text2ql includes built-in adapters for the two standard text-to-SQL benchmarks: [Spider](https://yale-lily.github.io/spider) and [BIRD](https://bird-bench.github.io/). Run them to measure accuracy against published baselines and track improvements over time.
+
+### Quick start
+
+```bash
+pip install text2ql[sql]   # SQLAlchemy needed for execution-accuracy mode
+```
+
+### Python API
+
+```python
+from text2ql.benchmarks import load_spider, load_bird, run_benchmark, format_report
+from text2ql.benchmarks.runner import BenchmarkConfig
+
+# Load Spider dev split (1034 examples)
+examples = load_spider("/path/to/spider", split="dev")
+
+# Run with structural matching (no database needed)
+report = run_benchmark(examples, config=BenchmarkConfig(mode="structural"))
+print(format_report(report))
+
+# Run with execution accuracy (requires SQLite databases)
+report = run_benchmark(examples, config=BenchmarkConfig(mode="execution"))
+print(format_report(report, verbose=True))
+```
+
+BIRD mini-dev (500 examples with SQLite databases):
+
+```python
+examples = load_bird("/path/to/bird-minidev", split="dev")
+report = run_benchmark(examples, config=BenchmarkConfig(mode="execution"))
+print(format_report(report))
+```
+
+### LLM mode benchmarking
+
+```python
+from text2ql.core import Text2QL
+from text2ql.providers.openai_compatible import OpenAICompatibleProvider
+
+provider = OpenAICompatibleProvider(model="gpt-4o-mini")
+service = Text2QL(provider=provider)
+
+# Set LLM mode on all examples
+for ex in examples:
+    ex.context["mode"] = "llm"
+
+config = BenchmarkConfig(mode="execution", service=service)
+report = run_benchmark(examples, config=config)
+print(format_report(report))
+```
+
+### CLI
+
+```bash
+# Spider — structural evaluation
+text2ql --benchmark spider \
+  --benchmark-path /path/to/spider \
+  --benchmark-mode structural
+
+# BIRD — execution accuracy with SQLite
+text2ql --benchmark bird \
+  --benchmark-path /path/to/bird-minidev \
+  --benchmark-mode execution
+
+# With LLM provider
+export OPENAI_API_KEY=...
+text2ql --benchmark spider \
+  --benchmark-path /path/to/spider \
+  --benchmark-mode structural \
+  --mode llm \
+  --llm-model gpt-4o-mini
+
+# Limit examples for quick smoke test
+text2ql --benchmark spider \
+  --benchmark-path /path/to/spider \
+  --benchmark-limit 50
+
+# Filter to a single database
+text2ql --benchmark bird \
+  --benchmark-path /path/to/bird-minidev \
+  --benchmark-db california_schools
+
+# Verbose output (shows individual failures)
+text2ql --benchmark spider \
+  --benchmark-path /path/to/spider \
+  --benchmark-verbose
+```
+
+### CLI flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--benchmark` | — | Benchmark name: `spider` or `bird` |
+| `--benchmark-path` | — | Path to dataset root directory |
+| `--benchmark-split` | `dev` | Split to evaluate (`dev`, `train`) |
+| `--benchmark-limit` | `0` (all) | Cap the number of examples |
+| `--benchmark-db` | — | Only evaluate this `db_id` |
+| `--benchmark-mode` | `execution` | `exact`, `structural`, or `execution` |
+| `--benchmark-verbose` | `false` | Show per-example failure details |
+
+### Evaluation modes
+
+| Mode | Requires DB | What it checks |
+|------|-------------|----------------|
+| `exact` | No | Normalized string equality |
+| `structural` | No | Parsed SQL signature match (table, columns, filters, ordering) |
+| `execution` | Yes (SQLite) | Run both gold and predicted SQL, compare result sets |
+
+### Report output
+
+Reports include:
+- Overall exact-match, structural-match, and execution accuracy
+- Breakdown by difficulty level (easy/medium/hard/extra for Spider; simple/moderate/challenging for BIRD)
+- Breakdown by database
+- Bottom-5 databases by accuracy
+- Per-example failure details (verbose mode)
+- Machine-readable JSON summary
+
+### Dataset setup
+
+**Spider**: clone the [taoyds/spider](https://github.com/taoyds/spider) repo. The `evaluation_examples/examples/` directory contains `tables.json` and `dev.json`. For execution accuracy, download the database files from the [official site](https://yale-lily.github.io/spider).
+
+**BIRD mini-dev**: download from [bird-bench/mini_dev](https://github.com/bird-bench/mini_dev). The `MINIDEV/` directory contains `mini_dev_sqlite.json` and `dev_databases/` with SQLite files.
 
 ## Roadmap
 
@@ -1216,6 +1345,7 @@ python -m twine check dist/*
 3. Add richer synthetic generation using domain-specific rewrite plugins.
 4. ~~Add execution evaluation hooks for real backends~~ *(done — `SQLAlchemyExecutor` + `create_sqlite_executor`)*.
 5. ~~Add function-calling / structured output support~~ *(done — `use_structured_output`, `mode="function_calling"`, `complete_structured()`)*.
-6. Add few-shot example support in LLM mode with dynamic example retrieval based on schema/mapping similarity.
-7. Multilingual prompt support (currently English only).
+6. ~~Add Spider/BIRD benchmark evaluation~~ *(done — `load_spider`, `load_bird`, `run_benchmark`, CLI `--benchmark`)*.
+7. Add few-shot example support in LLM mode with dynamic example retrieval based on schema/mapping similarity.
+8. Multilingual prompt support (currently English only).
 
