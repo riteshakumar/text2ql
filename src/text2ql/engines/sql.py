@@ -304,8 +304,11 @@ class SQLEngine(QueryEngine):
             resolved_language = resolve_language(language)
         except ValueError:
             return None, f"Unsupported language '{language}'"
+        evidence = context.get("evidence") or None
         try:
-            system_prompt, user_prompt = build_sql_direct_prompts(prompt, config, language=resolved_language)
+            system_prompt, user_prompt = build_sql_direct_prompts(
+                prompt, config, language=resolved_language, evidence=evidence
+            )
             system_prompt = self._apply_system_context(system_prompt, context)
         except Exception as exc:
             return None, f"Failed to build direct SQL prompts: {exc}"
@@ -341,8 +344,11 @@ class SQLEngine(QueryEngine):
             resolved_language = resolve_language(language)
         except ValueError:
             return None, f"Unsupported language '{language}'"
+        evidence = context.get("evidence") or None
         try:
-            system_prompt, user_prompt = build_sql_direct_prompts(prompt, config, language=resolved_language)
+            system_prompt, user_prompt = build_sql_direct_prompts(
+                prompt, config, language=resolved_language, evidence=evidence
+            )
             system_prompt = self._apply_system_context(system_prompt, context)
         except Exception as exc:
             return None, f"Failed to build direct SQL prompts: {exc}"

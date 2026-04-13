@@ -194,7 +194,19 @@ async def _aresolve_expected_execution_result(
 
 
 def normalize_query(query: str) -> str:
-    return re.sub(r"\s+", " ", query.strip())
+    """Normalize a SQL/GraphQL query for comparison.
+
+    Strips leading/trailing whitespace, collapses internal whitespace, removes
+    surrounding double-quotes from identifiers (e.g. ``"table"."col"`` →
+    ``table.col``), and lowercases the whole string so that minor formatting
+    differences don't cause false negatives.
+    """
+    q = re.sub(r"\s+", " ", query.strip())
+    # Strip double-quote wrapping from identifiers: "foo" → foo
+    q = re.sub(r'"([A-Za-z_]\w*)"', r"\1", q)
+    # Remove trailing semicolon
+    q = q.rstrip(";").rstrip()
+    return q.lower()
 
 
 def _default_execution_comparator(left: Any, right: Any) -> bool:
@@ -266,9 +278,14 @@ def _parse_sql_signature(
     raw_fields = [segment.strip() for segment in select_match.group(1).split(",") if segment.strip()]
     normalised_fields: list[str] = []
     for f in raw_fields:
+        # Strip AS alias clause: "orders"."id" AS orders_id → "orders"."id"
+        f = re.sub(r"\s+as\s+\w+", "", f, flags=re.I).strip()
         # Remove double-quote wrapping from each dot-separated part
         parts = f.split(".")
         unquoted = ".".join(_strip_sql_quotes(p) for p in parts)
+        # Reduce "table.col" to just "col" for comparison with bare gold SELECT
+        if "." in unquoted:
+            unquoted = unquoted.split(".")[-1]
         normalised_fields.append(unquoted.lower())
     fields = tuple(sorted(_dedupe(normalised_fields)))
 
@@ -281,10 +298,14 @@ def _parse_sql_signature(
                 continue
             parts = re.split(r"\s*(>=|<=|!=|=|>|<|in|not in|is null|is not null)\s*", condition, maxsplit=1, flags=re.I)
             if len(parts) >= 2:
-                # Strip quotes from key (column reference)
+                # Strip quotes from key (column reference), reduce table.col → col
                 raw_key = parts[0].strip()
                 key_parts = raw_key.split(".")
                 key = ".".join(_strip_sql_quotes(p) for p in key_parts).lower()
+                # Reduce "table.col" to just "col" so that quoted predicates
+                # match gold WHERE clauses that use bare column names.
+                if "." in key:
+                    key = key.split(".")[-1]
                 op = parts[1].strip().lower()
                 value = parts[2].strip().lower() if len(parts) > 2 else ""
                 filters[f"{key} {op}"] = value
@@ -296,10 +317,13 @@ def _parse_sql_signature(
     ordering: list[str] = []
     if order_match:
         if order_match.lastindex == 3:
-            col = f"{order_match.group(1).lower()}.{order_match.group(2).lower()}"
+            # "table"."col" form — use only the column part for comparison
+            col = order_match.group(2).lower()
             direction = (order_match.group(3) or "asc").lower()
         else:
-            col = order_match.group(1).lower()
+            raw_col = order_match.group(1).lower()
+            # Strip table prefix if present (e.g. "singer.age" → "age")
+            col = raw_col.split(".")[-1] if "." in raw_col else raw_col
             direction = (order_match.group(2) or "asc").lower()
         ordering.append(f"{col} {direction}")
 
