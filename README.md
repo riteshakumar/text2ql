@@ -23,6 +23,9 @@ pip install text2ql
 Optional extras:
 
 ```bash
+# Streamlit playground
+pip install "text2ql[app]"
+
 # SQL execution backend support (SQLAlchemy)
 pip install "text2ql[sql]"
 
@@ -100,6 +103,38 @@ provider = OpenAICompatibleProvider(
     use_structured_output=True,
 )
 service = Text2QL(provider=provider)
+```
+
+## Streamlit Playground
+
+Run the interactive UI for faster schema/prompt iteration.
+Prefer zero setup? Use the hosted app: https://text2ql.streamlit.app/
+Local run remains available for private schemas and payloads.
+
+```bash
+# from repo root
+pip install -e ".[app]"
+python -m streamlit run examples/streamlit_app.py
+```
+
+What you get:
+
+- GraphQL and SQL targets with `deterministic` or `llm` mode.
+- Bundled sample files (`examples/sample_schema.json`, `examples/sample_data.json`) or your own uploads.
+- Synthetic prompt variants + domain rewrite plugins.
+- Optional JSON execution checks and expected-query comparison.
+- Engine metadata, validation notes, and timing shown per variant.
+
+API key options for LLM mode:
+
+```bash
+OPENAI_API_KEY=... python -m streamlit run examples/streamlit_app.py
+```
+
+Or set Streamlit secrets (`.streamlit/secrets.toml`):
+
+```toml
+OPENAI_API_KEY="your-key"
 ```
 
 ## Modes at a glance
