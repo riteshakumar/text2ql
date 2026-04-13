@@ -439,16 +439,27 @@ def build_sql_prompts(
 
 ENGLISH_SQL_DIRECT_SYSTEM_PROMPT = (
     "You are an expert SQL query writer. "
-    "Given a natural language question and a database schema, write a single valid SQL SELECT query. "
+    "Given a natural language question and a database schema, write a single valid SQL SELECT query.\n"
     "Rules:\n"
-    "- Output ONLY the SQL query, no explanation, no markdown fences.\n"
+    "- Output ONLY the SQL query — no explanation, no markdown fences, no comments.\n"
     "- Use standard SQL syntax compatible with SQLite.\n"
-    "- Always quote table and column names with double-quotes to avoid reserved-word conflicts.\n"
-    "- Use JOIN ... ON ... syntax for multi-table queries.\n"
-    "- Use subqueries (NOT IN, EXISTS) when the question requires exclusion or correlated logic.\n"
-    "- Use HAVING for post-aggregation filters.\n"
-    "- Use DISTINCT when the question asks for unique values.\n"
-    "- End the query with a semicolon."
+    "- Quote table and column names with double-quotes only when they are reserved words; "
+    "prefer bare identifiers (e.g. SELECT id FROM orders) for simple names.\n"
+    "- SELECT ONLY the columns explicitly requested.  Do NOT add extra columns or AS aliases "
+    "unless the question asks for a renamed output.\n"
+    "- Use the minimum number of tables and JOINs needed to answer the question.  "
+    "If the answer can be derived from a single table, do NOT JOIN other tables.\n"
+    "- Prefer direct literal value filters (WHERE charter = 1) over subqueries when the value is "
+    "known from the question or the domain hints below.\n"
+    "- Use subqueries (NOT IN, EXISTS) only when the question genuinely requires exclusion or "
+    "correlated logic that cannot be expressed as a simple literal filter.\n"
+    "- Do NOT add DISTINCT unless the question explicitly asks for unique/distinct values.\n"
+    "- Use HAVING for post-aggregation filters (e.g. HAVING COUNT(*) > 2).\n"
+    "- For 'best', 'highest', 'most', 'largest' use MAX/DESC; "
+    "for 'worst', 'lowest', 'least', 'smallest' use MIN/ASC.\n"
+    "- Use exact column values as they are stored in the database.  "
+    "Domain hints (if provided) tell you the exact stored representation — follow them strictly.\n"
+    "- Do not end the query with a semicolon."
 )
 
 ENGLISH_SQL_DIRECT_USER_TEMPLATE = """Write a SQL query for the following request.
@@ -463,18 +474,27 @@ Columns per table:
 
 Foreign key relations:
 {relations}
-
+{evidence_block}
 SQL query:"""
 
 ENGLISH_GRAPHQL_DIRECT_SYSTEM_PROMPT = (
     "You are an expert GraphQL query writer. "
-    "Given a natural language question and a GraphQL schema, write a single valid GraphQL query. "
+    "Given a natural language question and a GraphQL schema, write a single valid GraphQL query.\n"
     "Rules:\n"
-    "- Output ONLY the GraphQL query, no explanation, no markdown fences.\n"
+    "- Output ONLY the GraphQL query — no explanation, no markdown fences, no comments.\n"
     "- Use standard GraphQL syntax.\n"
-    "- Use nested selections for related entities.\n"
-    "- Use filter arguments where needed.\n"
-    "- Use aliases for aggregated fields (e.g. totalCount: count)."
+    "- SELECT ONLY the fields explicitly requested.  Do NOT add extra fields or field aliases "
+    "unless the question asks for a renamed output.\n"
+    "- Use the minimum number of types and nested selections needed to answer the question.  "
+    "If the answer can be derived from a single type, do NOT nest into related types.\n"
+    "- Use nested selections only when the question genuinely requires data from a related type.\n"
+    "- Use filter arguments with exact stored values.  "
+    "Domain hints (if provided) tell you the exact stored representation — follow them strictly.\n"
+    "- For 'best', 'highest', 'most', 'largest' use orderBy DESC; "
+    "for 'worst', 'lowest', 'least', 'smallest' use orderBy ASC.\n"
+    "- Use aliases for aggregated fields only when a rename is requested "
+    "(e.g. totalCount: count).\n"
+    "- Do NOT add __typename or metadata fields unless requested."
 )
 
 ENGLISH_GRAPHQL_DIRECT_USER_TEMPLATE = """Write a GraphQL query for the following request.
@@ -488,7 +508,7 @@ Fields per type:
 
 Relations:
 {relations}
-
+{evidence_block}
 GraphQL query:"""
 
 
@@ -496,12 +516,20 @@ def build_sql_direct_prompts(
     text: str,
     config: NormalizedSchemaConfig,
     language: str = "english",
+    evidence: str | None = None,
 ) -> tuple[str, str]:
     """Build prompts for direct SQL generation (mode='llm').
 
     The LLM is asked to write the full SQL query rather than a structured
     intent JSON.  This enables subqueries, HAVING, DISTINCT, and any other
     SQL construct that the compiler does not support.
+
+    Parameters
+    ----------
+    evidence:
+        Optional domain hint string injected into the user prompt.  Used by
+        BIRD-style benchmarks to convey exact stored values (e.g.
+        "carcinogenic means label = '+'").
     """
     resolve_language(language)  # validate
 
@@ -525,11 +553,16 @@ def build_sql_direct_prompts(
         f"  {tbl}: {', '.join(cols)}" for tbl, cols in columns_by_table.items()
     ) or "  (none)"
 
+    evidence_block = ""
+    if evidence and evidence.strip():
+        evidence_block = f"\nDomain hints (use these for exact column values):\n{evidence.strip()}\n"
+
     user_prompt = ENGLISH_SQL_DIRECT_USER_TEMPLATE.format(
         text=text.strip(),
         tables=", ".join(tables),
         columns=columns_text,
         relations=relations_text,
+        evidence_block=evidence_block,
     )
     return ENGLISH_SQL_DIRECT_SYSTEM_PROMPT, user_prompt
 
@@ -538,11 +571,17 @@ def build_graphql_direct_prompts(
     text: str,
     config: NormalizedSchemaConfig,
     language: str = "english",
+    evidence: str | None = None,
 ) -> tuple[str, str]:
     """Build prompts for direct GraphQL generation (mode='llm').
 
     The LLM writes the full GraphQL query rather than a structured intent JSON,
     enabling nested selections and complex filter expressions.
+
+    Parameters
+    ----------
+    evidence:
+        Optional domain hint string injected into the user prompt.
     """
     resolve_language(language)  # validate
 
@@ -563,11 +602,16 @@ def build_graphql_direct_prompts(
             relations_text_parts.append(f"  {ent}.{rel_name} → {rel.target}")
     relations_text = "\n".join(relations_text_parts) if relations_text_parts else "  (none)"
 
+    evidence_block = ""
+    if evidence and evidence.strip():
+        evidence_block = f"\nDomain hints (use these for exact field values):\n{evidence.strip()}\n"
+
     user_prompt = ENGLISH_GRAPHQL_DIRECT_USER_TEMPLATE.format(
         text=text.strip(),
         entities=", ".join(entities),
         fields="\n".join(fields_text_parts) or "  (none)",
         relations=relations_text,
+        evidence_block=evidence_block,
     )
     return ENGLISH_GRAPHQL_DIRECT_SYSTEM_PROMPT, user_prompt
 
