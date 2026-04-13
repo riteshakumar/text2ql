@@ -224,8 +224,14 @@ class SQLIRRenderer(IRRenderer):
 
         where_parts = self._build_where_parts(ir.filters, ir.group_filters, table, exact_keys)
         where_parts.extend(join_where_parts)
+        # Subquery conditions (NOT IN / IN)
+        for sub in ir.subqueries:
+            part = self._render_subquery_condition(table, sub)
+            if part:
+                where_parts.append(part)
 
-        sql = f"SELECT {', '.join(select_cols)} FROM {_q(table)}"
+        distinct_kw = "DISTINCT " if ir.distinct else ""
+        sql = f"SELECT {distinct_kw}{', '.join(select_cols)} FROM {_q(table)}"
         if join_clauses:
             sql += " " + " ".join(join_clauses)
         if where_parts:
@@ -237,6 +243,13 @@ class SQLIRRenderer(IRRenderer):
             if join_select_cols:
                 group_cols += join_select_cols
             sql += " GROUP BY " + ", ".join(group_cols)
+
+        # HAVING clause — post-aggregation filters
+        if ir.having:
+            having_parts = [self._render_having_condition(h) for h in ir.having]
+            having_parts = [p for p in having_parts if p]
+            if having_parts:
+                sql += " HAVING " + " AND ".join(having_parts)
 
         if ir.order_by and ir.order_dir:
             sql += f" ORDER BY {_q(table)}.{_q(ir.order_by)} {ir.order_dir}"
@@ -359,6 +372,48 @@ class SQLIRRenderer(IRRenderer):
         if value is None:
             return f"{_q(alias)}.{_q(key)} IS NULL"
         return f"{_q(alias)}.{_q(key)} = {SQLIRRenderer._sql_literal(value)}"
+
+    @staticmethod
+    def _render_having_condition(h: dict[str, Any]) -> str:
+        """Render a single HAVING condition dict.
+
+        Expected keys: ``function`` (COUNT/SUM/…), ``field`` ("*" or column),
+        ``operator`` (">", ">=", "<", "<=", "=", "!="), ``value`` (scalar).
+        """
+        fn = str(h.get("function", "COUNT")).upper()
+        field = str(h.get("field", "*"))
+        field_expr = "*" if field == "*" else _q(field)
+        agg_expr = f"{fn}({field_expr})"
+        op = str(h.get("operator", "="))
+        if op not in {">", ">=", "<", "<=", "=", "!="}:
+            op = "="
+        value = h.get("value", 0)
+        return f"{agg_expr} {op} {SQLIRRenderer._sql_literal(value)}"
+
+    @staticmethod
+    def _render_subquery_condition(table: str, sub: dict[str, Any]) -> str:
+        """Render a NOT IN / IN subquery condition.
+
+        Expected keys: ``type`` ("not_in"|"in"), ``column`` (outer col),
+        ``subquery_table``, ``subquery_column``, optional ``subquery_filters``
+        (dict of equality conditions inside the subquery).
+        """
+        sub_type = str(sub.get("type", "not_in")).lower()
+        col = str(sub.get("column", "id"))
+        sub_table = str(sub.get("subquery_table", "")).strip()
+        sub_col = str(sub.get("subquery_column", "id"))
+        if not sub_table:
+            return ""
+        inner_sql = f"SELECT {_q(sub_table)}.{_q(sub_col)} FROM {_q(sub_table)}"
+        sub_filters: dict[str, Any] = sub.get("subquery_filters", {}) or {}
+        if sub_filters:
+            parts = [
+                f"{_q(sub_table)}.{_q(k)} = {SQLIRRenderer._sql_literal(v)}"
+                for k, v in sub_filters.items()
+            ]
+            inner_sql += " WHERE " + " AND ".join(parts)
+        op_kw = "NOT IN" if sub_type == "not_in" else "IN"
+        return f"{_q(table)}.{_q(col)} {op_kw} ({inner_sql})"
 
     @staticmethod
     def _sql_literal(value: Any) -> str:

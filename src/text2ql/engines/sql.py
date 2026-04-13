@@ -201,6 +201,9 @@ class SQLEngine(QueryEngine):
             logger.warning("SQLEngine: %s", error)
             return None, error
 
+        # Capture whether LLM intended empty columns (pure aggregation — no GROUP BY)
+        llm_columns_empty = len(intent.columns) == 0
+
         table, columns, filters = self._reconcile_owned_asset_intent(
             prompt=prompt,
             table=intent.table,
@@ -208,14 +211,7 @@ class SQLEngine(QueryEngine):
             filters=dict(intent.filters),
             config=config,
         )
-        joins = self._materialize_llm_joins(intent.joins, config, table)
-        order_by, order_dir, limit, offset = intent.order_by, intent.order_dir, intent.limit, intent.offset
 
-        table, columns, filters, joins, order_by, order_dir, notes = self._validate_components(
-            table=table, columns=columns, filters=filters, joins=joins,
-            order_by=order_by, order_dir=order_dir, config=config,
-        )
-        exact_filter_keys = self._allowed_filter_keys(config, table, set(columns))
         # Prefer LLM-provided aggregations; fall back to text detection
         aggregations = [
             {
@@ -225,11 +221,29 @@ class SQLEngine(QueryEngine):
             }
             for a in intent.aggregations
         ] if intent.aggregations else self._detect_aggregations(prompt.lower())
+
+        # When the LLM explicitly returned columns=[] with aggregations, respect
+        # that intent: a pure aggregation (COUNT(*)) needs no GROUP BY.  The
+        # reconcile step above may have added default columns — undo that here.
+        if llm_columns_empty and aggregations:
+            columns = []
+
+        joins = self._materialize_llm_joins(intent.joins, config, table)
+        order_by, order_dir, limit, offset = intent.order_by, intent.order_dir, intent.limit, intent.offset
+
+        table, columns, filters, joins, order_by, order_dir, notes = self._validate_components(
+            table=table, columns=columns, filters=filters, joins=joins,
+            order_by=order_by, order_dir=order_dir, config=config,
+        )
+        exact_filter_keys = self._allowed_filter_keys(config, table, set(columns))
         query = self._build_sql(
             table=table, columns=columns, filters=filters, joins=joins,
             order_by=order_by, order_dir=order_dir, limit=limit, offset=offset,
             exact_filter_keys=exact_filter_keys,
             aggregations=aggregations,
+            distinct=intent.distinct,
+            having=intent.having,
+            subqueries=intent.subqueries,
         )
         # Use calibrated schema-aware confidence instead of the LLM's self-report.
         confidence = compute_deterministic_confidence(
@@ -267,6 +281,9 @@ class SQLEngine(QueryEngine):
                 "limit": limit,
                 "offset": offset,
                 "aggregations": aggregations,
+                "distinct": intent.distinct,
+                "having": intent.having,
+                "subqueries": intent.subqueries,
                 "mode": "llm",
                 "language": resolved_language,
                 "raw_completion": raw,
@@ -1176,6 +1193,9 @@ class SQLEngine(QueryEngine):
         offset: int | None,
         exact_filter_keys: set[str] | None = None,
         aggregations: list[dict[str, str]] | None = None,
+        distinct: bool = False,
+        having: list[dict] | None = None,
+        subqueries: list[dict] | None = None,
     ) -> str:
         """Build a SQL SELECT statement via :class:`~text2ql.renderers.SQLIRRenderer`.
 
@@ -1210,6 +1230,9 @@ class SQLEngine(QueryEngine):
             target="sql",
             exact_filter_keys=exact_keys,
             metadata={"exact_filter_keys": list(exact_keys)},
+            distinct=distinct,
+            having=having or [],
+            subqueries=subqueries or [],
         )
         return _SQL_RENDERER.render(ir)
 

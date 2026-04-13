@@ -33,6 +33,9 @@ class SQLIntent:
     explanation: str
     confidence: float
     aggregations: list[dict]
+    distinct: bool
+    having: list[dict]
+    subqueries: list[dict]
 
 
 class ConstrainedOutputError(ValueError):
@@ -154,6 +157,18 @@ def parse_sql_intent(
         if isinstance(a, dict) and "function" in a and "field" in a
     ]
 
+    distinct = bool(payload.get("distinct", False))
+
+    having = payload.get("having", [])
+    if not isinstance(having, list):
+        having = []
+    having = [h for h in having if isinstance(h, dict) and "function" in h and "operator" in h and "value" in h]
+
+    subqueries = payload.get("subqueries", [])
+    if not isinstance(subqueries, list):
+        subqueries = []
+    subqueries = [s for s in subqueries if isinstance(s, dict) and "subquery_table" in s]
+
     canonical_table = _canonicalize_entity(table.strip(), config)
     canonical_columns = [_canonicalize_field(column.strip(), config) for column in columns]
     canonical_filters = {
@@ -182,6 +197,9 @@ def parse_sql_intent(
         explanation=explanation,
         confidence=normalized_confidence,
         aggregations=aggregations,
+        distinct=distinct,
+        having=having,
+        subqueries=subqueries,
     )
 
 

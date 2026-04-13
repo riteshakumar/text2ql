@@ -25,12 +25,18 @@ ENGLISH_SQL_SYSTEM_PROMPT = (
     "You are a SQL intent extractor. Return only valid JSON with keys: "
     "table (string), columns (array of strings), filters (object), joins (array), "
     "aggregations (array of objects with function and field), "
+    "distinct (bool, true when question asks for unique values), "
+    "having (array of post-aggregation conditions: [{\"function\":\"COUNT\",\"field\":\"*\",\"operator\":\">\",\"value\":5}]), "
+    "subqueries (array of NOT IN/IN conditions: [{\"type\":\"not_in\",\"column\":\"id\",\"subquery_table\":\"tbl\",\"subquery_column\":\"col\"}]), "
     "order_by (string|null), order_dir (ASC|DESC|null), limit (number|null), "
     "offset (number|null), explanation (string), confidence (number in [0,1]). "
     "For aggregations use: {\"function\": \"COUNT\", \"field\": \"*\"} or "
     "{\"function\": \"SUM\", \"field\": \"amount\"}. "
     "For filters with comparisons use suffix keys: age_gt, salary_gte, price_lt, credits_lte. "
     "For joins, use the relation name exactly as it appears in the schema relations. "
+    "Use HAVING for post-aggregation filters (e.g. count > 5). "
+    "Use subqueries NOT IN when the question excludes rows based on another table. "
+    "Set distinct=true when the question asks for unique/distinct values. "
     "Example filter: {\"age_gt\": 20, \"status\": \"active\"}."
 )
 
@@ -242,6 +248,41 @@ SQL_INTENT_JSON_SCHEMA: dict = {
             },
             "description": "Aggregation expressions like COUNT(*), SUM(amount).",
         },
+        "distinct": {
+            "type": "boolean",
+            "description": "True when the query should use SELECT DISTINCT.",
+        },
+        "having": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "function": {"type": "string", "enum": ["COUNT", "SUM", "AVG", "MIN", "MAX"]},
+                    "field": {"type": "string"},
+                    "operator": {"type": "string", "enum": [">", ">=", "<", "<=", "=", "!="]},
+                    "value": {},
+                },
+                "required": ["function", "field", "operator", "value"],
+                "additionalProperties": False,
+            },
+            "description": "Post-aggregation HAVING conditions.",
+        },
+        "subqueries": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string", "enum": ["not_in", "in"]},
+                    "column": {"type": "string"},
+                    "subquery_table": {"type": "string"},
+                    "subquery_column": {"type": "string"},
+                    "subquery_filters": {"type": "object", "additionalProperties": True},
+                },
+                "required": ["type", "column", "subquery_table", "subquery_column"],
+                "additionalProperties": False,
+            },
+            "description": "NOT IN / IN subquery conditions for exclusion logic.",
+        },
     },
     "required": [
         "table",
@@ -249,6 +290,9 @@ SQL_INTENT_JSON_SCHEMA: dict = {
         "filters",
         "joins",
         "aggregations",
+        "distinct",
+        "having",
+        "subqueries",
         "order_by",
         "order_dir",
         "limit",
