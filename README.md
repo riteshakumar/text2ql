@@ -3,6 +3,7 @@
 Natural-language to query-language toolkit for **GraphQL** and **SQL**.
 
 `text2ql` is built for practical usage: deterministic generation, LLM-assisted generation, schema/mapping normalization, evaluation utilities, and benchmark adapters (Spider/BIRD).
+Current first-class targets are GraphQL and SQL; planned future targets include JSONata, jq-style queries, Cypher, and dialect-focused SQL paths (PostgreSQL, MySQL, and more).
 
 ## Why teams use it
 
