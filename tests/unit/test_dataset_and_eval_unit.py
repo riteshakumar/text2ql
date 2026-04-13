@@ -450,7 +450,7 @@ def test_evaluate_examples_structural_execution_for_sql() -> None:
         DatasetExample(
             text="show customers highest total first 5",
             target="sql",
-            expected_query="SELECT customers.total FROM customers ORDER BY customers.total DESC LIMIT 5;",
+            expected_query='SELECT "customers"."total" FROM "customers" ORDER BY "customers"."total" DESC LIMIT 5;',
             schema={"entities": ["customers"], "fields": {"customers": ["id", "total"]}},
         )
     ]

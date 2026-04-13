@@ -16,6 +16,10 @@ class GraphQLIntent:
     filters: dict[str, str]
     explanation: str
     confidence: float
+    aggregations: list[dict]
+    nested: list[dict]
+    distinct: bool
+    having: list[dict]
 
 
 @dataclass(slots=True)
@@ -30,6 +34,10 @@ class SQLIntent:
     offset: int | None
     explanation: str
     confidence: float
+    aggregations: list[dict]
+    distinct: bool
+    having: list[dict]
+    subqueries: list[dict]
 
 
 class ConstrainedOutputError(ValueError):
@@ -65,6 +73,26 @@ def parse_graphql_intent(
     if not isinstance(confidence, (int, float)):
         raise ConstrainedOutputError("Field 'confidence' must be a number")
 
+    aggregations = payload.get("aggregations", [])
+    if not isinstance(aggregations, list):
+        aggregations = []
+    aggregations = [
+        a for a in aggregations
+        if isinstance(a, dict) and "function" in a and "field" in a
+    ]
+
+    nested = payload.get("nested", [])
+    if not isinstance(nested, list):
+        nested = []
+    nested = [n for n in nested if isinstance(n, dict) and "relation" in n]
+
+    distinct = bool(payload.get("distinct", False))
+
+    having = payload.get("having", [])
+    if not isinstance(having, list):
+        having = []
+    having = [h for h in having if isinstance(h, dict) and "function" in h and "operator" in h and "value" in h]
+
     canonical_entity = _canonicalize_entity(entity.strip(), config)
     canonical_fields = [_canonicalize_field(field.strip(), config) for field in fields]
     canonical_filters = {
@@ -73,6 +101,7 @@ def parse_graphql_intent(
         )
         for key, value in filters.items()
     }
+    canonical_filters = _expand_operator_filter_dicts(canonical_filters)
 
     normalized_confidence = max(0.0, min(1.0, float(confidence)))
     return GraphQLIntent(
@@ -81,6 +110,10 @@ def parse_graphql_intent(
         filters=canonical_filters,
         explanation=explanation,
         confidence=normalized_confidence,
+        aggregations=aggregations,
+        nested=nested,
+        distinct=distinct,
+        having=having,
     )
 
 
@@ -127,6 +160,26 @@ def parse_sql_intent(
     if not isinstance(confidence, (int, float)):
         raise ConstrainedOutputError("Field 'confidence' must be a number")
 
+    aggregations = payload.get("aggregations", [])
+    if not isinstance(aggregations, list):
+        aggregations = []
+    aggregations = [
+        a for a in aggregations
+        if isinstance(a, dict) and "function" in a and "field" in a
+    ]
+
+    distinct = bool(payload.get("distinct", False))
+
+    having = payload.get("having", [])
+    if not isinstance(having, list):
+        having = []
+    having = [h for h in having if isinstance(h, dict) and "function" in h and "operator" in h and "value" in h]
+
+    subqueries = payload.get("subqueries", [])
+    if not isinstance(subqueries, list):
+        subqueries = []
+    subqueries = [s for s in subqueries if isinstance(s, dict) and "subquery_table" in s]
+
     canonical_table = _canonicalize_entity(table.strip(), config)
     canonical_columns = [_canonicalize_field(column.strip(), config) for column in columns]
     canonical_filters = {
@@ -135,6 +188,7 @@ def parse_sql_intent(
         )
         for key, value in filters.items()
     }
+    canonical_filters = _expand_operator_filter_dicts(canonical_filters)
     normalized_confidence = max(0.0, min(1.0, float(confidence)))
     normalized_limit = _coerce_optional_int(limit)
     normalized_offset = _coerce_optional_int(offset)
@@ -153,7 +207,43 @@ def parse_sql_intent(
         offset=normalized_offset,
         explanation=explanation,
         confidence=normalized_confidence,
+        aggregations=aggregations,
+        distinct=distinct,
+        having=having,
+        subqueries=subqueries,
     )
+
+
+def _expand_operator_filter_dicts(filters: dict) -> dict:
+    """Convert dict-style comparison values like ``{"operator": ">", "value": 60}``
+    into the suffix-key format understood by the engine (e.g. ``age_gt: 60``).
+    """
+    _OP_TO_SUFFIX: dict[str, str] = {
+        ">": "_gt",
+        ">=": "_gte",
+        "<": "_lt",
+        "<=": "_lte",
+        "!=": "_ne",
+    }
+    result: dict = {}
+    for key, value in filters.items():
+        if (
+            isinstance(value, dict)
+            and "operator" in value
+            and "value" in value
+            and len(value) == 2
+        ):
+            op = value["operator"]
+            scalar = value["value"]
+            suffix = _OP_TO_SUFFIX.get(op)
+            if suffix is not None:
+                result[f"{key}{suffix}"] = scalar
+            else:
+                # operator "=" or unknown — keep key as-is with scalar value
+                result[key] = scalar
+        else:
+            result[key] = value
+    return result
 
 
 def _canonicalize_entity(entity: str, config: NormalizedSchemaConfig) -> str:
@@ -206,6 +296,32 @@ def _coerce_optional_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def extract_raw_sql(raw: str) -> str:
+    """Extract a SQL query from raw LLM output, stripping markdown fences and prefixes."""
+    # Try fenced code block first
+    match = re.search(r"```(?:sql)?\s*(.*?)\s*```", raw, flags=re.S | re.I)
+    if match:
+        return match.group(1).strip()
+    # Strip common prefixes
+    for prefix in ("sql query:", "sql:", "query:", "answer:"):
+        idx = raw.lower().find(prefix)
+        if idx >= 0:
+            return raw[idx + len(prefix):].strip()
+    return raw.strip()
+
+
+def extract_raw_graphql(raw: str) -> str:
+    """Extract a GraphQL query from raw LLM output, stripping markdown fences."""
+    match = re.search(r"```(?:graphql)?\s*(.*?)\s*```", raw, flags=re.S | re.I)
+    if match:
+        return match.group(1).strip()
+    # Find the first opening brace (start of the query)
+    brace_start = raw.find("{")
+    if brace_start >= 0:
+        return raw[brace_start:].strip()
+    return raw.strip()
 
 
 def _load_intent_payload(raw: str) -> dict[str, Any]:

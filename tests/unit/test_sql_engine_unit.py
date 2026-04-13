@@ -1,6 +1,7 @@
 import pytest
 
 from text2ql.engines.sql import SQLEngine
+from text2ql.providers.base import LLMProvider
 from text2ql.types import QueryRequest
 
 pytestmark = pytest.mark.unit
@@ -23,8 +24,8 @@ def test_sql_engine_generates_basic_select_with_alias_mapping() -> None:
     result = engine.generate(request)
 
     assert result.target == "sql"
-    assert "FROM customers" in result.query
-    assert "customers.email" in result.query
+    assert 'FROM "customers"' in result.query
+    assert '"customers"."email"' in result.query
     assert "LIMIT 5" in result.query
 
 
@@ -38,7 +39,7 @@ def test_sql_engine_supports_ordering_and_pagination() -> None:
 
     result = engine.generate(request)
 
-    assert "ORDER BY customers.total DESC" in result.query
+    assert 'ORDER BY "customers"."total" DESC' in result.query
     assert "LIMIT 5" in result.query
     assert "OFFSET 10" in result.query
 
@@ -53,8 +54,8 @@ def test_sql_engine_supports_negation_comparison_and_grouped_filters() -> None:
 
     result = engine.generate(request)
 
-    assert "products.price >= 10" in result.query
-    assert "products.status !=" in result.query
+    assert '"products"."price" >= 10' in result.query
+    assert '"products"."status" !=' in result.query
     assert "IN ('retail', 'wholesale')" in result.query
     assert "WHERE" in result.query
 
@@ -88,9 +89,9 @@ def test_sql_engine_coerces_enum_boolean_and_null() -> None:
 
     result = engine.generate(request)
 
-    assert "orders.status = 'ACTIVE'" in result.query
-    assert "orders.shipped_ne = FALSE" in result.query
-    assert "orders.cursor IS NULL" in result.query
+    assert '"orders"."status" = \'ACTIVE\'' in result.query
+    assert '"orders"."shipped_ne" = FALSE' in result.query
+    assert '"orders"."cursor" IS NULL' in result.query
 
 
 def test_sql_engine_supports_relation_join_with_local_filters() -> None:
@@ -116,8 +117,8 @@ def test_sql_engine_supports_relation_join_with_local_filters() -> None:
 
     result = engine.generate(request)
 
-    assert "LEFT JOIN orders orders ON orders.customerId = customers.id" in result.query
-    assert "orders.status = 'shipped'" in result.query
+    assert 'LEFT JOIN "orders" "orders" ON orders.customerId = customers.id' in result.query
+    assert '"orders"."status" = \'shipped\'' in result.query
 
 
 def test_sql_engine_parses_grouped_filters_with_parentheses_precedence() -> None:
@@ -130,9 +131,9 @@ def test_sql_engine_parses_grouped_filters_with_parentheses_precedence() -> None
 
     result = engine.generate(request)
 
-    assert "products.status = 'active'" in result.query
-    assert "products.price >= 10" in result.query
-    assert "products.category IN ('retail', 'wholesale')" in result.query
+    assert '"products"."status" = \'active\'' in result.query
+    assert '"products"."price" >= 10' in result.query
+    assert '"products"."category" IN (\'retail\', \'wholesale\')' in result.query
     assert " OR " in result.query
 
 
@@ -177,7 +178,7 @@ def test_sql_engine_extract_filter_value_ignores_spurious_token() -> None:
 
 
 def test_sql_engine_llm_reconciles_owned_asset_filter_when_missing() -> None:
-    class _StubProvider:
+    class _StubProvider(LLMProvider):
         def complete(self, system_prompt: str, user_prompt: str) -> str:
             return (
                 '{"table":"positions","columns":["quantity"],"filters":{},'
@@ -195,11 +196,11 @@ def test_sql_engine_llm_reconciles_owned_asset_filter_when_missing() -> None:
             "args": {"positions": ["symbol"]},
         },
         mapping={"filter_values": {"symbol": {"qqq": "QQQ"}}},
-        context={"mode": "llm", "language": "english"},
+        context={"mode": "function_calling", "language": "english"},
     )
 
     result = engine.generate(request)
 
-    assert "FROM positions" in result.query
-    assert "positions.symbol = 'QQQ'" in result.query
-    assert "positions.quantity" in result.query
+    assert 'FROM "positions"' in result.query
+    assert '"positions"."symbol" = \'QQQ\'' in result.query
+    assert '"positions"."quantity"' in result.query

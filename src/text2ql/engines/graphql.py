@@ -5,7 +5,7 @@ import re
 from datetime import datetime
 from typing import Any
 
-from text2ql.constrained import ConstrainedOutputError, parse_graphql_intent
+from text2ql.constrained import ConstrainedOutputError, extract_raw_graphql, parse_graphql_intent
 from text2ql.renderers import GraphQLIRRenderer
 from text2ql.filters import (
     AND_TOKEN as _AND_TOKEN,
@@ -20,6 +20,7 @@ from text2ql.filters import (
 )
 from text2ql.prompting import (
     GRAPHQL_INTENT_JSON_SCHEMA,
+    build_graphql_direct_prompts,
     build_graphql_prompts,
     resolve_language,
     resolve_prompt_template,
@@ -167,6 +168,9 @@ class GraphQLEngine(QueryEngine):
             logger.warning("GraphQLEngine: %s", error)
             return None, error
 
+        # Capture whether LLM intended empty fields (pure aggregation — no extra field padding)
+        llm_fields_empty = len(intent.fields) == 0
+
         reconciled_entity, reconciled_fields, reconciled_filters = self._reconcile_owned_asset_intent(
             prompt=prompt,
             entity=intent.entity,
@@ -174,14 +178,37 @@ class GraphQLEngine(QueryEngine):
             filters=dict(intent.filters),
             config=config,
         )
-        # Detect aggregations and nested from the original prompt so LLM mode
-        # produces the same richness as deterministic mode.
-        aggregations = self._detect_aggregations(prompt, config, reconciled_entity)
-        nested = self._detect_nested(prompt, config, reconciled_entity)
+        # Prefer LLM-provided aggregations; fall back to text detection.
+        if intent.aggregations:
+            aggregations = [
+                {
+                    "function": str(a.get("function", "COUNT")).upper(),
+                    "field": str(a.get("field", "*")),
+                    "alias": a.get("alias"),
+                }
+                for a in intent.aggregations
+            ]
+        else:
+            aggregations = self._detect_aggregations(prompt, config, reconciled_entity)
+
+        # When the LLM explicitly returned fields=[] with aggregations, respect that
+        # intent: a pure aggregation needs no scalar fields in the selection set.
+        if llm_fields_empty and aggregations:
+            reconciled_fields = []
+
+        # Prefer LLM-provided nested relations; fall back to text detection.
+        if intent.nested:
+            nested = intent.nested
+        else:
+            nested = self._detect_nested(prompt, config, reconciled_entity)
         entity, fields, filters, aggregations, nested, validation_notes = self._validate_components(
             reconciled_entity, reconciled_fields, reconciled_filters, aggregations, nested, config,
         )
-        query = self._build_query(entity, fields, filters, aggregations, nested)
+        query = self._build_query(
+            entity, fields, filters, aggregations, nested,
+            distinct=intent.distinct,
+            having=intent.having,
+        )
         validation_notes.extend(self._validate_generated_query_against_introspection(query, config))
         # Use calibrated schema-aware confidence instead of the LLM's self-report,
         # which is an uncalibrated guess that produces incomparable scores across modes.
@@ -204,11 +231,87 @@ class GraphQLEngine(QueryEngine):
                 "filters": filters,
                 "aggregations": aggregations,
                 "nested": nested,
+                "distinct": intent.distinct,
+                "having": intent.having,
                 "mode": "llm",
                 "language": resolved_language,
                 "raw_completion": raw,
                 "llm_confidence": intent.confidence,
                 "validation_notes": validation_notes,
+            },
+        ), None
+
+    def _generate_direct_graphql(
+        self,
+        prompt: str,
+        config: NormalizedSchemaConfig,
+        context: dict,
+    ) -> tuple[QueryResult | None, str | None]:
+        """Generate GraphQL by having the LLM write the raw query directly (mode='llm')."""
+        language = str(context.get("language", "english"))
+        try:
+            resolved_language = resolve_language(language)
+        except ValueError:
+            return None, f"Unsupported language '{language}'"
+        try:
+            system_prompt, user_prompt = build_graphql_direct_prompts(prompt, config, language=resolved_language)
+            system_prompt = self._apply_system_context(system_prompt, context)
+        except Exception as exc:
+            return None, f"Failed to build direct GraphQL prompts: {exc}"
+        logger.debug("GraphQLEngine: calling LLM for direct GraphQL generation")
+        try:
+            raw = self.provider.complete(system_prompt=system_prompt, user_prompt=user_prompt)
+        except (RuntimeError, ValueError, TypeError) as exc:
+            return None, f"LLM provider error: {exc}"
+        query = extract_raw_graphql(raw)
+        if not query:
+            return None, "LLM returned empty GraphQL query"
+        return QueryResult(
+            query=query,
+            target="graphql",
+            confidence=0.8,
+            explanation=f"Direct GraphQL generated by LLM for: {prompt[:80]}",
+            metadata={
+                "mode": "llm_direct",
+                "language": resolved_language,
+                "raw_completion": raw,
+            },
+        ), None
+
+    async def _agenerate_direct_graphql(
+        self,
+        prompt: str,
+        config: NormalizedSchemaConfig,
+        context: dict,
+    ) -> tuple[QueryResult | None, str | None]:
+        """Async version of _generate_direct_graphql."""
+        language = str(context.get("language", "english"))
+        try:
+            resolved_language = resolve_language(language)
+        except ValueError:
+            return None, f"Unsupported language '{language}'"
+        try:
+            system_prompt, user_prompt = build_graphql_direct_prompts(prompt, config, language=resolved_language)
+            system_prompt = self._apply_system_context(system_prompt, context)
+        except Exception as exc:
+            return None, f"Failed to build direct GraphQL prompts: {exc}"
+        logger.debug("GraphQLEngine: calling LLM for direct GraphQL generation (async)")
+        try:
+            raw = await self.provider.acomplete(system_prompt=system_prompt, user_prompt=user_prompt)
+        except (RuntimeError, ValueError, TypeError) as exc:
+            return None, f"LLM provider error: {exc}"
+        query = extract_raw_graphql(raw)
+        if not query:
+            return None, "LLM returned empty GraphQL query"
+        return QueryResult(
+            query=query,
+            target="graphql",
+            confidence=0.8,
+            explanation=f"Direct GraphQL generated by LLM for: {prompt[:80]}",
+            metadata={
+                "mode": "llm_direct",
+                "language": resolved_language,
+                "raw_completion": raw,
             },
         ), None
 
@@ -219,23 +322,19 @@ class GraphQLEngine(QueryEngine):
         context: dict,
         mode: str = "llm",
     ) -> tuple[QueryResult | None, str | None]:
+        if mode == "llm":
+            return self._generate_direct_graphql(prompt, config, context)
         prepared = self._prepare_llm_prompts(prompt, config, context)
         if prepared is None:
             return None, "Failed to prepare LLM prompts (invalid language or template)."
         system_prompt, user_prompt, resolved_language = prepared
-        use_fc = mode == "function_calling"
-        logger.debug(
-            "GraphQLEngine: calling LLM provider (sync, function_calling=%s)", use_fc
-        )
+        logger.debug("GraphQLEngine: calling LLM provider (sync, function_calling=True)")
         try:
-            if use_fc:
-                raw = self.provider.complete_structured(
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    json_schema=GRAPHQL_INTENT_JSON_SCHEMA,
-                )
-            else:
-                raw = self.provider.complete(system_prompt=system_prompt, user_prompt=user_prompt)
+            raw = self.provider.complete_structured(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                json_schema=GRAPHQL_INTENT_JSON_SCHEMA,
+            )
         except (RuntimeError, ValueError, TypeError) as exc:
             error = f"LLM provider error: {exc}"
             logger.warning("GraphQLEngine: %s", error)
@@ -249,25 +348,19 @@ class GraphQLEngine(QueryEngine):
         context: dict,
         mode: str = "llm",
     ) -> tuple[QueryResult | None, str | None]:
+        if mode == "llm":
+            return await self._agenerate_direct_graphql(prompt, config, context)
         prepared = self._prepare_llm_prompts(prompt, config, context)
         if prepared is None:
             return None, "Failed to prepare LLM prompts (invalid language or template)."
         system_prompt, user_prompt, resolved_language = prepared
-        use_fc = mode == "function_calling"
-        logger.debug(
-            "GraphQLEngine: calling LLM provider (async, function_calling=%s)", use_fc
-        )
+        logger.debug("GraphQLEngine: calling LLM provider (async, function_calling=True)")
         try:
-            if use_fc:
-                raw = await self.provider.acomplete_structured(
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    json_schema=GRAPHQL_INTENT_JSON_SCHEMA,
-                )
-            else:
-                raw = await self.provider.acomplete(
-                    system_prompt=system_prompt, user_prompt=user_prompt
-                )
+            raw = await self.provider.acomplete_structured(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                json_schema=GRAPHQL_INTENT_JSON_SCHEMA,
+            )
         except (RuntimeError, ValueError, TypeError) as exc:
             error = f"LLM provider error: {exc}"
             logger.warning("GraphQLEngine: async LLM provider error: %s", error)
@@ -1262,6 +1355,8 @@ class GraphQLEngine(QueryEngine):
         filters: dict[str, Any],
         aggregations: list[dict[str, str]],
         nested: list[dict[str, Any]],
+        distinct: bool = False,
+        having: list[dict] | None = None,
     ) -> str:
         """Build a GraphQL query string via :class:`~text2ql.renderers.GraphQLIRRenderer`.
 
@@ -1276,6 +1371,8 @@ class GraphQLEngine(QueryEngine):
             aggregations=aggregations,
             nested=nested,
             target="graphql",
+            distinct=distinct,
+            having=having or [],
         )
         return _GRAPHQL_RENDERER.render(ir)
 
@@ -1347,6 +1444,7 @@ class GraphQLEngine(QueryEngine):
             default_fields=config.default_fields,
             entity=validated_entity,
             notes=notes,
+            aggregation_only=not fields and bool(aggregations),
         )
         allowed_args = self._resolve_allowed_args(validated_entity, config)
         validated_filters = self._validate_filters(
@@ -1428,7 +1526,11 @@ class GraphQLEngine(QueryEngine):
         default_fields: list[str],
         entity: str,
         notes: list[str],
+        aggregation_only: bool = False,
     ) -> list[str]:
+        # Pure aggregation query — no scalar fields needed in the selection set.
+        if aggregation_only:
+            return []
         if not allowed_fields:
             return fields
         filtered_fields = [field for field in fields if field in allowed_fields]

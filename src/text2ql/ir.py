@@ -201,6 +201,9 @@ class QueryIR:
     target: str = "graphql"
     source_text: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    distinct: bool = False
+    having: list[dict[str, Any]] = field(default_factory=list)
+    subqueries: list[dict[str, Any]] = field(default_factory=list)
 
     # ------------------------------------------------------------------
     # Factory helpers
@@ -243,6 +246,9 @@ class QueryIR:
             target=result.target,
             source_text=source_text,
             metadata=meta,
+            distinct=bool(meta.get("distinct", False)),
+            having=list(meta.get("having") or []),
+            subqueries=list(meta.get("subqueries") or []),
         )
 
     @classmethod
@@ -263,6 +269,9 @@ class QueryIR:
         source_text: str = "",
         metadata: dict[str, Any] | None = None,
         exact_filter_keys: frozenset[str] | None = None,
+        distinct: bool = False,
+        having: list[dict[str, Any]] | None = None,
+        subqueries: list[dict[str, Any]] | None = None,
     ) -> "QueryIR":
         """Build a ``QueryIR`` directly from engine component dicts.
 
@@ -292,6 +301,9 @@ class QueryIR:
             target=target,
             source_text=source_text,
             metadata=metadata or {},
+            distinct=distinct,
+            having=list(having or []),
+            subqueries=list(subqueries or []),
         )
 
 
