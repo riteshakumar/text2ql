@@ -172,6 +172,7 @@ async def arewrite_user_utterance(
 def _build_system_prompt(target: str, system_context: str) -> str:
     base = (
         "You rewrite user utterances into clear canonical requests for text2ql.\n"
+        f"Target query language: {target.strip().lower() or 'graphql'}.\n"
         "Return ONLY JSON object with keys: rewritten_text (string), notes (string), confidence (number 0..1).\n"
         "Do not invent entities/fields that are not present in schema context.\n"
         "Keep intent unchanged.\n"
@@ -237,29 +238,33 @@ def _extract_first_json_object(raw: str) -> str | None:
     start = raw.find("{")
     if start < 0:
         return None
-    depth = 0
-    in_string = False
-    escaped = False
+    state = {"depth": 0, "in_string": False, "escaped": False}
     for idx in range(start, len(raw)):
         ch = raw[idx]
-        if escaped:
-            escaped = False
-            continue
-        if ch == "\\":
-            escaped = True
-            continue
-        if ch == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return raw[start : idx + 1].strip()
+        if _advance_json_scan_state(state, ch) and state["depth"] == 0:
+            return raw[start : idx + 1].strip()
     return None
+
+
+def _advance_json_scan_state(state: dict[str, Any], ch: str) -> bool:
+    if state["escaped"]:
+        state["escaped"] = False
+        return False
+    if ch == "\\":
+        state["escaped"] = True
+        return False
+    if ch == '"':
+        state["in_string"] = not state["in_string"]
+        return False
+    if state["in_string"]:
+        return False
+    if ch == "{":
+        state["depth"] += 1
+        return True
+    if ch == "}":
+        state["depth"] -= 1
+        return True
+    return False
 
 
 def _match_owned_asset_phrase(lowered: str) -> str | None:

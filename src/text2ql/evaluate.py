@@ -12,6 +12,17 @@ ExecutionBackend = Callable[[str, DatasetExample], Any]
 AsyncExecutionBackend = Callable[[str, DatasetExample], Any]  # may be sync or async
 ExecutionComparator = Callable[[Any, Any], bool]
 
+IDENTIFIER_PATTERN = r"[A-Za-z_]\w*"
+QUOTED_IDENTIFIER_RE = rf'"({IDENTIFIER_PATTERN})"'
+FROM_IDENTIFIER_RE = rf'\bfrom\s+"?({IDENTIFIER_PATTERN})"?\b'
+JOIN_IDENTIFIER_RE = rf'\bjoin\s+"?({IDENTIFIER_PATTERN})"?\b'
+SELECT_CLAUSE_RE = r"\bselect\s+(.*?)\s+\bfrom\b"
+AS_ALIAS_RE = r"\s+as\s+\w+"
+ORDER_BY_KEYWORD = "order by"
+WHERE_SPLIT_TERMINATORS = (ORDER_BY_KEYWORD, "limit", "offset", ";")
+ORDER_BY_SPLIT_TERMINATORS = ("limit", "offset", ";")
+JOIN_ON_END_TERMINATORS = ("join", "where", ORDER_BY_KEYWORD, "limit", "offset", ";")
+
 
 @dataclass(slots=True)
 class EvaluationRow:
@@ -203,7 +214,7 @@ def normalize_query(query: str) -> str:
     """
     q = re.sub(r"\s+", " ", query.strip())
     # Strip double-quote wrapping from identifiers: "foo" → foo
-    q = re.sub(r'"([A-Za-z_]\w*)"', r"\1", q)
+    q = _normalize_quoted_identifiers(q)
     # Remove trailing semicolon
     q = q.rstrip(";").rstrip()
     return q.lower()
@@ -272,52 +283,17 @@ def _parse_sql_signature(
     tuple[str, ...],
     tuple[str, ...],
 ] | None:
-    # Support both quoted ("table") and unquoted (table) identifiers after FROM
-    table_match = re.search(r'\bfrom\s+"?([A-Za-z_]\w*)"?\b', query, re.I)
-    if not table_match:
+    table = _parse_from_table(query)
+    if table is None:
         return None
-    table = table_match.group(1).lower()
     source_tables = _extract_source_tables(query)
     join_predicates = _extract_join_predicates(query)
 
-    select_match = re.search(r"\bselect\s+(.*?)\s+\bfrom\b", query, re.I | re.S)
-    if not select_match:
+    fields = _parse_select_fields(query)
+    if fields is None:
         return None
-    # Normalise field tokens: strip double-quotes and table prefix quotes
-    raw_fields = [segment.strip() for segment in select_match.group(1).split(",") if segment.strip()]
-    normalised_fields: list[str] = []
-    for f in raw_fields:
-        # Strip AS alias clause: "orders"."id" AS orders_id → "orders"."id"
-        f = re.sub(r"\s+as\s+\w+", "", f, flags=re.I).strip()
-        # Remove double-quote wrapping from each dot-separated part
-        parts = f.split(".")
-        unquoted = ".".join(_strip_sql_quotes(p) for p in parts)
-        # Reduce "table.col" to just "col" for comparison with bare gold SELECT
-        if "." in unquoted:
-            unquoted = unquoted.split(".")[-1]
-        normalised_fields.append(unquoted.lower())
-    fields = tuple(sorted(_dedupe(normalised_fields)))
 
-    where_match = re.search(r"\bwhere\s+(.*?)(?:\border by\b|\blimit\b|\boffset\b|;|$)", query, re.I | re.S)
-    filters: dict[str, str] = {}
-    if where_match:
-        for condition in re.split(r"\s+and\s+", where_match.group(1), flags=re.I):
-            condition = condition.strip()
-            if not condition:
-                continue
-            parts = re.split(r"\s*(>=|<=|!=|=|>|<|in|not in|is null|is not null)\s*", condition, maxsplit=1, flags=re.I)
-            if len(parts) >= 2:
-                # Strip quotes from key (column reference), reduce table.col → col
-                raw_key = parts[0].strip()
-                key_parts = raw_key.split(".")
-                key = ".".join(_strip_sql_quotes(p) for p in key_parts).lower()
-                # Reduce "table.col" to just "col" so that quoted predicates
-                # match gold WHERE clauses that use bare column names.
-                if "." in key:
-                    key = key.split(".")[-1]
-                op = parts[1].strip().lower()
-                value = parts[2].strip().lower() if len(parts) > 2 else ""
-                filters[f"{key} {op}"] = value
+    filters = _parse_where_filters(query)
 
     ordering = _extract_ordering_signature(query)
 
@@ -333,7 +309,7 @@ def _parse_sql_signature(
 
 def _extract_source_tables(query: str) -> tuple[str, ...]:
     tables: list[str] = []
-    for pattern in (r'\bfrom\s+"?([A-Za-z_]\w*)"?\b', r'\bjoin\s+"?([A-Za-z_]\w*)"?\b'):
+    for pattern in (FROM_IDENTIFIER_RE, JOIN_IDENTIFIER_RE):
         for match in re.finditer(pattern, query, re.I):
             tables.append(match.group(1).lower())
     return tuple(sorted(_dedupe(tables)))
@@ -342,34 +318,21 @@ def _extract_source_tables(query: str) -> tuple[str, ...]:
 def _extract_join_predicates(query: str) -> tuple[str, ...]:
     """Collect normalized JOIN ON predicates from SQL query text."""
     predicates: list[str] = []
-    for match in re.finditer(
-        r"\bon\s+(.*?)(?=\b(?:left|right|inner|outer|cross)?\s*join\b|\bwhere\b|\border by\b|\blimit\b|\boffset\b|;|$)",
-        query,
-        re.I | re.S,
-    ):
-        predicate = match.group(1).strip()
-        if not predicate:
-            continue
-        normalized = re.sub(r"\s+", " ", predicate)
-        normalized = re.sub(r'"([A-Za-z_]\w*)"', r"\1", normalized).lower()
-        predicates.append(normalized)
+    for segment in re.split(r"\b(?:left|right|inner|outer|cross)?\s*join\b", query, flags=re.I):
+        on_clause = _slice_clause(segment, "on", JOIN_ON_END_TERMINATORS)
+        if on_clause:
+            normalized = _normalize_quoted_identifiers(re.sub(r"\s+", " ", on_clause.strip())).lower()
+            predicates.append(normalized)
     return tuple(sorted(_dedupe(predicates)))
 
 
 def _extract_ordering_signature(query: str) -> list[str]:
-    order_match = re.search(
-        r"\border by\s+(.*?)(?:\blimit\b|\boffset\b|;|$)",
-        query,
-        re.I | re.S,
-    )
-    if not order_match:
-        return []
-    order_blob = order_match.group(1).strip()
+    order_blob = _slice_clause(query, ORDER_BY_KEYWORD, ORDER_BY_SPLIT_TERMINATORS)
     if not order_blob:
         return []
     ordering: list[str] = []
     for clause in [part.strip() for part in order_blob.split(",") if part.strip()]:
-        normalized_clause = re.sub(r'"([A-Za-z_]\w*)"', r"\1", clause).lower()
+        normalized_clause = _normalize_quoted_identifiers(clause).lower()
         pieces = normalized_clause.split()
         if not pieces:
             continue
@@ -378,6 +341,90 @@ def _extract_ordering_signature(query: str) -> list[str]:
         direction = pieces[1] if len(pieces) > 1 and pieces[1] in {"asc", "desc"} else "asc"
         ordering.append(f"{col} {direction}")
     return ordering
+
+
+def _parse_from_table(query: str) -> str | None:
+    table_match = re.search(FROM_IDENTIFIER_RE, query, re.I)
+    if table_match is None:
+        return None
+    return table_match.group(1).lower()
+
+
+def _parse_select_fields(query: str) -> tuple[str, ...] | None:
+    select_match = re.search(SELECT_CLAUSE_RE, query, re.I | re.S)
+    if not select_match:
+        return None
+    raw_fields = [segment.strip() for segment in select_match.group(1).split(",") if segment.strip()]
+    normalized = [_normalize_select_field(segment) for segment in raw_fields]
+    return tuple(sorted(_dedupe([field for field in normalized if field])))
+
+
+def _normalize_select_field(field: str) -> str:
+    raw = re.sub(AS_ALIAS_RE, "", field, flags=re.I).strip()
+    unquoted = ".".join(_strip_sql_quotes(part) for part in raw.split("."))
+    if "." in unquoted:
+        unquoted = unquoted.split(".")[-1]
+    return unquoted.lower()
+
+
+def _parse_where_filters(query: str) -> dict[str, str]:
+    where_blob = _slice_clause(query, "where", WHERE_SPLIT_TERMINATORS)
+    if not where_blob:
+        return {}
+
+    filters: dict[str, str] = {}
+    for condition in re.split(r"\s+and\s+", where_blob, flags=re.I):
+        condition = condition.strip()
+        if not condition:
+            continue
+        key, op, value = _parse_filter_condition(condition)
+        if key and op:
+            filters[f"{key} {op}"] = value
+    return filters
+
+
+def _parse_filter_condition(condition: str) -> tuple[str, str, str]:
+    parts = re.split(
+        r"\s*(>=|<=|!=|=|>|<|in|not in|is null|is not null)\s*",
+        condition,
+        maxsplit=1,
+        flags=re.I,
+    )
+    if len(parts) < 2:
+        return "", "", ""
+    key = _normalize_filter_key(parts[0].strip())
+    op = parts[1].strip().lower()
+    value = parts[2].strip().lower() if len(parts) > 2 else ""
+    return key, op, value
+
+
+def _normalize_filter_key(raw_key: str) -> str:
+    key = ".".join(_strip_sql_quotes(part) for part in raw_key.split(".")).lower()
+    return key.split(".")[-1] if "." in key else key
+
+
+def _normalize_quoted_identifiers(value: str) -> str:
+    return re.sub(QUOTED_IDENTIFIER_RE, r"\1", value)
+
+
+def _slice_clause(query: str, start_keyword: str, end_keywords: tuple[str, ...]) -> str:
+    lowered = query.lower()
+    start_marker = f"{start_keyword.lower()} "
+    start = lowered.find(start_marker)
+    if start < 0:
+        return ""
+    body_start = start + len(start_marker)
+    body = query[body_start:]
+    lowered_body = lowered[body_start:]
+    end = len(body)
+    for marker in end_keywords:
+        idx = lowered_body.find(f" {marker}")
+        if idx >= 0:
+            end = min(end, idx)
+    semicolon_index = lowered_body.find(";")
+    if semicolon_index >= 0:
+        end = min(end, semicolon_index)
+    return body[:end].strip()
 
 
 def _parse_graphql_signature(query: str) -> tuple[str, tuple[str, ...], tuple[tuple[str, str], ...]] | None:

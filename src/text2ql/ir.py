@@ -258,20 +258,7 @@ class QueryIR:
         entity: str,
         fields: list[str],
         filters: dict[str, Any],
-        joins: list[dict[str, Any]] | None = None,
-        nested: list[dict[str, Any]] | None = None,
-        aggregations: list[dict[str, Any]] | None = None,
-        order_by: str | None = None,
-        order_dir: str | None = None,
-        limit: int | None = None,
-        offset: int | None = None,
-        target: str = "graphql",
-        source_text: str = "",
-        metadata: dict[str, Any] | None = None,
-        exact_filter_keys: frozenset[str] | None = None,
-        distinct: bool = False,
-        having: list[dict[str, Any]] | None = None,
-        subqueries: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
     ) -> "QueryIR":
         """Build a ``QueryIR`` directly from engine component dicts.
 
@@ -282,7 +269,10 @@ class QueryIR:
             column names so that columns whose names end in ``_ne``/``_gte``/…
             are not mistakenly treated as comparison-operator suffixes.
         """
-        flat_filters, group_filters = _split_filters(filters, exact_filter_keys)
+        joins = kwargs.get("joins")
+        nested = kwargs.get("nested")
+        aggregations = kwargs.get("aggregations")
+        flat_filters, group_filters = _split_filters(filters, kwargs.get("exact_filter_keys"))
         ir_joins = [_join_from_dict(j) for j in (joins or []) if isinstance(j, dict)]
         ir_nested = [_nested_from_dict(n) for n in (nested or []) if isinstance(n, dict)]
         ir_aggs = [_agg_from_dict(a) for a in (aggregations or []) if isinstance(a, dict)]
@@ -294,16 +284,16 @@ class QueryIR:
             nested=ir_nested,
             aggregations=ir_aggs,
             group_filters=group_filters,
-            order_by=order_by,
-            order_dir=order_dir,
-            limit=limit,
-            offset=offset,
-            target=target,
-            source_text=source_text,
-            metadata=metadata or {},
-            distinct=distinct,
-            having=list(having or []),
-            subqueries=list(subqueries or []),
+            order_by=kwargs.get("order_by"),
+            order_dir=kwargs.get("order_dir"),
+            limit=kwargs.get("limit"),
+            offset=kwargs.get("offset"),
+            target=kwargs.get("target", "graphql"),
+            source_text=kwargs.get("source_text", ""),
+            metadata=kwargs.get("metadata") or {},
+            distinct=bool(kwargs.get("distinct", False)),
+            having=list(kwargs.get("having") or []),
+            subqueries=list(kwargs.get("subqueries") or []),
         )
 
 
@@ -384,7 +374,7 @@ def _split_filters(
     groups: dict[str, Any] = {}
     exact_keys: frozenset[str] = exact_filter_keys or frozenset()
 
-    _SUFFIX_OP = {
+    suffix_op = {
         "_gte": "gte",
         "_lte": "lte",
         "_gt": "gt",
@@ -398,22 +388,34 @@ def _split_filters(
         if key in {"and", "or", "not"} and isinstance(value, list):
             groups[key] = value
             continue
-        if value is None:
-            flat.append(IRFilter(key=key, value=None, operator="is_null"))
-            continue
-        op = "eq"
-        canonical_key = key
-        # Only attempt suffix-based operator detection when the key is not
-        # a known exact schema column name.
-        if key not in exact_keys:
-            for suffix, suffix_op in _SUFFIX_OP.items():
-                if key.endswith(suffix):
-                    canonical_key = key[: -len(suffix)]
-                    op = suffix_op
-                    break
-        flat.append(IRFilter(key=canonical_key, value=value, operator=op))
+        flat.append(_build_ir_filter(key, value, exact_keys, suffix_op))
 
     return flat, groups
+
+
+def _build_ir_filter(
+    key: str,
+    value: Any,
+    exact_keys: frozenset[str],
+    suffix_op: dict[str, str],
+) -> IRFilter:
+    if value is None:
+        return IRFilter(key=key, value=None, operator="is_null")
+    canonical_key, operator = _resolve_filter_operator(key, exact_keys, suffix_op)
+    return IRFilter(key=canonical_key, value=value, operator=operator)
+
+
+def _resolve_filter_operator(
+    key: str,
+    exact_keys: frozenset[str],
+    suffix_op: dict[str, str],
+) -> tuple[str, str]:
+    if key in exact_keys:
+        return key, "eq"
+    for suffix, op in suffix_op.items():
+        if key.endswith(suffix):
+            return key[: -len(suffix)], op
+    return key, "eq"
 
 
 def _join_from_dict(d: dict[str, Any]) -> IRJoin:

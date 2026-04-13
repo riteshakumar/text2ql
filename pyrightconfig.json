@@ -1,0 +1,15 @@
+{
+  "include": [
+    "src",
+    "tests",
+    "run_llm_benchmark.py"
+  ],
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "extraPaths": [
+        "src"
+      ]
+    }
+  ]
+}

@@ -27,6 +27,8 @@ provided for unit tests and CI pipelines — no external database required.
 
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -35,17 +37,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Optional SQLAlchemy import guard
-# ---------------------------------------------------------------------------
-
-_SQLALCHEMY_AVAILABLE = False
-try:
-    import sqlalchemy  # noqa: F401
-
-    _SQLALCHEMY_AVAILABLE = True
-except ImportError:
-    pass
+_SQLALCHEMY_AVAILABLE = importlib.util.find_spec("sqlalchemy") is not None
 
 
 def _require_sqlalchemy() -> None:
@@ -55,6 +47,19 @@ def _require_sqlalchemy() -> None:
             "Install it with: pip install text2ql[sql]  "
             "or: pip install 'sqlalchemy>=2.0'"
         )
+
+
+def _sqlalchemy_module() -> Any:
+    """Load SQLAlchemy lazily so optional dependency checks stay runtime-only."""
+    _require_sqlalchemy()
+    try:
+        return importlib.import_module("sqlalchemy")
+    except ImportError as exc:
+        raise ImportError(
+            "SQLAlchemy is required for SQL execution. "
+            "Install it with: pip install text2ql[sql]  "
+            "or: pip install 'sqlalchemy>=2.0'"
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -97,8 +102,7 @@ class SQLAlchemyExecutor:
         connect_args: dict[str, Any] | None = None,
         row_limit: int | None = 10_000,
     ) -> None:
-        _require_sqlalchemy()
-        import sqlalchemy as sa
+        sa = _sqlalchemy_module()
 
         if isinstance(engine_or_url, str):
             kwargs: dict[str, Any] = {}
@@ -137,7 +141,7 @@ class SQLAlchemyExecutor:
             Any database or driver error propagates unchanged so that the
             evaluation framework can record it in ``execution_backend_error``.
         """
-        import sqlalchemy as sa
+        sa = _sqlalchemy_module()
 
         statement = _maybe_add_limit(sql, self._row_limit)
         logger.debug("Executing SQL: %s", statement)
@@ -249,8 +253,7 @@ def create_sqlite_executor(
         rows = executor.execute("SELECT name FROM users WHERE status = 'active';")
         # [{"name": "Alice"}]
     """
-    _require_sqlalchemy()
-    import sqlalchemy as sa
+    sa = _sqlalchemy_module()
 
     engine = sa.create_engine(
         "sqlite:///:memory:", connect_args={"check_same_thread": False}
@@ -282,7 +285,7 @@ def _maybe_add_limit(sql: str, row_limit: int | None) -> str:
 
 def _load_json_data_raw(engine: Any, table_name: str, rows: list[dict[str, Any]]) -> None:
     """DDL-based bulk insert without pandas."""
-    import sqlalchemy as sa
+    sa = _sqlalchemy_module()
 
     columns = list(rows[0].keys())
     col_defs = ", ".join(f'"{col}" TEXT' for col in columns)

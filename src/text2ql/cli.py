@@ -447,19 +447,13 @@ def _generate_result_payloads(
     execution_matches = 0
     execution_total = 0
     for idx, prompt in enumerate(prompts):
-        rewritten_prompt = prompt
-        rewrite_meta: dict[str, Any] = {"applied": False, "reason": "disabled"}
-        if args.llm_rewrite == "on" and rewrite_provider is not None:
-            rewritten_prompt, rewrite_meta = rewrite_user_utterance(
-                text=prompt,
-                target=args.target,
-                schema=schema,
-                mapping=mapping,
-                provider=rewrite_provider,
-                system_context=args.system_context,
-            )
-        elif args.llm_rewrite == "on" and rewrite_provider is None:
-            rewrite_meta = {"applied": False, "reason": "missing_api_key_or_provider"}
+        rewritten_prompt, rewrite_meta = _rewrite_prompt_if_enabled(
+            args=args,
+            prompt=prompt,
+            rewrite_provider=rewrite_provider,
+            schema=schema,
+            mapping=mapping,
+        )
         result = service.generate(
             text=rewritten_prompt,
             target=args.target,
@@ -478,17 +472,7 @@ def _generate_result_payloads(
             engine_confidence=as_unit_float(result.confidence, default=0.5),
             rewrite_meta=rewrite_meta if (args.llm_rewrite == "on" and rewrite_provider is not None) else None,
         )
-        payload: dict[str, Any] = {
-            "prompt": prompt,
-            "rewritten_prompt": rewritten_prompt,
-            "rewrite": rewrite_meta,
-            "query": result.query,
-            "confidence": result.confidence,
-            "explanation": result.explanation,
-            "synthetic": dynamic_meta,
-            "metadata": dynamic_meta,
-            "engine_metadata": result.metadata,
-        }
+        payload = _build_generation_payload(prompt, rewritten_prompt, rewrite_meta, result, dynamic_meta)
         if execution_eval_enabled:
             _apply_execution_evaluation(
                 payload=payload,
@@ -498,12 +482,68 @@ def _generate_result_payloads(
                 expected_query=expected_query,
                 expected_execution=expected_execution,
             )
-            if "execution_match" in payload:
-                execution_total += 1
-                if payload["execution_match"]:
-                    execution_matches += 1
+            execution_matches, execution_total = _update_execution_counters(
+                payload=payload,
+                execution_matches=execution_matches,
+                execution_total=execution_total,
+            )
         results.append(payload)
     return results, execution_matches, execution_total
+
+
+def _rewrite_prompt_if_enabled(
+    args: argparse.Namespace,
+    prompt: str,
+    rewrite_provider: LLMProvider | None,
+    schema: dict[str, Any] | None,
+    mapping: dict[str, Any] | None,
+) -> tuple[str, dict[str, Any]]:
+    if args.llm_rewrite != "on":
+        return prompt, {"applied": False, "reason": "disabled"}
+    if rewrite_provider is None:
+        return prompt, {"applied": False, "reason": "missing_api_key_or_provider"}
+    rewritten_prompt, rewrite_meta = rewrite_user_utterance(
+        text=prompt,
+        target=args.target,
+        schema=schema,
+        mapping=mapping,
+        provider=rewrite_provider,
+        system_context=args.system_context,
+    )
+    return rewritten_prompt, rewrite_meta
+
+
+def _build_generation_payload(
+    prompt: str,
+    rewritten_prompt: str,
+    rewrite_meta: dict[str, Any],
+    result: QueryResult,
+    dynamic_meta: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "prompt": prompt,
+        "rewritten_prompt": rewritten_prompt,
+        "rewrite": rewrite_meta,
+        "query": result.query,
+        "confidence": result.confidence,
+        "explanation": result.explanation,
+        "synthetic": dynamic_meta,
+        "metadata": dynamic_meta,
+        "engine_metadata": result.metadata,
+    }
+
+
+def _update_execution_counters(
+    payload: dict[str, Any],
+    execution_matches: int,
+    execution_total: int,
+) -> tuple[int, int]:
+    if "execution_match" not in payload:
+        return execution_matches, execution_total
+    execution_total += 1
+    if payload["execution_match"]:
+        execution_matches += 1
+    return execution_matches, execution_total
 
 
 def _apply_execution_evaluation(

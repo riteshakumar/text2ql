@@ -89,24 +89,35 @@ def collect_entity_rows(
 ) -> dict[str, list[dict[str, Any]]]:
     if out is None:
         out = {}
-    if isinstance(node, dict):
-        for key, value in node.items():
-            if isinstance(value, dict):
-                out.setdefault(str(key), []).append(value)
-                collect_entity_rows(value, out)
-            elif isinstance(value, list):
-                dict_items = [item for item in value if isinstance(item, dict)]
-                if dict_items:
-                    out.setdefault(str(key), []).extend(dict_items)
-                    for item in dict_items:
-                        collect_entity_rows(item, out)
-                else:
-                    for item in value:
-                        collect_entity_rows(item, out)
-    elif isinstance(node, list):
-        for item in node:
-            collect_entity_rows(item, out)
+    _collect_entity_rows_into(node, out)
     return out
+
+
+def _collect_entity_rows_into(node: Any, out: dict[str, list[dict[str, Any]]]) -> None:
+    if isinstance(node, dict):
+        _collect_from_dict(node, out)
+        return
+    if isinstance(node, list):
+        for item in node:
+            _collect_entity_rows_into(item, out)
+
+
+def _collect_from_dict(node: dict[str, Any], out: dict[str, list[dict[str, Any]]]) -> None:
+    for key, value in node.items():
+        if isinstance(value, dict):
+            out.setdefault(str(key), []).append(value)
+            _collect_entity_rows_into(value, out)
+            continue
+        if isinstance(value, list):
+            _collect_from_list(str(key), value, out)
+
+
+def _collect_from_list(key: str, value: list[Any], out: dict[str, list[dict[str, Any]]]) -> None:
+    dict_items = [item for item in value if isinstance(item, dict)]
+    if dict_items:
+        out.setdefault(key, []).extend(dict_items)
+    for item in value:
+        _collect_entity_rows_into(item, out)
 
 
 def _quote_ident(name: str) -> str:

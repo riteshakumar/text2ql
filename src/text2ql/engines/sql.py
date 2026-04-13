@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import date, datetime
 from dataclasses import dataclass
 from typing import Any
 
@@ -62,6 +63,7 @@ from .text_utils import (
 logger = logging.getLogger(__name__)
 
 _SQL_RENDERER = SQLIRRenderer()
+AND_SEPARATOR = " AND "
 
 
 @dataclass(slots=True)
@@ -527,33 +529,7 @@ class SQLEngine(QueryEngine):
             relation_name = str(item.get("relation", "")).strip()
             if not relation_name:
                 continue
-
-            relation = None
-            # 1. Direct lookup by relation name on primary table
-            relation_map = config.relations_by_entity.get(table, {})
-            relation = relation_map.get(relation_name)
-
-            # 2. Fallback: match by target table name on primary table
-            if relation is None:
-                for rel in relation_map.values():
-                    if rel.target.lower() == relation_name.lower():
-                        relation = rel
-                        break
-
-            # 3. Fallback: search across all tables
-            if relation is None:
-                for ent_relations in config.relations_by_entity.values():
-                    rel = ent_relations.get(relation_name)
-                    if rel is not None:
-                        relation = rel
-                        break
-                    for rel in ent_relations.values():
-                        if rel.target.lower() == relation_name.lower():
-                            relation = rel
-                            break
-                    if relation is not None:
-                        break
-
+            relation = self._resolve_relation_for_join(config, table, relation_name)
             if relation is None:
                 logger.warning(
                     "SQLEngine: LLM requested unknown relation %r for table %r; skipping join.",
@@ -561,22 +537,7 @@ class SQLEngine(QueryEngine):
                     table,
                 )
                 continue
-
-            alias = str(item.get("alias", relation.name)).strip() or relation.name
-            fields = [str(field) for field in item.get("fields", relation.fields[:1]) if str(field).strip()]
-            filters = item.get("filters", {})
-            if not isinstance(filters, dict):
-                filters = {}
-            joins.append(
-                _RelationJoin(
-                    relation=relation.name,
-                    target=relation.target,
-                    alias=alias,
-                    on_clause=self._build_join_on_clause(table, relation.target),
-                    fields=fields or (relation.fields[:1] or ["id"]),
-                    filters={str(key): value for key, value in filters.items()},
-                )
-            )
+            joins.append(self._build_relation_join_from_payload(item, relation, table))
         return joins
 
     def _detect_table(self, lowered: str, config: Any) -> str:
@@ -687,7 +648,7 @@ class SQLEngine(QueryEngine):
             if part.startswith("where "):
                 part = part[6:].strip()
             part = self._strip_outer_parentheses(part)
-            in_match = re.match(r"^([a-zA-Z_][a-zA-Z0-9_]*)\s+in\s+([a-zA-Z0-9_,\s-]+)$", part)
+            in_match = re.match(r"^([A-Za-z_]\w*)\s+in\s+([\w,\s-]+)$", part)
             if in_match:
                 field = in_match.group(1)
                 values_blob = in_match.group(2)
@@ -699,23 +660,9 @@ class SQLEngine(QueryEngine):
                 if values:
                     nodes.append({f"{field}_in": values})
                     continue
-            for pattern, suffix in [
-                (r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*(>=|<=|>|<)\s*([a-zA-Z0-9_.:-]+)$", None),
-                (r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:!=|is not|not)\s*([a-zA-Z0-9_.:-]+)$", "_ne"),
-                (r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:is\s+)?([a-zA-Z0-9_.:-]+)$", ""),
-            ]:
-                match = re.match(pattern, part)
-                if not match:
-                    continue
-                if suffix is None:
-                    field, operator, value = match.group(1), match.group(2), match.group(3)
-                    op_suffix = {">=": "_gte", "<=": "_lte", ">": "_gt", "<": "_lt"}[operator]
-                    nodes.append({f"{field}{op_suffix}": value})
-                elif suffix == "_ne":
-                    nodes.append({f"{match.group(1)}_ne": match.group(2)})
-                else:
-                    nodes.append({match.group(1): match.group(2)})
-                break
+            parsed = self._parse_atomic_and_node(part)
+            if parsed:
+                nodes.append(parsed)
         return nodes
 
     @staticmethod
@@ -887,15 +834,7 @@ class SQLEngine(QueryEngine):
         for node in nodes:
             if not isinstance(node, dict):
                 continue
-            valid_node: dict[str, Any] = {}
-            for n_key, n_val in node.items():
-                if n_key in {"and", "or", "not"} and isinstance(n_val, list):
-                    child = self._validate_group_nodes(n_val, allowed_filter_keys)
-                    if child:
-                        valid_node[n_key] = child
-                    continue
-                if self._is_allowed_filter_key(n_key, allowed_filter_keys):
-                    valid_node[n_key] = n_val
+            valid_node = self._validate_group_node(node, allowed_filter_keys)
             if valid_node:
                 nested.append(valid_node)
         return nested
@@ -929,30 +868,27 @@ class SQLEngine(QueryEngine):
         known_filter_keys: set[str] | None = None,
     ) -> None:
         arg_types = config.introspection_query_args.get(table, {})
-        for key, value in list(filters.items()):
+        updates: dict[str, Any] = {}
+        keys_to_drop: list[str] = []
+        for key, value in filters.items():
             if key in {"and", "or", "not"} and isinstance(value, list):
-                for child in value:
-                    if isinstance(child, dict):
-                        self._coerce_filter_values(
-                            child,
-                            config,
-                            table,
-                            notes,
-                            known_filter_keys=known_filter_keys,
-                        )
+                self._coerce_group_children(value, config, table, notes, known_filter_keys)
                 continue
-            base_key = self._base_filter_key(key, known_keys=known_filter_keys or set(arg_types.keys()))
-            arg_type = arg_types.get(base_key)
-            coerced = self._coerce_value(value, arg_type)
-            enum_values = self._enum_values_for_type(arg_type, config) if arg_type else set()
-            if enum_values and isinstance(coerced, str):
-                canonical = next((enum for enum in enum_values if enum.lower() == coerced.lower()), None)
-                if canonical is None:
-                    notes.append(f"dropped invalid enum value '{coerced}' for '{base_key}'")
-                    filters.pop(key, None)
-                    continue
-                coerced = canonical
-            filters[key] = coerced
+            drop_key, coerced = self._coerce_scalar_filter_entry(
+                key=key,
+                value=value,
+                arg_types=arg_types,
+                config=config,
+                notes=notes,
+                known_filter_keys=known_filter_keys,
+            )
+            if drop_key:
+                keys_to_drop.append(key)
+            else:
+                updates[key] = coerced
+        for key in keys_to_drop:
+            filters.pop(key, None)
+        filters.update(updates)
 
     @staticmethod
     def _base_filter_key(key: str, known_keys: set[str] | None = None) -> str:
@@ -979,11 +915,23 @@ class SQLEngine(QueryEngine):
             return int(raw)
         if re.fullmatch(r"-?\d+\.\d+", raw):
             return float(raw)
-        if re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:[tT]\d{2}:\d{2}(?::\d{2})?(?:z|[+\-]\d{2}:\d{2})?)?", raw):
+        if SQLEngine._is_iso_date_or_datetime(raw):
             return raw
         if arg_type and "enum" in arg_type.lower():
             return raw.upper()
         return raw
+
+    @staticmethod
+    def _is_iso_date_or_datetime(value: str) -> bool:
+        try:
+            if len(value) == 10:
+                date.fromisoformat(value)
+                return True
+            normalized = value.replace("Z", "+00:00").replace("z", "+00:00")
+            datetime.fromisoformat(normalized)
+            return True
+        except ValueError:
+            return False
 
     @staticmethod
     def _enum_values_for_type(arg_type: str, config: Any) -> set[str]:
@@ -1005,56 +953,19 @@ class SQLEngine(QueryEngine):
         invalid_join_notes: list[str] = []
 
         for join in joins:
-            relation = relation_map.get(join.relation)
-            if relation is None:
-                note = f"dropped invalid relation '{join.relation}' for '{table}'"
-                notes.append(note)
-                invalid_join_notes.append(note)
-                logger.warning("SQLEngine [%s]: %s", table, note)
-                continue
-            if strict_intro_relations and join.relation not in intro_relations:
-                note = f"dropped invalid relation '{join.relation}' for '{table}'"
-                notes.append(note)
-                invalid_join_notes.append(note)
-                logger.warning("SQLEngine [%s]: %s", table, note)
-                continue
-
-            # Validate ON-clause columns exist in both parent and target tables
-            on_notes = _validate_join_on_clause(
-                on_clause=join.on_clause,
-                parent_table=table,
+            validated_join = self._validate_single_join(
+                join=join,
+                table=table,
+                config=config,
+                relation_map=relation_map,
+                strict_intro_relations=strict_intro_relations,
+                intro_relations=intro_relations,
                 parent_columns=parent_columns,
-                target_table=join.target,
-                target_columns=set(self._columns_for_table(config, join.target)),
+                notes=notes,
+                invalid_join_notes=invalid_join_notes,
             )
-            if on_notes:
-                for note in on_notes:
-                    logger.warning("SQLEngine [%s]: JOIN ON clause: %s", table, note)
-                notes.extend(on_notes)
-                invalid_join_notes.extend(on_notes)
-
-            allowed = set(relation.fields)
-            if join.relation in intro_relations:
-                target_type = intro_relations[join.relation]
-                intro_allowed = set(config.introspection_entity_fields.get(target_type, set()))
-                if intro_allowed:
-                    allowed = allowed.intersection(intro_allowed) or intro_allowed
-            join_fields = [field for field in join.fields if field in allowed] or (relation.fields[:1] or ["id"])
-            join_filters = {
-                key: value
-                for key, value in join.filters.items()
-                if key in set(relation.args)
-            }
-            valid.append(
-                _RelationJoin(
-                    relation=join.relation,
-                    target=join.target,
-                    alias=join.alias,
-                    on_clause=join.on_clause,
-                    fields=join_fields,
-                    filters=join_filters,
-                )
-            )
+            if validated_join is not None:
+                valid.append(validated_join)
 
         if self.strict_validation and invalid_join_notes:
             raise ValidationError(
@@ -1062,6 +973,195 @@ class SQLEngine(QueryEngine):
                 invalid_join_notes,
             )
         return valid
+
+    def _resolve_relation_for_join(
+        self,
+        config: Any,
+        table: str,
+        relation_name: str,
+    ) -> NormalizedRelation | None:
+        relation_map = config.relations_by_entity.get(table, {})
+        relation = relation_map.get(relation_name)
+        if relation is not None:
+            return relation
+        relation = self._match_relation_by_target(relation_map, relation_name)
+        if relation is not None:
+            return relation
+        return self._find_relation_globally(config, relation_name)
+
+    @staticmethod
+    def _match_relation_by_target(
+        relation_map: dict[str, NormalizedRelation],
+        relation_name: str,
+    ) -> NormalizedRelation | None:
+        for relation in relation_map.values():
+            if relation.target.lower() == relation_name.lower():
+                return relation
+        return None
+
+    def _find_relation_globally(self, config: Any, relation_name: str) -> NormalizedRelation | None:
+        for ent_relations in config.relations_by_entity.values():
+            relation = ent_relations.get(relation_name)
+            if relation is not None:
+                return relation
+            relation = self._match_relation_by_target(ent_relations, relation_name)
+            if relation is not None:
+                return relation
+        return None
+
+    def _build_relation_join_from_payload(
+        self,
+        item: dict[str, Any],
+        relation: NormalizedRelation,
+        table: str,
+    ) -> _RelationJoin:
+        alias = str(item.get("alias", relation.name)).strip() or relation.name
+        fields = [str(field) for field in item.get("fields", relation.fields[:1]) if str(field).strip()]
+        filters = item.get("filters", {})
+        if not isinstance(filters, dict):
+            filters = {}
+        return _RelationJoin(
+            relation=relation.name,
+            target=relation.target,
+            alias=alias,
+            on_clause=self._build_join_on_clause(table, relation.target),
+            fields=fields or (relation.fields[:1] or ["id"]),
+            filters={str(key): value for key, value in filters.items()},
+        )
+
+    def _parse_atomic_and_node(self, part: str) -> dict[str, Any] | None:
+        patterns = [
+            (r"^([A-Za-z_]\w*)\s*(>=|<=|>|<)\s*([\w.:-]+)$", None),
+            (r"^([A-Za-z_]\w*)\s*(?:!=|is not|not)\s*([\w.:-]+)$", "_ne"),
+            (r"^([A-Za-z_]\w*)\s*(?:is\s+)?([\w.:-]+)$", ""),
+        ]
+        for pattern, suffix in patterns:
+            match = re.match(pattern, part)
+            if not match:
+                continue
+            if suffix is None:
+                field, operator, value = match.group(1), match.group(2), match.group(3)
+                op_suffix = {">=": "_gte", "<=": "_lte", ">": "_gt", "<": "_lt"}[operator]
+                return {f"{field}{op_suffix}": value}
+            if suffix == "_ne":
+                return {f"{match.group(1)}_ne": match.group(2)}
+            return {match.group(1): match.group(2)}
+        return None
+
+    def _validate_group_node(
+        self,
+        node: dict[str, Any],
+        allowed_filter_keys: set[str],
+    ) -> dict[str, Any]:
+        valid_node: dict[str, Any] = {}
+        for key, value in node.items():
+            if key in {"and", "or", "not"} and isinstance(value, list):
+                child = self._validate_group_nodes(value, allowed_filter_keys)
+                if child:
+                    valid_node[key] = child
+                continue
+            if self._is_allowed_filter_key(key, allowed_filter_keys):
+                valid_node[key] = value
+        return valid_node
+
+    def _coerce_group_children(
+        self,
+        children: list[Any],
+        config: Any,
+        table: str,
+        notes: list[str],
+        known_filter_keys: set[str] | None,
+    ) -> None:
+        for child in children:
+            if isinstance(child, dict):
+                self._coerce_filter_values(
+                    child,
+                    config,
+                    table,
+                    notes,
+                    known_filter_keys=known_filter_keys,
+                )
+
+    def _coerce_scalar_filter_entry(
+        self,
+        key: str,
+        value: Any,
+        arg_types: dict[str, str],
+        config: Any,
+        notes: list[str],
+        known_filter_keys: set[str] | None,
+    ) -> tuple[bool, Any]:
+        base_key = self._base_filter_key(key, known_keys=known_filter_keys or set(arg_types.keys()))
+        arg_type = arg_types.get(base_key)
+        coerced = self._coerce_value(value, arg_type)
+        enum_values = self._enum_values_for_type(arg_type, config) if arg_type else set()
+        if enum_values and isinstance(coerced, str):
+            canonical = next((enum for enum in enum_values if enum.lower() == coerced.lower()), None)
+            if canonical is None:
+                notes.append(f"dropped invalid enum value '{coerced}' for '{base_key}'")
+                return True, None
+            coerced = canonical
+        return False, coerced
+
+    def _validate_single_join(
+        self,
+        join: _RelationJoin,
+        table: str,
+        config: Any,
+        relation_map: dict[str, NormalizedRelation],
+        strict_intro_relations: bool,
+        intro_relations: dict[str, str],
+        parent_columns: set[str],
+        notes: list[str],
+        invalid_join_notes: list[str],
+    ) -> _RelationJoin | None:
+        relation = relation_map.get(join.relation)
+        if relation is None or (strict_intro_relations and join.relation not in intro_relations):
+            note = f"dropped invalid relation '{join.relation}' for '{table}'"
+            notes.append(note)
+            invalid_join_notes.append(note)
+            logger.warning("SQLEngine [%s]: %s", table, note)
+            return None
+
+        on_notes = _validate_join_on_clause(
+            on_clause=join.on_clause,
+            parent_table=table,
+            parent_columns=parent_columns,
+            target_table=join.target,
+            target_columns=set(self._columns_for_table(config, join.target)),
+        )
+        if on_notes:
+            for note in on_notes:
+                logger.warning("SQLEngine [%s]: JOIN ON clause: %s", table, note)
+            notes.extend(on_notes)
+            invalid_join_notes.extend(on_notes)
+
+        allowed = self._allowed_join_fields(relation, intro_relations, join, config)
+        join_fields = [field for field in join.fields if field in allowed] or (relation.fields[:1] or ["id"])
+        join_filters = {key: value for key, value in join.filters.items() if key in set(relation.args)}
+        return _RelationJoin(
+            relation=join.relation,
+            target=join.target,
+            alias=join.alias,
+            on_clause=join.on_clause,
+            fields=join_fields,
+            filters=join_filters,
+        )
+
+    @staticmethod
+    def _allowed_join_fields(
+        relation: NormalizedRelation,
+        intro_relations: dict[str, str],
+        join: _RelationJoin,
+        config: Any,
+    ) -> set[str]:
+        allowed = set(relation.fields)
+        if join.relation in intro_relations:
+            target_type = intro_relations[join.relation]
+            intro_allowed = set(config.introspection_entity_fields.get(target_type, set()))
+            if intro_allowed:
+                allowed = allowed.intersection(intro_allowed) or intro_allowed
+        return allowed
 
     def _build_sql(
         self,
@@ -1143,28 +1243,37 @@ class SQLEngine(QueryEngine):
     ) -> str | None:
         expressions: list[str] = []
         for node in nodes:
-            atom: list[str] = []
-            for n_key, n_value in node.items():
-                if n_key in {"and", "or", "not"} and isinstance(n_value, list):
-                    grouped = self._build_group_expression(
-                        n_key,
-                        n_value,
-                        alias,
-                        exact_filter_keys=exact_filter_keys,
-                    )
-                    if grouped:
-                        atom.append(grouped)
-                    continue
-                atom.append(self._sql_condition(alias, n_key, n_value, exact_filter_keys=exact_filter_keys))
+            atom = self._group_node_conditions(node, alias, exact_filter_keys)
             if atom:
-                expressions.append(" AND ".join(atom))
+                expressions.append(AND_SEPARATOR.join(atom))
         if not expressions:
             return None
         if key == "and":
-            return "(" + " AND ".join(expressions) + ")"
+            return "(" + AND_SEPARATOR.join(expressions) + ")"
         if key == "not":
-            return "NOT (" + " AND ".join(expressions) + ")"
+            return "NOT (" + AND_SEPARATOR.join(expressions) + ")"
         return "(" + " OR ".join(expressions) + ")"
+
+    def _group_node_conditions(
+        self,
+        node: dict[str, Any],
+        alias: str,
+        exact_filter_keys: set[str] | None = None,
+    ) -> list[str]:
+        atom: list[str] = []
+        for n_key, n_value in node.items():
+            if n_key in {"and", "or", "not"} and isinstance(n_value, list):
+                grouped = self._build_group_expression(
+                    n_key,
+                    n_value,
+                    alias,
+                    exact_filter_keys=exact_filter_keys,
+                )
+                if grouped:
+                    atom.append(grouped)
+                continue
+            atom.append(self._sql_condition(alias, n_key, n_value, exact_filter_keys=exact_filter_keys))
+        return atom
 
     def _sql_condition(
         self,
@@ -1274,34 +1383,30 @@ def _detect_contradictory_filters(filters: dict[str, Any]) -> list[str]:
     This function intentionally only inspects scalar ``eq`` conflicts at the
     top level to avoid false positives in complex OR trees.
     """
-    # Collect plain-equality values per base field
     eq_values: dict[str, list[Any]] = {}
-    _SUFFIXES = ("_gte", "_lte", "_gt", "_lt", "_ne", "_in", "_nin")
-
     for key, value in filters.items():
-        if key in {"and", "or", "not"}:
+        if key in {"and", "or", "not"} or _is_operator_filter_key(key):
             continue
-        base = key
-        for suffix in _SUFFIXES:
-            if key.endswith(suffix):
-                base = key[: -len(suffix)]
-                break
-        else:
-            # No suffix → plain equality
-            eq_values.setdefault(base, []).append(value)
-
+        eq_values.setdefault(key, []).append(value)
     issues: list[str] = []
     for field_name, values in eq_values.items():
-        unique = []
-        for v in values:
-            if v not in unique:
-                unique.append(v)
-        if len(unique) > 1:
-            quoted = ", ".join(repr(v) for v in unique)
-            issues.append(
-                f"contradictory equality values for field '{field_name}': {quoted}"
-            )
+        unique_values = _unique_preserving_order(values)
+        if len(unique_values) > 1:
+            quoted = ", ".join(repr(v) for v in unique_values)
+            issues.append(f"contradictory equality values for field '{field_name}': {quoted}")
     return issues
+
+
+def _is_operator_filter_key(key: str) -> bool:
+    return key.endswith(("_gte", "_lte", "_gt", "_lt", "_ne", "_in", "_nin"))
+
+
+def _unique_preserving_order(values: list[Any]) -> list[Any]:
+    out: list[Any] = []
+    for value in values:
+        if value not in out:
+            out.append(value)
+    return out
 
 
 def _validate_join_on_clause(

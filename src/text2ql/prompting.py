@@ -511,6 +511,8 @@ Relations:
 {evidence_block}
 GraphQL query:"""
 
+NONE_LABEL = "  (none)"
+
 
 def build_sql_direct_prompts(
     text: str,
@@ -547,11 +549,11 @@ def build_sql_direct_prompts(
         for rel_name, rel in rel_map.items():
             on = getattr(rel, "on", None) or f"{tbl}.? = {rel.target}.?"
             relations_text_parts.append(f"  {tbl} → {rel.target} (via {on})")
-    relations_text = "\n".join(relations_text_parts) if relations_text_parts else "  (none)"
+    relations_text = "\n".join(relations_text_parts) if relations_text_parts else NONE_LABEL
 
     columns_text = "\n".join(
         f"  {tbl}: {', '.join(cols)}" for tbl, cols in columns_by_table.items()
-    ) or "  (none)"
+    ) or NONE_LABEL
 
     evidence_block = ""
     if evidence and evidence.strip():
@@ -586,21 +588,8 @@ def build_graphql_direct_prompts(
     resolve_language(language)  # validate
 
     entities = config.entities or []
-    fields_text_parts: list[str] = []
-    for entity in entities:
-        cols: list[str] = []
-        if hasattr(config, "fields_by_entity"):
-            cols = config.fields_by_entity.get(entity, [])
-        if not cols and hasattr(config, "args_by_entity"):
-            cols = config.args_by_entity.get(entity, [])
-        fields_text_parts.append(f"  {entity}: {', '.join(cols) if cols else '(none)'}")
-
-    relations_by_entity = getattr(config, "relations_by_entity", {})
-    relations_text_parts = []
-    for ent, rel_map in relations_by_entity.items():
-        for rel_name, rel in rel_map.items():
-            relations_text_parts.append(f"  {ent}.{rel_name} → {rel.target}")
-    relations_text = "\n".join(relations_text_parts) if relations_text_parts else "  (none)"
+    fields_text_parts = [_graphql_entity_fields_line(config, entity) for entity in entities]
+    relations_text = _graphql_relations_text(config)
 
     evidence_block = ""
     if evidence and evidence.strip():
@@ -609,11 +598,29 @@ def build_graphql_direct_prompts(
     user_prompt = ENGLISH_GRAPHQL_DIRECT_USER_TEMPLATE.format(
         text=text.strip(),
         entities=", ".join(entities),
-        fields="\n".join(fields_text_parts) or "  (none)",
+        fields="\n".join(fields_text_parts) or NONE_LABEL,
         relations=relations_text,
         evidence_block=evidence_block,
     )
     return ENGLISH_GRAPHQL_DIRECT_SYSTEM_PROMPT, user_prompt
+
+
+def _graphql_entity_fields_line(config: NormalizedSchemaConfig, entity: str) -> str:
+    cols: list[str] = []
+    if hasattr(config, "fields_by_entity"):
+        cols = config.fields_by_entity.get(entity, [])
+    if not cols and hasattr(config, "args_by_entity"):
+        cols = config.args_by_entity.get(entity, [])
+    return f"  {entity}: {', '.join(cols) if cols else '(none)'}"
+
+
+def _graphql_relations_text(config: NormalizedSchemaConfig) -> str:
+    relations_by_entity = getattr(config, "relations_by_entity", {})
+    relations_text_parts: list[str] = []
+    for entity, rel_map in relations_by_entity.items():
+        for rel_name, relation in rel_map.items():
+            relations_text_parts.append(f"  {entity}.{rel_name} → {relation.target}")
+    return "\n".join(relations_text_parts) if relations_text_parts else NONE_LABEL
 
 
 def resolve_prompt_template(context: dict[str, Any]) -> str | None:

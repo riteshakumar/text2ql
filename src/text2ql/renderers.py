@@ -17,6 +17,8 @@ from typing import Any
 
 from text2ql.ir import IRAggregation, IRFilter, IRJoin, IRNested, IRRenderer, QueryIR
 
+AND_SEPARATOR = " AND "
+
 # ---------------------------------------------------------------------------
 # SQL identifier quoting helper
 # ---------------------------------------------------------------------------
@@ -233,62 +235,12 @@ class SQLIRRenderer(IRRenderer):
 
     def render(self, ir: QueryIR) -> str:
         """Produce a SQL SELECT statement from *ir*."""
-        table = ir.entity
-        exact_keys: frozenset[str] = frozenset(ir.metadata.get("exact_filter_keys", []))
-        join_clauses: list[str] = []
-        join_where_parts: list[str] = []
-        join_select_cols: list[str] = []
-
-        for join in ir.joins:
-            join_clauses.append(
-                f"{join.join_type} JOIN {_q(join.target)} {_q(join.target)} ON {join.on_left} = {join.on_right}"
-            )
-            join_select_cols.extend(
-                f"{_q(join.target)}.{_q(f)} AS {join.target}_{f}" for f in join.fields
-            )
-            join_where_parts.extend(self._build_where_parts(join.filters, {}, join.target, exact_keys))
-
-        base_cols = [f"{_q(table)}.{_q(col)}" for col in ir.fields]
-        agg_cols = [self._render_agg_column(agg) for agg in ir.aggregations]
-
-        select_cols = base_cols + join_select_cols + agg_cols or [f"{_q(table)}.*"]
-
-        where_parts = self._build_where_parts(ir.filters, ir.group_filters, table, exact_keys)
-        where_parts.extend(join_where_parts)
-        # Subquery conditions (NOT IN / IN)
-        for sub in ir.subqueries:
-            part = self._render_subquery_condition(table, sub)
-            if part:
-                where_parts.append(part)
-
-        distinct_kw = "DISTINCT " if ir.distinct else ""
-        sql = f"SELECT {distinct_kw}{', '.join(select_cols)} FROM {_q(table)}"
-        if join_clauses:
-            sql += " " + " ".join(join_clauses)
-        if where_parts:
-            sql += " WHERE " + " AND ".join(where_parts)
-
-        # GROUP BY is needed when mixing aggregate and non-aggregate columns.
-        if ir.aggregations and ir.fields:
-            group_cols = [f"{_q(table)}.{_q(col)}" for col in ir.fields]
-            if join_select_cols:
-                group_cols += join_select_cols
-            sql += " GROUP BY " + ", ".join(group_cols)
-
-        # HAVING clause — post-aggregation filters
-        if ir.having:
-            having_parts = [self._render_having_condition(h) for h in ir.having]
-            having_parts = [p for p in having_parts if p]
-            if having_parts:
-                sql += " HAVING " + " AND ".join(having_parts)
-
-        if ir.order_by and ir.order_dir:
-            sql += f" ORDER BY {_q(table)}.{_q(ir.order_by)} {ir.order_dir}"
-        if ir.limit is not None:
-            sql += f" LIMIT {ir.limit}"
-        if ir.offset is not None:
-            sql += f" OFFSET {ir.offset}"
-
+        context = self._build_render_context(ir)
+        sql = self._render_select_from(context)
+        sql = self._append_where(sql, context["where_parts"])
+        sql = self._append_group_by(sql, context["table"], ir, context["join_select_cols"])
+        sql = self._append_having(sql, ir)
+        sql = self._append_order_limit_offset(sql, context["table"], ir)
         return sql + ";"
 
     # ------------------------------------------------------------------
@@ -327,22 +279,15 @@ class SQLIRRenderer(IRRenderer):
     ) -> str | None:
         expressions: list[str] = []
         for node in nodes:
-            atom: list[str] = []
-            for n_key, n_value in node.items():
-                if n_key in {"and", "or", "not"} and isinstance(n_value, list):
-                    child = self._build_group_expression(n_key, n_value, alias, exact_keys)
-                    if child:
-                        atom.append(child)
-                else:
-                    atom.append(self._dict_filter_condition(alias, n_key, n_value, exact_keys))
+            atom = self._group_node_atoms(node, alias, exact_keys)
             if atom:
-                expressions.append(" AND ".join(atom))
+                expressions.append(AND_SEPARATOR.join(atom))
         if not expressions:
             return None
         if key == "and":
-            return "(" + " AND ".join(expressions) + ")"
+            return "(" + AND_SEPARATOR.join(expressions) + ")"
         if key == "not":
-            return "NOT (" + " AND ".join(expressions) + ")"
+            return "NOT (" + AND_SEPARATOR.join(expressions) + ")"
         return "(" + " OR ".join(expressions) + ")"
 
     @staticmethod
@@ -387,22 +332,134 @@ class SQLIRRenderer(IRRenderer):
         ``shipped_ne`` should render as ``alias.shipped_ne = …``).
         """
         if key not in exact_keys:
-            mapping = {"_gte": ">=", "_lte": "<=", "_gt": ">", "_lt": "<", "_ne": "!="}
-            for suffix, op in mapping.items():
-                if key.endswith(suffix):
-                    col = key[: -len(suffix)]
-                    return f"{_q(alias)}.{_q(col)} {op} {SQLIRRenderer._sql_literal(value)}"
-            if key.endswith("_in"):
-                col = key[:-3]
-                vals = value if isinstance(value, list) else [value]
-                return f"{_q(alias)}.{_q(col)} IN ({', '.join(SQLIRRenderer._sql_literal(v) for v in vals)})"
-            if key.endswith("_nin"):
-                col = key[:-4]
-                vals = value if isinstance(value, list) else [value]
-                return f"{_q(alias)}.{_q(col)} NOT IN ({', '.join(SQLIRRenderer._sql_literal(v) for v in vals)})"
+            suffix_condition = SQLIRRenderer._suffix_filter_condition(alias, key, value)
+            if suffix_condition:
+                return suffix_condition
         if value is None:
             return f"{_q(alias)}.{_q(key)} IS NULL"
         return f"{_q(alias)}.{_q(key)} = {SQLIRRenderer._sql_literal(value)}"
+
+    def _render_join_parts(
+        self,
+        ir: QueryIR,
+        exact_keys: frozenset[str],
+    ) -> tuple[list[str], list[str], list[str]]:
+        join_clauses: list[str] = []
+        join_where_parts: list[str] = []
+        join_select_cols: list[str] = []
+        for join in ir.joins:
+            join_clauses.append(
+                f"{join.join_type} JOIN {_q(join.target)} {_q(join.target)} ON {join.on_left} = {join.on_right}"
+            )
+            join_select_cols.extend(f"{_q(join.target)}.{_q(f)} AS {join.target}_{f}" for f in join.fields)
+            join_where_parts.extend(self._build_where_parts(join.filters, {}, join.target, exact_keys))
+        return join_clauses, join_where_parts, join_select_cols
+
+    def _build_render_context(self, ir: QueryIR) -> dict[str, Any]:
+        table = ir.entity
+        exact_keys: frozenset[str] = frozenset(ir.metadata.get("exact_filter_keys", []))
+        join_clauses, join_where_parts, join_select_cols = self._render_join_parts(ir, exact_keys)
+        select_cols = self._select_columns(ir, table, join_select_cols)
+        where_parts = self._build_where_parts(ir.filters, ir.group_filters, table, exact_keys)
+        where_parts.extend(join_where_parts)
+        where_parts.extend(self._render_subquery_conditions(table, ir.subqueries))
+        return {
+            "table": table,
+            "select_cols": select_cols,
+            "join_clauses": join_clauses,
+            "join_select_cols": join_select_cols,
+            "where_parts": where_parts,
+            "distinct": ir.distinct,
+        }
+
+    def _select_columns(self, ir: QueryIR, table: str, join_select_cols: list[str]) -> list[str]:
+        base_cols = [f"{_q(table)}.{_q(col)}" for col in ir.fields]
+        agg_cols = [self._render_agg_column(agg) for agg in ir.aggregations]
+        return base_cols + join_select_cols + agg_cols or [f"{_q(table)}.*"]
+
+    def _render_subquery_conditions(self, table: str, subqueries: list[dict[str, Any]]) -> list[str]:
+        parts: list[str] = []
+        for sub in subqueries:
+            condition = self._render_subquery_condition(table, sub)
+            if condition:
+                parts.append(condition)
+        return parts
+
+    def _render_select_from(self, context: dict[str, Any]) -> str:
+        distinct_kw = "DISTINCT " if context["distinct"] else ""
+        sql = f"SELECT {distinct_kw}{', '.join(context['select_cols'])} FROM {_q(context['table'])}"
+        if context["join_clauses"]:
+            sql += " " + " ".join(context["join_clauses"])
+        return sql
+
+    @staticmethod
+    def _append_where(sql: str, where_parts: list[str]) -> str:
+        if not where_parts:
+            return sql
+        return sql + " WHERE " + AND_SEPARATOR.join(where_parts)
+
+    @staticmethod
+    def _append_group_by(sql: str, table: str, ir: QueryIR, join_select_cols: list[str]) -> str:
+        if not (ir.aggregations and ir.fields):
+            return sql
+        group_cols = [f"{_q(table)}.{_q(col)}" for col in ir.fields]
+        if join_select_cols:
+            group_cols += join_select_cols
+        return sql + " GROUP BY " + ", ".join(group_cols)
+
+    @staticmethod
+    def _append_having(sql: str, ir: QueryIR) -> str:
+        if not ir.having:
+            return sql
+        having_parts = [SQLIRRenderer._render_having_condition(h) for h in ir.having]
+        filtered = [part for part in having_parts if part]
+        if not filtered:
+            return sql
+        return sql + " HAVING " + AND_SEPARATOR.join(filtered)
+
+    @staticmethod
+    def _append_order_limit_offset(sql: str, table: str, ir: QueryIR) -> str:
+        out = sql
+        if ir.order_by and ir.order_dir:
+            out += f" ORDER BY {_q(table)}.{_q(ir.order_by)} {ir.order_dir}"
+        if ir.limit is not None:
+            out += f" LIMIT {ir.limit}"
+        if ir.offset is not None:
+            out += f" OFFSET {ir.offset}"
+        return out
+
+    def _group_node_atoms(
+        self,
+        node: dict[str, Any],
+        alias: str,
+        exact_keys: frozenset[str],
+    ) -> list[str]:
+        atom: list[str] = []
+        for n_key, n_value in node.items():
+            if n_key in {"and", "or", "not"} and isinstance(n_value, list):
+                child = self._build_group_expression(n_key, n_value, alias, exact_keys)
+                if child:
+                    atom.append(child)
+            else:
+                atom.append(self._dict_filter_condition(alias, n_key, n_value, exact_keys))
+        return atom
+
+    @staticmethod
+    def _suffix_filter_condition(alias: str, key: str, value: Any) -> str | None:
+        mapping = {"_gte": ">=", "_lte": "<=", "_gt": ">", "_lt": "<", "_ne": "!="}
+        for suffix, op in mapping.items():
+            if key.endswith(suffix):
+                col = key[: -len(suffix)]
+                return f"{_q(alias)}.{_q(col)} {op} {SQLIRRenderer._sql_literal(value)}"
+        if key.endswith("_in"):
+            col = key[:-3]
+            vals = value if isinstance(value, list) else [value]
+            return f"{_q(alias)}.{_q(col)} IN ({', '.join(SQLIRRenderer._sql_literal(v) for v in vals)})"
+        if key.endswith("_nin"):
+            col = key[:-4]
+            vals = value if isinstance(value, list) else [value]
+            return f"{_q(alias)}.{_q(col)} NOT IN ({', '.join(SQLIRRenderer._sql_literal(v) for v in vals)})"
+        return None
 
     @staticmethod
     def _render_having_condition(h: dict[str, Any]) -> str:

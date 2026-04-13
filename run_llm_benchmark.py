@@ -10,11 +10,22 @@ Usage:
 from __future__ import annotations
 
 import json
+import importlib
 import os
 import sqlite3
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
+
+# Reused fixture literals extracted for Sonar S1192 (duplicate string literal).
+ALAMEDA_CITY_UNIFIED = "Alameda City Unified"
+ALAMEDA_HIGH = "Alameda High"
+ENCINAL_HIGH = "Encinal High"
+ISLAND_HIGH = "Island High"
+ALPINE_COUNTY_UNIFIED = "Alpine County Unified"
+ALPINE_CREST = "Alpine Crest"
+SEASON_2008_2009 = "2008/2009"
 
 # ---------------------------------------------------------------------------
 # 50 Spider-style examples across 5 databases
@@ -208,25 +219,25 @@ BIRD_DBS = {
         "foreign_keys": [],
         "data": {
             "schools": [
-                ("01234560000000", "Alameda", "Alameda City Unified", "Alameda High", "Alameda", "94501", "510-748-4000", "Active", 0),
-                ("01234560112607", "Alameda", "Alameda City Unified", "Encinal High", "Alameda", "94501", "510-748-4010", "Active", 0),
-                ("01234560136713", "Alameda", "Alameda City Unified", "Island High", "Alameda", "94501", "510-748-4000", "Active", 1),
-                ("01611190130401", "Alpine", "Alpine County Unified", "Alpine Crest", "Markleeville", "96120", "530-694-2230", "Active", 0),
-                ("01611190000000", "Alpine", "Alpine County Unified", "Woodfords", "Markleeville", "96120", "530-694-2230", "Active", 0),
+                ("01234560000000", "Alameda", ALAMEDA_CITY_UNIFIED, ALAMEDA_HIGH, "Alameda", "94501", "510-748-4000", "Active", 0),
+                ("01234560112607", "Alameda", ALAMEDA_CITY_UNIFIED, ENCINAL_HIGH, "Alameda", "94501", "510-748-4010", "Active", 0),
+                ("01234560136713", "Alameda", ALAMEDA_CITY_UNIFIED, ISLAND_HIGH, "Alameda", "94501", "510-748-4000", "Active", 1),
+                ("01611190130401", "Alpine", ALPINE_COUNTY_UNIFIED, ALPINE_CREST, "Markleeville", "96120", "530-694-2230", "Active", 0),
+                ("01611190000000", "Alpine", ALPINE_COUNTY_UNIFIED, "Woodfords", "Markleeville", "96120", "530-694-2230", "Active", 0),
             ],
             "satscores": [
-                ("01234560000000", "S", "Alameda High", "Alameda City Unified", "Alameda", 280, 498, 502, 495, 120),
-                ("01234560112607", "S", "Encinal High", "Alameda City Unified", "Alameda", 210, 480, 475, 472, 85),
-                ("01234560136713", "S", "Island High", "Alameda City Unified", "Alameda", 45, 430, 420, 415, 10),
-                ("01611190130401", "S", "Alpine Crest", "Alpine County Unified", "Alpine", 25, 510, 520, 505, 15),
-                ("01611190000000", "S", "Woodfords", "Alpine County Unified", "Alpine", 30, 490, 485, 480, 12),
+                ("01234560000000", "S", ALAMEDA_HIGH, ALAMEDA_CITY_UNIFIED, "Alameda", 280, 498, 502, 495, 120),
+                ("01234560112607", "S", ENCINAL_HIGH, ALAMEDA_CITY_UNIFIED, "Alameda", 210, 480, 475, 472, 85),
+                ("01234560136713", "S", ISLAND_HIGH, ALAMEDA_CITY_UNIFIED, "Alameda", 45, 430, 420, 415, 10),
+                ("01611190130401", "S", ALPINE_CREST, ALPINE_COUNTY_UNIFIED, "Alpine", 25, 510, 520, 505, 15),
+                ("01611190000000", "S", "Woodfords", ALPINE_COUNTY_UNIFIED, "Alpine", 30, 490, 485, 480, 12),
             ],
             "frpm": [
-                ("01234560000000", "Alameda", "Alameda City Unified", "Alameda High", "9", "12", 1800, 200, 0.111, 210),
-                ("01234560112607", "Alameda", "Alameda City Unified", "Encinal High", "9", "12", 1500, 350, 0.233, 360),
-                ("01234560136713", "Alameda", "Alameda City Unified", "Island High", "9", "12", 300, 180, 0.600, 185),
-                ("01611190130401", "Alpine", "Alpine County Unified", "Alpine Crest", "K", "12", 200, 40, 0.200, 42),
-                ("01611190000000", "Alpine", "Alpine County Unified", "Woodfords", "K", "12", 120, 30, 0.250, 31),
+                ("01234560000000", "Alameda", ALAMEDA_CITY_UNIFIED, ALAMEDA_HIGH, "9", "12", 1800, 200, 0.111, 210),
+                ("01234560112607", "Alameda", ALAMEDA_CITY_UNIFIED, ENCINAL_HIGH, "9", "12", 1500, 350, 0.233, 360),
+                ("01234560136713", "Alameda", ALAMEDA_CITY_UNIFIED, ISLAND_HIGH, "9", "12", 300, 180, 0.600, 185),
+                ("01611190130401", "Alpine", ALPINE_COUNTY_UNIFIED, ALPINE_CREST, "K", "12", 200, 40, 0.200, 42),
+                ("01611190000000", "Alpine", ALPINE_COUNTY_UNIFIED, "Woodfords", "K", "12", 120, 30, 0.250, 31),
             ],
         },
     },
@@ -272,11 +283,11 @@ BIRD_DBS = {
         "data": {
             "league": [(1, 1, "Belgium Jupiler League"), (2, 2, "England Premier League"), (3, 3, "France Ligue 1")],
             "match": [
-                (1, 1, 1, "2008/2009", 1, "2008-08-02", 9987, 9993, 1, 0),
-                (2, 1, 1, "2008/2009", 1, "2008-08-09", 9993, 9994, 2, 1),
-                (3, 2, 2, "2008/2009", 1, "2008-08-16", 8455, 8659, 0, 0),
-                (4, 2, 2, "2008/2009", 1, "2008-08-17", 8659, 8472, 3, 2),
-                (5, 3, 3, "2008/2009", 1, "2008-08-09", 9825, 9826, 1, 1),
+                (1, 1, 1, SEASON_2008_2009, 1, "2008-08-02", 9987, 9993, 1, 0),
+                (2, 1, 1, SEASON_2008_2009, 1, "2008-08-09", 9993, 9994, 2, 1),
+                (3, 2, 2, SEASON_2008_2009, 1, "2008-08-16", 8455, 8659, 0, 0),
+                (4, 2, 2, SEASON_2008_2009, 1, "2008-08-17", 8659, 8472, 3, 2),
+                (5, 3, 3, SEASON_2008_2009, 1, "2008-08-09", 9825, 9826, 1, 1),
             ],
             "player": [(1, 505942, "Aaron Appindangoye", 218353, "1992-02-29", 182.88, 187), (2, 155782, "Aaron Cresswell", 189615, "1989-12-15", 170.18, 146), (3, 162549, "Aaron Doran", 186170, "1991-05-13", 170.18, 143)],
             "player_attributes": [(1, 218353, 505942, "2016-02-18", 67, 71, "right"), (2, 189615, 155782, "2016-02-18", 72, 72, "left")],
@@ -457,14 +468,26 @@ def main() -> None:
         print("ERROR: Set OPENAI_API_KEY or TEXT2QL_API_KEY environment variable.")
         sys.exit(1)
 
-    sys.path.insert(0, str(Path(__file__).parent / "src"))
-    from text2ql.benchmarks import load_spider, load_bird, run_benchmark, format_report, BenchmarkConfig
-    from text2ql.core import Text2QL
-    from text2ql.dataset import DatasetExample
-    from text2ql.providers.openai_compatible import OpenAICompatibleProvider
+    repo_src = str(Path(__file__).parent / "src")
+    if repo_src not in sys.path:
+        sys.path.insert(0, repo_src)
 
-    provider = OpenAICompatibleProvider(api_key=api_key, model="gpt-4o-mini")
-    service = Text2QL(provider=provider)
+    benchmarks_mod = importlib.import_module("text2ql.benchmarks")
+    core_mod = importlib.import_module("text2ql.core")
+    dataset_mod = importlib.import_module("text2ql.dataset")
+    provider_mod = importlib.import_module("text2ql.providers.openai_compatible")
+
+    load_spider = benchmarks_mod.load_spider
+    load_bird = benchmarks_mod.load_bird
+    run_benchmark = benchmarks_mod.run_benchmark
+    format_report = benchmarks_mod.format_report
+    benchmark_config_cls = benchmarks_mod.BenchmarkConfig
+    text2ql_cls = core_mod.Text2QL
+    dataset_example_cls = dataset_mod.DatasetExample
+    openai_provider_cls = provider_mod.OpenAICompatibleProvider
+
+    provider = openai_provider_cls(api_key=api_key, model="gpt-4o-mini")
+    service = text2ql_cls(provider=provider)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         spider_root = Path(tmpdir) / "spider"
@@ -480,12 +503,12 @@ def main() -> None:
         bird_examples = load_bird(bird_root, split="dev", limit=50)
 
         # Patch context to mode="llm"
-        def with_llm_mode(examples: list[DatasetExample]) -> list[DatasetExample]:
+        def with_llm_mode(examples: list[Any]) -> list[Any]:
             patched = []
             for ex in examples:
                 ctx = dict(ex.context)
                 ctx["mode"] = "llm"
-                patched.append(DatasetExample(
+                patched.append(dataset_example_cls(
                     text=ex.text,
                     target=ex.target,
                     expected_query=ex.expected_query,
@@ -499,7 +522,7 @@ def main() -> None:
         spider_examples = with_llm_mode(spider_examples)
         bird_examples = with_llm_mode(bird_examples)
 
-        cfg = BenchmarkConfig(mode="execution", service=service, concurrency=1)
+        cfg = benchmark_config_cls(mode="execution", service=service, concurrency=1)
 
         print(f"\nRunning Spider benchmark ({len(spider_examples)} examples, mode=llm, model=gpt-4o-mini)...")
         spider_report = run_benchmark(spider_examples, config=cfg)

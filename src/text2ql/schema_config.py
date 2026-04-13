@@ -420,7 +420,7 @@ def _coerce_aliases(payload: Any) -> list[str]:
 
 
 def _infer_from_arbitrary_payload(config: NormalizedSchemaConfig, payload: dict[str, Any]) -> None:
-    if config.entities or config.fields or config.fields_by_entity:
+    if _has_explicit_schema(config):
         return
     if not isinstance(payload, dict) or not payload:
         return
@@ -429,25 +429,8 @@ def _infer_from_arbitrary_payload(config: NormalizedSchemaConfig, payload: dict[
     if not entities_to_fields:
         return
 
-    config.entities = sorted(entities_to_fields.keys())
-    config.fields_by_entity = {
-        entity: sorted(fields) for entity, fields in entities_to_fields.items() if fields
-    }
-    if config.fields_by_entity:
-        all_fields: list[str] = []
-        seen: set[str] = set()
-        for fields in config.fields_by_entity.values():
-            for field in fields:
-                if field in seen:
-                    continue
-                seen.add(field)
-                all_fields.append(field)
-        config.fields = all_fields
-
-    if not config.default_entity and config.entities:
-        config.default_entity = "accounts" if "accounts" in config.entities else config.entities[0]
-    if not config.default_fields and config.default_entity:
-        config.default_fields = config.fields_by_entity.get(config.default_entity, [])[:5]
+    _apply_inferred_entities_and_fields(config, entities_to_fields)
+    _apply_inferred_defaults(config)
     if not config.args_by_entity:
         config.args_by_entity = _build_generic_args(config.fields_by_entity)
 
@@ -468,27 +451,13 @@ def _collect_entities_and_fields(payload: dict[str, Any]) -> dict[str, set[str]]
 
     def walk(node: Any, entity_hint: str | None) -> None:
         if isinstance(node, dict):
-            if entity_hint:
-                out.setdefault(entity_hint, set()).update(str(k) for k in node.keys())
-            for key, value in node.items():
-                if entity_hint is None and key in ignored_root_keys:
-                    continue
-                if isinstance(value, dict):
-                    if entity_hint:
-                        out.setdefault(entity_hint, set()).update(str(k) for k in value.keys())
-                    walk(value, str(key))
-                    continue
-                if isinstance(value, list):
-                    first = _first_dict(value)
-                    if first is not None:
-                        if entity_hint:
-                            out.setdefault(entity_hint, set()).update(str(k) for k in first.keys())
-                        walk(first, str(key))
-                    elif entity_hint:
-                        out.setdefault(entity_hint, set()).add(str(key))
-                    continue
-                if entity_hint:
-                    out.setdefault(entity_hint, set()).add(str(key))
+            _walk_payload_dict(
+                node=node,
+                entity_hint=entity_hint,
+                ignored_root_keys=ignored_root_keys,
+                out=out,
+                walk_fn=walk,
+            )
             return
 
         if isinstance(node, list):
@@ -533,23 +502,29 @@ def _build_generic_args(fields_by_entity: dict[str, list[str]]) -> dict[str, lis
 def _extract_enum_values(types_payload: dict[str, Any]) -> dict[str, set[str]]:
     out: dict[str, set[str]] = {}
     for type_name, type_spec in types_payload.items():
-        if not isinstance(type_name, str) or not isinstance(type_spec, dict):
-            continue
-        values_payload = type_spec.get("enumValues", type_spec.get("values"))
-        if not isinstance(values_payload, list):
-            continue
-        values: set[str] = set()
-        for item in values_payload:
-            if isinstance(item, str):
-                values.add(item)
-                continue
-            if isinstance(item, dict):
-                name = item.get("name")
-                if isinstance(name, str):
-                    values.add(name)
+        values = _extract_enum_values_for_type(type_name, type_spec)
         if values:
             out[type_name] = values
     return out
+
+
+def _extract_enum_values_for_type(type_name: Any, type_spec: Any) -> set[str]:
+    if not isinstance(type_name, str) or not isinstance(type_spec, dict):
+        return set()
+    values_payload = type_spec.get("enumValues", type_spec.get("values"))
+    if not isinstance(values_payload, list):
+        return set()
+    return {name for item in values_payload if (name := _enum_item_name(item))}
+
+
+def _enum_item_name(item: Any) -> str:
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        name = item.get("name")
+        if isinstance(name, str):
+            return name
+    return ""
 
 
 def _auto_discover_args(
@@ -557,41 +532,16 @@ def _auto_discover_args(
     schema: dict[str, Any],
     mapping: dict[str, Any],
 ) -> None:
-    entities = list(dict.fromkeys(config.entities + list(config.fields_by_entity.keys())))
+    entities = _candidate_entities_for_args(config)
     if not entities:
         return
 
     discovered: dict[str, set[str]] = {entity: set(config.args_by_entity.get(entity, [])) for entity in entities}
-
-    for entity, arg_map in config.introspection_query_args.items():
-        if entity not in discovered:
-            discovered[entity] = set()
-        discovered[entity].update(arg_map.keys())
-
-    for payload in (schema, mapping):
-        if not isinstance(payload, dict):
-            continue
-        for hint_key in ("filters", "filterable_fields", "query_args", "params", "parameters", "where"):
-            _merge_discovered_from_hint_payload(discovered, entities, config, payload.get(hint_key))
-
-    for canonical in config.filter_key_aliases.values():
-        if not isinstance(canonical, str) or not canonical.strip():
-            continue
-        canonical_name = canonical.strip()
-        for entity in entities:
-            entity_fields = _candidate_fields_for_entity(config, entity)
-            if canonical_name in entity_fields:
-                discovered.setdefault(entity, set()).add(canonical_name)
-
-    for entity in entities:
-        if not discovered.get(entity):
-            discovered[entity] = set(_candidate_fields_for_entity(config, entity))
-        discovered[entity].update({"limit", "offset", "first", "after", "orderBy", "orderDirection", "orderDir"})
-
-    for entity, args in discovered.items():
-        normalized = sorted(arg for arg in args if isinstance(arg, str) and arg.strip())
-        if normalized:
-            config.args_by_entity[entity] = normalized
+    _merge_introspection_args(discovered, config)
+    _merge_hint_payload_args(discovered, entities, config, schema, mapping)
+    _merge_filter_alias_args(discovered, entities, config)
+    _ensure_default_pagination_args(discovered, entities, config)
+    _write_discovered_args(config, discovered)
 
 
 def _merge_discovered_from_hint_payload(
@@ -601,37 +551,197 @@ def _merge_discovered_from_hint_payload(
     payload: Any,
 ) -> None:
     if isinstance(payload, list):
-        normalized = {str(item).strip() for item in payload if str(item).strip()}
-        if not normalized:
-            return
-        for entity in entities:
-            allowed_for_entity = set(_candidate_fields_for_entity(config, entity)) | set(
-                config.introspection_query_args.get(entity, {}).keys()
-            )
-            scoped = {item for item in normalized if item in allowed_for_entity}
-            if scoped:
-                discovered.setdefault(entity, set()).update(scoped)
+        _merge_list_hint_payload(discovered, entities, config, payload)
         return
     if not isinstance(payload, dict):
         return
     if all(isinstance(value, list) for value in payload.values()):
-        for entity, values in payload.items():
-            if not isinstance(entity, str):
-                continue
-            normalized = {str(item).strip() for item in values if str(item).strip()}
-            if normalized:
-                discovered.setdefault(entity, set()).update(normalized)
+        _merge_entity_list_hint_payload(discovered, payload)
         return
     # Alias-like maps: keys are aliases and values are canonicals.
+    _merge_alias_hint_payload(discovered, entities, config, payload)
+
+
+def _has_explicit_schema(config: NormalizedSchemaConfig) -> bool:
+    return bool(config.entities or config.fields or config.fields_by_entity)
+
+
+def _apply_inferred_entities_and_fields(
+    config: NormalizedSchemaConfig,
+    entities_to_fields: dict[str, set[str]],
+) -> None:
+    config.entities = sorted(entities_to_fields.keys())
+    config.fields_by_entity = {entity: sorted(fields) for entity, fields in entities_to_fields.items() if fields}
+    if config.fields_by_entity:
+        config.fields = _flatten_unique_fields(config.fields_by_entity)
+
+
+def _flatten_unique_fields(fields_by_entity: dict[str, list[str]]) -> list[str]:
+    all_fields: list[str] = []
+    seen: set[str] = set()
+    for fields in fields_by_entity.values():
+        for field in fields:
+            if field in seen:
+                continue
+            seen.add(field)
+            all_fields.append(field)
+    return all_fields
+
+
+def _apply_inferred_defaults(config: NormalizedSchemaConfig) -> None:
+    if not config.default_entity and config.entities:
+        config.default_entity = "accounts" if "accounts" in config.entities else config.entities[0]
+    if not config.default_fields and config.default_entity:
+        config.default_fields = config.fields_by_entity.get(config.default_entity, [])[:5]
+
+
+def _walk_payload_dict(
+    node: dict[str, Any],
+    entity_hint: str | None,
+    ignored_root_keys: set[str],
+    out: dict[str, set[str]],
+    walk_fn: Any,
+) -> None:
+    if entity_hint:
+        out.setdefault(entity_hint, set()).update(str(k) for k in node.keys())
+    for key, value in node.items():
+        if entity_hint is None and key in ignored_root_keys:
+            continue
+        _walk_payload_entry(key, value, entity_hint, out, walk_fn)
+
+
+def _walk_payload_entry(
+    key: str,
+    value: Any,
+    entity_hint: str | None,
+    out: dict[str, set[str]],
+    walk_fn: Any,
+) -> None:
+    if isinstance(value, dict):
+        if entity_hint:
+            out.setdefault(entity_hint, set()).update(str(k) for k in value.keys())
+        walk_fn(value, str(key))
+        return
+    if isinstance(value, list):
+        first = _first_dict(value)
+        if first is not None:
+            if entity_hint:
+                out.setdefault(entity_hint, set()).update(str(k) for k in first.keys())
+            walk_fn(first, str(key))
+        elif entity_hint:
+            out.setdefault(entity_hint, set()).add(str(key))
+        return
+    if entity_hint:
+        out.setdefault(entity_hint, set()).add(str(key))
+
+
+def _candidate_entities_for_args(config: NormalizedSchemaConfig) -> list[str]:
+    return list(dict.fromkeys(config.entities + list(config.fields_by_entity.keys())))
+
+
+def _merge_introspection_args(discovered: dict[str, set[str]], config: NormalizedSchemaConfig) -> None:
+    for entity, arg_map in config.introspection_query_args.items():
+        discovered.setdefault(entity, set()).update(arg_map.keys())
+
+
+def _merge_hint_payload_args(
+    discovered: dict[str, set[str]],
+    entities: list[str],
+    config: NormalizedSchemaConfig,
+    schema: dict[str, Any],
+    mapping: dict[str, Any],
+) -> None:
+    for payload in (schema, mapping):
+        if not isinstance(payload, dict):
+            continue
+        for hint_key in ("filters", "filterable_fields", "query_args", "params", "parameters", "where"):
+            _merge_discovered_from_hint_payload(discovered, entities, config, payload.get(hint_key))
+
+
+def _merge_filter_alias_args(
+    discovered: dict[str, set[str]],
+    entities: list[str],
+    config: NormalizedSchemaConfig,
+) -> None:
+    for canonical in config.filter_key_aliases.values():
+        if not isinstance(canonical, str) or not canonical.strip():
+            continue
+        canonical_name = canonical.strip()
+        for entity in entities:
+            entity_fields = _candidate_fields_for_entity(config, entity)
+            if canonical_name in entity_fields:
+                discovered.setdefault(entity, set()).add(canonical_name)
+
+
+def _ensure_default_pagination_args(
+    discovered: dict[str, set[str]],
+    entities: list[str],
+    config: NormalizedSchemaConfig,
+) -> None:
+    pagination_args = {"limit", "offset", "first", "after", "orderBy", "orderDirection", "orderDir"}
+    for entity in entities:
+        if not discovered.get(entity):
+            discovered[entity] = set(_candidate_fields_for_entity(config, entity))
+        discovered[entity].update(pagination_args)
+
+
+def _write_discovered_args(
+    config: NormalizedSchemaConfig,
+    discovered: dict[str, set[str]],
+) -> None:
+    for entity, args in discovered.items():
+        normalized = sorted(arg for arg in args if isinstance(arg, str) and arg.strip())
+        if normalized:
+            config.args_by_entity[entity] = normalized
+
+
+def _allowed_fields_for_entity(config: NormalizedSchemaConfig, entity: str) -> set[str]:
+    return set(_candidate_fields_for_entity(config, entity)) | set(
+        config.introspection_query_args.get(entity, {}).keys()
+    )
+
+
+def _merge_list_hint_payload(
+    discovered: dict[str, set[str]],
+    entities: list[str],
+    config: NormalizedSchemaConfig,
+    payload: list[Any],
+) -> None:
+    normalized = {str(item).strip() for item in payload if str(item).strip()}
+    if not normalized:
+        return
+    for entity in entities:
+        allowed_for_entity = _allowed_fields_for_entity(config, entity)
+        scoped = {item for item in normalized if item in allowed_for_entity}
+        if scoped:
+            discovered.setdefault(entity, set()).update(scoped)
+
+
+def _merge_entity_list_hint_payload(
+    discovered: dict[str, set[str]],
+    payload: dict[str, Any],
+) -> None:
+    for entity, values in payload.items():
+        if not isinstance(entity, str):
+            continue
+        normalized = {str(item).strip() for item in values if str(item).strip()}
+        if normalized:
+            discovered.setdefault(entity, set()).update(normalized)
+
+
+def _merge_alias_hint_payload(
+    discovered: dict[str, set[str]],
+    entities: list[str],
+    config: NormalizedSchemaConfig,
+    payload: dict[str, Any],
+) -> None:
     for canonical in payload.values():
-        if isinstance(canonical, str) and canonical.strip():
-            canonical_name = canonical.strip()
-            for entity in entities:
-                allowed_for_entity = set(_candidate_fields_for_entity(config, entity)) | set(
-                    config.introspection_query_args.get(entity, {}).keys()
-                )
-                if canonical_name in allowed_for_entity:
-                    discovered.setdefault(entity, set()).add(canonical_name)
+        if not isinstance(canonical, str) or not canonical.strip():
+            continue
+        canonical_name = canonical.strip()
+        for entity in entities:
+            if canonical_name in _allowed_fields_for_entity(config, entity):
+                discovered.setdefault(entity, set()).add(canonical_name)
 
 
 def _candidate_fields_for_entity(config: NormalizedSchemaConfig, entity: str) -> list[str]:

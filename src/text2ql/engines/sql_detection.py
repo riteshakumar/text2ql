@@ -43,10 +43,10 @@ def detect_order(engine: "SQLEngine", lowered: str, selected_columns: list[str])
         return None, None
     if any(token in lowered for token in ("latest", "newest", "most recent")):
         return engine._detect_order_field(lowered, selected_columns), "DESC"
-    highest = re.search(r"\bhighest\s+([a-zA-Z_][a-zA-Z0-9_]*)\b", lowered)
+    highest = re.search(r"\bhighest\s+([A-Za-z_]\w*)\b", lowered)
     if highest:
         return highest.group(1), "DESC"
-    lowest = re.search(r"\blowest\s+([a-zA-Z_][a-zA-Z0-9_]*)\b", lowered)
+    lowest = re.search(r"\blowest\s+([A-Za-z_]\w*)\b", lowered)
     if lowest:
         return lowest.group(1), "ASC"
     return None, None

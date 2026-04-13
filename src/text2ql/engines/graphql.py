@@ -493,27 +493,14 @@ class GraphQLEngine(QueryEngine):
         config so that the engine stays domain-agnostic.
         """
         for intent in config.keyword_intents:
-            keywords = intent.get("keywords", [])
-            if isinstance(keywords, str):
-                keywords = [keywords]
-            if not keywords:
+            if not self._intent_matches_keywords(lowered, intent):
                 continue
-            if not all(kw in lowered for kw in keywords):
-                continue
-            if "find_entity_by_name" in intent:
-                result = self._find_entity_by_name(config, str(intent["find_entity_by_name"]))
-                if result:
-                    return result
-            if "find_entity_with_fields" in intent:
-                fields = intent["find_entity_with_fields"]
-                preferred = intent.get("preferred_entity_names")
-                result = self._find_entity_with_field(
-                    config,
-                    candidate_fields=list(fields) if isinstance(fields, list) else [str(fields)],
-                    preferred_entity_names=list(preferred) if isinstance(preferred, list) else None,
-                )
-                if result:
-                    return result
+            by_name = self._resolve_special_entity_by_name(config, intent)
+            if by_name:
+                return by_name
+            by_fields = self._resolve_special_entity_by_fields(config, intent)
+            if by_fields:
+                return by_fields
         return None
 
     def _resolve_entity_by_alias_or_name(
@@ -600,24 +587,18 @@ class GraphQLEngine(QueryEngine):
         filter_key_aliases: dict[str, str],
     ) -> None:
         for alias, canonical in self._sorted_alias_pairs(filter_key_aliases):
-            value = self._extract_filter_value(alias=alias, text=where_clause or lowered)
-            if value is None and where_clause is not None:
-                value = self._extract_filter_value(alias=alias, text=lowered)
+            value = self._extract_alias_filter_value(alias, lowered, where_clause)
             if value is None:
                 continue
             resolved_canonical = self._resolve_filter_key_for_entity(config, entity, canonical)
-            if self._is_spurious_filter_value(value):
-                continue
-            if str(resolved_canonical).strip().lower() == entity.strip().lower():
-                continue
             mapped_value = (
                 config.filter_value_aliases.get(str(resolved_canonical).lower(), {}).get(value.lower(), value)
             )
-            if self._is_spurious_filter_value(mapped_value):
-                continue
-            if (
-                str(resolved_canonical).lower() in self._quantity_field_candidates()
-                and self._is_spurious_quantity_value(mapped_value)
+            if not self._is_valid_alias_filter_value(
+                entity=entity,
+                resolved_canonical=resolved_canonical,
+                raw_value=value,
+                mapped_value=mapped_value,
             ):
                 continue
             filters[str(resolved_canonical)] = mapped_value
@@ -1442,32 +1423,107 @@ class GraphQLEngine(QueryEngine):
         arg_type = arg_types.get(base_key)
         enum_values: set[str] = self._enum_values_for_type(arg_type, config) if arg_type else set()
         if isinstance(value, list):
-            out: list[Any] = []
-            for item in value:
-                coerced = self._coerce_scalar_value(item, arg_type)
-                if coerced is None:
-                    continue
-                if enum_values and isinstance(coerced, str):
-                    canonical = next(
-                        (ev for ev in enum_values if ev.lower() == coerced.lower()), None
-                    )
-                    if canonical is None:
-                        notes.append(f"dropped invalid enum value '{coerced}' for '{base_key}'")
-                        continue
-                    coerced = canonical
-                out.append(coerced)
-            return out
+            return self._coerce_list_filter_values(value, arg_type, enum_values, base_key, notes)
         coerced_scalar = self._coerce_scalar_value(value, arg_type)
         if enum_values and isinstance(coerced_scalar, str):
-            canonical = next(
-                (enum_val for enum_val in enum_values if enum_val.lower() == coerced_scalar.lower()),
-                None,
-            )
+            canonical = self._coerce_enum_value(coerced_scalar, enum_values)
             if canonical is None:
                 notes.append(f"dropped invalid enum value '{coerced_scalar}' for '{base_key}'")
                 return None
             coerced_scalar = canonical
         return coerced_scalar
+
+    @staticmethod
+    def _intent_keywords(intent: dict[str, Any]) -> list[str]:
+        keywords = intent.get("keywords", [])
+        if isinstance(keywords, str):
+            return [keywords]
+        if isinstance(keywords, list):
+            return [str(item) for item in keywords if str(item).strip()]
+        return []
+
+    def _intent_matches_keywords(self, lowered: str, intent: dict[str, Any]) -> bool:
+        keywords = self._intent_keywords(intent)
+        return bool(keywords) and all(keyword in lowered for keyword in keywords)
+
+    def _resolve_special_entity_by_name(
+        self,
+        config: NormalizedSchemaConfig,
+        intent: dict[str, Any],
+    ) -> str | None:
+        if "find_entity_by_name" not in intent:
+            return None
+        return self._find_entity_by_name(config, str(intent["find_entity_by_name"]))
+
+    def _resolve_special_entity_by_fields(
+        self,
+        config: NormalizedSchemaConfig,
+        intent: dict[str, Any],
+    ) -> str | None:
+        if "find_entity_with_fields" not in intent:
+            return None
+        fields = intent["find_entity_with_fields"]
+        preferred = intent.get("preferred_entity_names")
+        return self._find_entity_with_field(
+            config,
+            candidate_fields=list(fields) if isinstance(fields, list) else [str(fields)],
+            preferred_entity_names=list(preferred) if isinstance(preferred, list) else None,
+        )
+
+    def _extract_alias_filter_value(
+        self,
+        alias: str,
+        lowered: str,
+        where_clause: str | None,
+    ) -> str | None:
+        value = self._extract_filter_value(alias=alias, text=where_clause or lowered)
+        if value is None and where_clause is not None:
+            value = self._extract_filter_value(alias=alias, text=lowered)
+        return value
+
+    def _is_valid_alias_filter_value(
+        self,
+        entity: str,
+        resolved_canonical: Any,
+        raw_value: Any,
+        mapped_value: Any,
+    ) -> bool:
+        if self._is_spurious_filter_value(raw_value):
+            return False
+        if str(resolved_canonical).strip().lower() == entity.strip().lower():
+            return False
+        if self._is_spurious_filter_value(mapped_value):
+            return False
+        return not (
+            str(resolved_canonical).lower() in self._quantity_field_candidates()
+            and self._is_spurious_quantity_value(mapped_value)
+        )
+
+    def _coerce_list_filter_values(
+        self,
+        values: list[Any],
+        arg_type: str | None,
+        enum_values: set[str],
+        base_key: str,
+        notes: list[str],
+    ) -> list[Any]:
+        out: list[Any] = []
+        for item in values:
+            coerced = self._coerce_scalar_value(item, arg_type)
+            if coerced is None:
+                continue
+            if enum_values and isinstance(coerced, str):
+                canonical = self._coerce_enum_value(coerced, enum_values)
+                if canonical is None:
+                    notes.append(f"dropped invalid enum value '{coerced}' for '{base_key}'")
+                    continue
+                coerced = canonical
+            out.append(coerced)
+        return out
+
+    @staticmethod
+    def _coerce_enum_value(value: str, enum_values: set[str]) -> str | None:
+        return next((enum_value for enum_value in enum_values if enum_value.lower() == value.lower()), None)
 
     @staticmethod
     def _base_filter_key(key: str) -> str:

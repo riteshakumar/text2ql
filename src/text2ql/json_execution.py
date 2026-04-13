@@ -4,6 +4,9 @@ from typing import Any
 
 from text2ql.types import QueryResult
 
+PAGINATION_FILTER_KEYS = {"limit", "offset", "first", "after", "orderBy", "orderDirection", "orderDir"}
+GROUP_FILTER_KEYS = {"and", "or", "not"}
+
 
 def execute_query_result_on_json(
     result: QueryResult,
@@ -15,6 +18,29 @@ def execute_query_result_on_json(
     if root_key and isinstance(payload, dict):
         root = payload.get(root_key, payload)
 
+    entity, fields, filters, aggregations = _extract_query_components(result)
+
+    nodes = _find_entity_nodes(root, entity)
+    if not nodes:
+        return [], f"Entity '{entity}' not found in payload."
+
+    rows = _collect_projected_rows(nodes, fields, filters)
+    rows = _apply_limit_offset(
+        rows=rows,
+        limit=_coerce_limit(filters, result.metadata),
+        offset=_coerce_offset(filters, result.metadata),
+    )
+
+    if not rows:
+        return [], f"Entity '{entity}' found but filtered out by {filters}."
+    if aggregations:
+        return [_evaluate_aggregations(rows, aggregations)], ""
+    return rows, ""
+
+
+def _extract_query_components(
+    result: QueryResult,
+) -> tuple[str, list[str], dict[str, Any], list[dict[str, Any]]]:
     entity = str(result.metadata.get("entity") or result.metadata.get("table") or "")
     fields = [str(field) for field in (result.metadata.get("fields") or result.metadata.get("columns") or [])]
     filters = result.metadata.get("filters", {})
@@ -23,33 +49,37 @@ def execute_query_result_on_json(
         filters = {}
     if not isinstance(aggregations, list):
         aggregations = []
+    return entity, fields, filters, aggregations
 
-    nodes = _find_entity_nodes(root, entity)
-    if not nodes:
-        return [], f"Entity '{entity}' not found in payload."
 
-    limit = _coerce_limit(filters, result.metadata)
-    offset = _coerce_offset(filters, result.metadata)
+def _collect_projected_rows(
+    nodes: list[Any],
+    fields: list[str],
+    filters: dict[str, Any],
+) -> list[Any]:
     rows: list[Any] = []
     for node in nodes:
-        if isinstance(node, list):
-            rows.extend(_project_fields(item, fields) for item in node if _matches_filters(item, filters))
-            continue
-        if isinstance(node, dict):
-            if _matches_filters(node, filters):
-                rows.append(_project_fields(node, fields))
-            continue
-        rows.append(node)
+        rows.extend(_rows_from_node(node, fields, filters))
+    return rows
 
-    if offset is not None:
-        rows = rows[offset:]
-    if limit is not None:
-        rows = rows[:limit]
-    if not rows:
-        return [], f"Entity '{entity}' found but filtered out by {filters}."
-    if aggregations:
-        return [_evaluate_aggregations(rows, aggregations)], ""
-    return rows, ""
+
+def _rows_from_node(node: Any, fields: list[str], filters: dict[str, Any]) -> list[Any]:
+    if isinstance(node, list):
+        return [
+            _project_fields(item, fields)
+            for item in node
+            if _matches_filters(item, filters)
+        ]
+    if isinstance(node, dict):
+        if _matches_filters(node, filters):
+            return [_project_fields(node, fields)]
+        return []
+    return [node]
+
+
+def _apply_limit_offset(rows: list[Any], limit: int | None, offset: int | None) -> list[Any]:
+    out = rows[offset:] if offset is not None else list(rows)
+    return out[:limit] if limit is not None else out
 
 
 def _evaluate_aggregations(rows: list[Any], aggregations: list[dict[str, Any]]) -> dict[str, Any]:
@@ -166,69 +196,63 @@ def _matches_filters(row: Any, filters: dict[str, Any]) -> bool:
     if not isinstance(row, dict):
         return True
     for key, expected in filters.items():
-        if key in {"limit", "offset", "first", "after", "orderBy", "orderDirection", "orderDir"}:
+        if key in PAGINATION_FILTER_KEYS:
             continue
-        if key in {"and", "or", "not"} and isinstance(expected, list):
-            clauses = [item for item in expected if isinstance(item, dict)]
-            if not clauses:
-                continue
-            if key == "and" and not all(_matches_filters(row, clause) for clause in clauses):
-                return False
-            if key == "or" and not any(_matches_filters(row, clause) for clause in clauses):
-                return False
-            if key == "not" and any(_matches_filters(row, clause) for clause in clauses):
+        if key in GROUP_FILTER_KEYS and isinstance(expected, list):
+            if not _matches_group_filter(row, key, expected):
                 return False
             continue
-        if key.endswith("_gte"):
-            field = key[:-4]
-            try:
-                if float(_lookup_field_value(row, field)) < float(expected):
-                    return False
-            except (TypeError, ValueError):
-                return False
-            continue
-        if key.endswith("_lte"):
-            field = key[:-4]
-            try:
-                if float(_lookup_field_value(row, field)) > float(expected):
-                    return False
-            except (TypeError, ValueError):
-                return False
-            continue
-        if key.endswith("_gt"):
-            field = key[:-3]
-            try:
-                if float(_lookup_field_value(row, field)) <= float(expected):
-                    return False
-            except (TypeError, ValueError):
-                return False
-            continue
-        if key.endswith("_lt"):
-            field = key[:-3]
-            try:
-                if float(_lookup_field_value(row, field)) >= float(expected):
-                    return False
-            except (TypeError, ValueError):
-                return False
-            continue
-        if key.endswith("_ne"):
-            field = key[:-3]
-            if _stringify(_lookup_field_value(row, field)) == _stringify(expected):
-                return False
-            continue
-        if key.endswith("_in") and isinstance(expected, list):
-            field = key[:-3]
-            if _stringify(_lookup_field_value(row, field)) not in {_stringify(item) for item in expected}:
-                return False
-            continue
-        if key.endswith("_nin") and isinstance(expected, list):
-            field = key[:-4]
-            if _stringify(_lookup_field_value(row, field)) in {_stringify(item) for item in expected}:
-                return False
-            continue
-        if _stringify(_lookup_field_value(row, key)) != _stringify(expected):
+        if not _matches_operator_filter(row, key, expected):
             return False
     return True
+
+
+def _matches_group_filter(row: dict[str, Any], key: str, expected: list[Any]) -> bool:
+    clauses = [item for item in expected if isinstance(item, dict)]
+    if not clauses:
+        return True
+    if key == "and":
+        return all(_matches_filters(row, clause) for clause in clauses)
+    if key == "or":
+        return any(_matches_filters(row, clause) for clause in clauses)
+    if key == "not":
+        return not any(_matches_filters(row, clause) for clause in clauses)
+    return True
+
+
+def _matches_operator_filter(row: dict[str, Any], key: str, expected: Any) -> bool:
+    if key.endswith("_gte"):
+        return _compare_numeric(row, key[:-4], expected, op="gte")
+    if key.endswith("_lte"):
+        return _compare_numeric(row, key[:-4], expected, op="lte")
+    if key.endswith("_gt"):
+        return _compare_numeric(row, key[:-3], expected, op="gt")
+    if key.endswith("_lt"):
+        return _compare_numeric(row, key[:-3], expected, op="lt")
+    if key.endswith("_ne"):
+        return _stringify(_lookup_field_value(row, key[:-3])) != _stringify(expected)
+    if key.endswith("_in") and isinstance(expected, list):
+        actual = _stringify(_lookup_field_value(row, key[:-3]))
+        return actual in {_stringify(item) for item in expected}
+    if key.endswith("_nin") and isinstance(expected, list):
+        actual = _stringify(_lookup_field_value(row, key[:-4]))
+        return actual not in {_stringify(item) for item in expected}
+    return _stringify(_lookup_field_value(row, key)) == _stringify(expected)
+
+
+def _compare_numeric(row: dict[str, Any], field: str, expected: Any, op: str) -> bool:
+    try:
+        actual = float(_lookup_field_value(row, field))
+        target = float(expected)
+    except (TypeError, ValueError):
+        return False
+    if op == "gte":
+        return actual >= target
+    if op == "lte":
+        return actual <= target
+    if op == "gt":
+        return actual > target
+    return actual < target
 
 
 def _lookup_field_value(row: Any, key: str) -> Any:
