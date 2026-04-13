@@ -361,6 +361,150 @@ def build_sql_prompts(
     return ENGLISH_SQL_SYSTEM_PROMPT, user_prompt
 
 
+# ---------------------------------------------------------------------------
+# Direct query generation prompts (mode="llm")
+#
+# Unlike the intent-extraction prompts above, these ask the LLM to write the
+# full query directly.  The engine returns the raw query string without passing
+# it through the deterministic compiler, so subqueries, HAVING, DISTINCT, and
+# any other SQL/GraphQL construct are supported natively.
+# ---------------------------------------------------------------------------
+
+ENGLISH_SQL_DIRECT_SYSTEM_PROMPT = (
+    "You are an expert SQL query writer. "
+    "Given a natural language question and a database schema, write a single valid SQL SELECT query. "
+    "Rules:\n"
+    "- Output ONLY the SQL query, no explanation, no markdown fences.\n"
+    "- Use standard SQL syntax compatible with SQLite.\n"
+    "- Always quote table and column names with double-quotes to avoid reserved-word conflicts.\n"
+    "- Use JOIN ... ON ... syntax for multi-table queries.\n"
+    "- Use subqueries (NOT IN, EXISTS) when the question requires exclusion or correlated logic.\n"
+    "- Use HAVING for post-aggregation filters.\n"
+    "- Use DISTINCT when the question asks for unique values.\n"
+    "- End the query with a semicolon."
+)
+
+ENGLISH_SQL_DIRECT_USER_TEMPLATE = """Write a SQL query for the following request.
+
+Request: {text}
+
+Database schema:
+Tables: {tables}
+
+Columns per table:
+{columns}
+
+Foreign key relations:
+{relations}
+
+SQL query:"""
+
+ENGLISH_GRAPHQL_DIRECT_SYSTEM_PROMPT = (
+    "You are an expert GraphQL query writer. "
+    "Given a natural language question and a GraphQL schema, write a single valid GraphQL query. "
+    "Rules:\n"
+    "- Output ONLY the GraphQL query, no explanation, no markdown fences.\n"
+    "- Use standard GraphQL syntax.\n"
+    "- Use nested selections for related entities.\n"
+    "- Use filter arguments where needed.\n"
+    "- Use aliases for aggregated fields (e.g. totalCount: count)."
+)
+
+ENGLISH_GRAPHQL_DIRECT_USER_TEMPLATE = """Write a GraphQL query for the following request.
+
+Request: {text}
+
+Available types: {entities}
+
+Fields per type:
+{fields}
+
+Relations:
+{relations}
+
+GraphQL query:"""
+
+
+def build_sql_direct_prompts(
+    text: str,
+    config: NormalizedSchemaConfig,
+    language: str = "english",
+) -> tuple[str, str]:
+    """Build prompts for direct SQL generation (mode='llm').
+
+    The LLM is asked to write the full SQL query rather than a structured
+    intent JSON.  This enables subqueries, HAVING, DISTINCT, and any other
+    SQL construct that the compiler does not support.
+    """
+    resolve_language(language)  # validate
+
+    tables = config.entities or []
+    columns_by_table: dict[str, list[str]] = {}
+    for entity in tables:
+        cols = config.fields_by_entity.get(entity, []) if hasattr(config, "fields_by_entity") else []
+        if not cols and hasattr(config, "args_by_entity"):
+            cols = config.args_by_entity.get(entity, [])
+        columns_by_table[entity] = cols
+
+    relations_by_entity = getattr(config, "relations_by_entity", {})
+    relations_text_parts: list[str] = []
+    for tbl, rel_map in relations_by_entity.items():
+        for rel_name, rel in rel_map.items():
+            on = getattr(rel, "on", None) or f"{tbl}.? = {rel.target}.?"
+            relations_text_parts.append(f"  {tbl} → {rel.target} (via {on})")
+    relations_text = "\n".join(relations_text_parts) if relations_text_parts else "  (none)"
+
+    columns_text = "\n".join(
+        f"  {tbl}: {', '.join(cols)}" for tbl, cols in columns_by_table.items()
+    ) or "  (none)"
+
+    user_prompt = ENGLISH_SQL_DIRECT_USER_TEMPLATE.format(
+        text=text.strip(),
+        tables=", ".join(tables),
+        columns=columns_text,
+        relations=relations_text,
+    )
+    return ENGLISH_SQL_DIRECT_SYSTEM_PROMPT, user_prompt
+
+
+def build_graphql_direct_prompts(
+    text: str,
+    config: NormalizedSchemaConfig,
+    language: str = "english",
+) -> tuple[str, str]:
+    """Build prompts for direct GraphQL generation (mode='llm').
+
+    The LLM writes the full GraphQL query rather than a structured intent JSON,
+    enabling nested selections and complex filter expressions.
+    """
+    resolve_language(language)  # validate
+
+    entities = config.entities or []
+    fields_text_parts: list[str] = []
+    for entity in entities:
+        cols: list[str] = []
+        if hasattr(config, "fields_by_entity"):
+            cols = config.fields_by_entity.get(entity, [])
+        if not cols and hasattr(config, "args_by_entity"):
+            cols = config.args_by_entity.get(entity, [])
+        fields_text_parts.append(f"  {entity}: {', '.join(cols) if cols else '(none)'}")
+
+    relations_by_entity = getattr(config, "relations_by_entity", {})
+    relations_text_parts = []
+    for ent, rel_map in relations_by_entity.items():
+        for rel_name, rel in rel_map.items():
+            relations_text_parts.append(f"  {ent}.{rel_name} → {rel.target}")
+    relations_text = "\n".join(relations_text_parts) if relations_text_parts else "  (none)"
+
+    user_prompt = ENGLISH_GRAPHQL_DIRECT_USER_TEMPLATE.format(
+        text=text.strip(),
+        entities=", ".join(entities),
+        fields="\n".join(fields_text_parts) or "  (none)",
+        relations=relations_text,
+    )
+    return ENGLISH_GRAPHQL_DIRECT_SYSTEM_PROMPT, user_prompt
+
+
 def resolve_prompt_template(context: dict[str, Any]) -> str | None:
     template = context.get("prompt_template")
     if isinstance(template, str) and template.strip():

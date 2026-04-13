@@ -41,6 +41,7 @@ class StructuredFallbackProvider(LLMProvider):
 
 
 def test_llm_mode_uses_provider_with_constrained_output() -> None:
+    # mode="function_calling" is the intent-compiler path (LLM returns JSON intent)
     service = Text2QL(
         provider=StubProvider(
             {
@@ -56,7 +57,7 @@ def test_llm_mode_uses_provider_with_constrained_output() -> None:
     result = service.generate(
         "show top 3 clients with mail state active",
         schema={"entities": ["customers"], "fields": ["id", "email", "status"]},
-        context={"mode": "llm", "language": "english"},
+        context={"mode": "function_calling", "language": "english"},
     )
 
     assert "customers(limit: 3, status: \"active\")" in result.query
@@ -68,9 +69,10 @@ def test_llm_mode_uses_provider_with_constrained_output() -> None:
 
 
 def test_llm_mode_falls_back_to_deterministic_on_invalid_output() -> None:
+    # mode="function_calling" still parses JSON intent; invalid output causes fallback
     service = Text2QL(provider=InvalidProvider())
 
-    result = service.generate("list users", context={"mode": "llm"})
+    result = service.generate("list users", context={"mode": "function_calling"})
 
     assert result.metadata["mode"] == "deterministic"
     assert "user" in result.query
@@ -106,6 +108,7 @@ def test_llm_mode_falls_back_to_deterministic_on_unsupported_language() -> None:
 
 
 def test_sql_llm_mode_uses_provider_with_constrained_output() -> None:
+    # mode="function_calling" is the intent-compiler path (LLM returns JSON intent)
     service = Text2QL(
         provider=StubProvider(
             {
@@ -127,7 +130,7 @@ def test_sql_llm_mode_uses_provider_with_constrained_output() -> None:
         "show top 5 latest orders with status active",
         target="sql",
         schema={"entities": ["orders"], "fields": {"orders": ["id", "status", "createdAt"]}},
-        context={"mode": "llm", "language": "english"},
+        context={"mode": "function_calling", "language": "english"},
     )
 
     assert result.target == "sql"
@@ -145,6 +148,7 @@ def test_sql_llm_mode_uses_provider_with_constrained_output() -> None:
 # ---------------------------------------------------------------------------
 
 def test_async_llm_mode_succeeds() -> None:
+    # mode="function_calling" is the intent-compiler path; verify async path works
     service = Text2QL(
         provider=StubProvider(
             {
@@ -161,7 +165,7 @@ def test_async_llm_mode_succeeds() -> None:
         service.agenerate(
             "pending orders",
             schema={"entities": ["orders"], "fields": ["id", "status"]},
-            context={"mode": "llm"},
+            context={"mode": "function_calling"},
         )
     )
 
@@ -225,6 +229,7 @@ def test_function_calling_falls_back_to_plain_complete_on_error() -> None:
 # ---------------------------------------------------------------------------
 
 def test_llm_mode_applies_filter_value_aliases() -> None:
+    # mode="function_calling" runs the intent compiler which applies alias mapping
     service = Text2QL(
         provider=StubProvider(
             {
@@ -241,7 +246,7 @@ def test_llm_mode_applies_filter_value_aliases() -> None:
         "show active orders",
         schema={"entities": ["orders"], "fields": ["id", "status"]},
         mapping={"filter_values": {"status": {"active": "ACTIVE"}}},
-        context={"mode": "llm"},
+        context={"mode": "function_calling"},
     )
 
     assert result.metadata["mode"] == "llm"
@@ -285,6 +290,7 @@ def test_llm_mode_system_context_is_injected() -> None:
 # ---------------------------------------------------------------------------
 
 def test_sql_llm_mode_skips_unknown_join_relation() -> None:
+    # mode="function_calling" runs the intent compiler which validates/drops bad joins
     service = Text2QL(
         provider=StubProvider(
             {
@@ -306,7 +312,7 @@ def test_sql_llm_mode_skips_unknown_join_relation() -> None:
         "show orders",
         target="sql",
         schema={"entities": ["orders"], "fields": {"orders": ["id", "status"]}},
-        context={"mode": "llm"},
+        context={"mode": "function_calling"},
     )
 
     # Invalid join must be silently dropped — query must still be valid SQL

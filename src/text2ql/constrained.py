@@ -269,6 +269,32 @@ def _coerce_optional_int(value: Any) -> int | None:
         return None
 
 
+def extract_raw_sql(raw: str) -> str:
+    """Extract a SQL query from raw LLM output, stripping markdown fences and prefixes."""
+    # Try fenced code block first
+    match = re.search(r"```(?:sql)?\s*(.*?)\s*```", raw, flags=re.S | re.I)
+    if match:
+        return match.group(1).strip()
+    # Strip common prefixes
+    for prefix in ("sql query:", "sql:", "query:", "answer:"):
+        idx = raw.lower().find(prefix)
+        if idx >= 0:
+            return raw[idx + len(prefix):].strip()
+    return raw.strip()
+
+
+def extract_raw_graphql(raw: str) -> str:
+    """Extract a GraphQL query from raw LLM output, stripping markdown fences."""
+    match = re.search(r"```(?:graphql)?\s*(.*?)\s*```", raw, flags=re.S | re.I)
+    if match:
+        return match.group(1).strip()
+    # Find the first opening brace (start of the query)
+    brace_start = raw.find("{")
+    if brace_start >= 0:
+        return raw[brace_start:].strip()
+    return raw.strip()
+
+
 def _load_intent_payload(raw: str) -> dict[str, Any]:
     try:
         payload = json.loads(raw)

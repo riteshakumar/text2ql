@@ -1,6 +1,7 @@
 import pytest
 
 from text2ql.engines.sql import SQLEngine
+from text2ql.providers.base import LLMProvider
 from text2ql.types import QueryRequest
 
 pytestmark = pytest.mark.unit
@@ -177,7 +178,7 @@ def test_sql_engine_extract_filter_value_ignores_spurious_token() -> None:
 
 
 def test_sql_engine_llm_reconciles_owned_asset_filter_when_missing() -> None:
-    class _StubProvider:
+    class _StubProvider(LLMProvider):
         def complete(self, system_prompt: str, user_prompt: str) -> str:
             return (
                 '{"table":"positions","columns":["quantity"],"filters":{},'
@@ -195,7 +196,7 @@ def test_sql_engine_llm_reconciles_owned_asset_filter_when_missing() -> None:
             "args": {"positions": ["symbol"]},
         },
         mapping={"filter_values": {"symbol": {"qqq": "QQQ"}}},
-        context={"mode": "llm", "language": "english"},
+        context={"mode": "function_calling", "language": "english"},
     )
 
     result = engine.generate(request)
