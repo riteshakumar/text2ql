@@ -168,6 +168,9 @@ class GraphQLEngine(QueryEngine):
             logger.warning("GraphQLEngine: %s", error)
             return None, error
 
+        # Capture whether LLM intended empty fields (pure aggregation — no extra field padding)
+        llm_fields_empty = len(intent.fields) == 0
+
         reconciled_entity, reconciled_fields, reconciled_filters = self._reconcile_owned_asset_intent(
             prompt=prompt,
             entity=intent.entity,
@@ -187,6 +190,12 @@ class GraphQLEngine(QueryEngine):
             ]
         else:
             aggregations = self._detect_aggregations(prompt, config, reconciled_entity)
+
+        # When the LLM explicitly returned fields=[] with aggregations, respect that
+        # intent: a pure aggregation needs no scalar fields in the selection set.
+        if llm_fields_empty and aggregations:
+            reconciled_fields = []
+
         # Prefer LLM-provided nested relations; fall back to text detection.
         if intent.nested:
             nested = intent.nested
@@ -195,7 +204,11 @@ class GraphQLEngine(QueryEngine):
         entity, fields, filters, aggregations, nested, validation_notes = self._validate_components(
             reconciled_entity, reconciled_fields, reconciled_filters, aggregations, nested, config,
         )
-        query = self._build_query(entity, fields, filters, aggregations, nested)
+        query = self._build_query(
+            entity, fields, filters, aggregations, nested,
+            distinct=intent.distinct,
+            having=intent.having,
+        )
         validation_notes.extend(self._validate_generated_query_against_introspection(query, config))
         # Use calibrated schema-aware confidence instead of the LLM's self-report,
         # which is an uncalibrated guess that produces incomparable scores across modes.
@@ -218,6 +231,8 @@ class GraphQLEngine(QueryEngine):
                 "filters": filters,
                 "aggregations": aggregations,
                 "nested": nested,
+                "distinct": intent.distinct,
+                "having": intent.having,
                 "mode": "llm",
                 "language": resolved_language,
                 "raw_completion": raw,
@@ -1340,6 +1355,8 @@ class GraphQLEngine(QueryEngine):
         filters: dict[str, Any],
         aggregations: list[dict[str, str]],
         nested: list[dict[str, Any]],
+        distinct: bool = False,
+        having: list[dict] | None = None,
     ) -> str:
         """Build a GraphQL query string via :class:`~text2ql.renderers.GraphQLIRRenderer`.
 
@@ -1354,6 +1371,8 @@ class GraphQLEngine(QueryEngine):
             aggregations=aggregations,
             nested=nested,
             target="graphql",
+            distinct=distinct,
+            having=having or [],
         )
         return _GRAPHQL_RENDERER.render(ir)
 
@@ -1425,6 +1444,7 @@ class GraphQLEngine(QueryEngine):
             default_fields=config.default_fields,
             entity=validated_entity,
             notes=notes,
+            aggregation_only=not fields and bool(aggregations),
         )
         allowed_args = self._resolve_allowed_args(validated_entity, config)
         validated_filters = self._validate_filters(
@@ -1506,7 +1526,11 @@ class GraphQLEngine(QueryEngine):
         default_fields: list[str],
         entity: str,
         notes: list[str],
+        aggregation_only: bool = False,
     ) -> list[str]:
+        # Pure aggregation query — no scalar fields needed in the selection set.
+        if aggregation_only:
+            return []
         if not allowed_fields:
             return fields
         filtered_fields = [field for field in fields if field in allowed_fields]

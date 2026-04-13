@@ -39,6 +39,8 @@ _GRAPHQL_FILTER_ORDER: dict[str, int] = {
     "orderBy": 4,
     "orderDirection": 5,
     "orderDir": 6,
+    "distinct": 7,
+    "having": 8,
     "status": 10,
     "and": 90,
     "or": 91,
@@ -64,7 +66,13 @@ class GraphQLIRRenderer(IRRenderer):
 
     def render(self, ir: QueryIR) -> str:
         """Produce a GraphQL query string from *ir*."""
-        args = self._build_args(ir.filters, ir.group_filters)
+        extra_group: dict[str, Any] = {}
+        if ir.distinct:
+            extra_group["distinct"] = True
+        if ir.having:
+            extra_group["having"] = self._build_having_arg(ir.having)
+        combined_group = {**ir.group_filters, **extra_group}
+        args = self._build_args(ir.filters, combined_group)
         selection_lines: list[str] = list(ir.fields)
 
         for agg in ir.aggregations:
@@ -103,6 +111,29 @@ class GraphQLIRRenderer(IRRenderer):
         ordered = sorted(parts.items(), key=lambda kv: (_GRAPHQL_FILTER_ORDER.get(kv[0], 100), kv[0]))
         args_str = ", ".join(f"{k}: {self._format_arg(v)}" for k, v in ordered)
         return f"({args_str})"
+
+    @staticmethod
+    def _build_having_arg(having: list[dict[str, Any]]) -> dict[str, Any]:
+        """Convert having conditions to a GraphQL having argument dict.
+
+        Each condition becomes ``{function: {field: {_op: value}}}`` — the
+        Hasura / Postgraphile convention.  For example::
+
+            COUNT(*) > 5  →  {"count": {"_gt": 5}}
+            SUM(amount) >= 100  →  {"sum": {"amount": {"_gte": 100}}}
+        """
+        _OP = {">": "_gt", ">=": "_gte", "<": "_lt", "<=": "_lte", "=": "_eq", "!=": "_neq"}
+        result: dict[str, Any] = {}
+        for h in having:
+            fn = str(h.get("function", "COUNT")).lower()
+            field = str(h.get("field", "*"))
+            op = _OP.get(str(h.get("operator", "=")), "_eq")
+            value = h.get("value", 0)
+            if field == "*":
+                result[fn] = {op: value}
+            else:
+                result[fn] = {field: {op: value}}
+        return result
 
     @staticmethod
     def _render_aggregation(agg: IRAggregation) -> str:

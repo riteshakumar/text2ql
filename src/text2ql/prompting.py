@@ -13,11 +13,15 @@ ENGLISH_GRAPHQL_SYSTEM_PROMPT = (
     "entity (string), fields (array of strings), filters (object), "
     "aggregations (array of objects with function and field), "
     "nested (array of objects with relation and fields), "
+    "distinct (bool, true when query asks for unique values), "
+    "having (array of post-aggregation conditions: [{\"function\":\"COUNT\",\"field\":\"*\",\"operator\":\">\",\"value\":5}]), "
     "explanation (string), confidence (number in [0,1]). "
     "For aggregations use: {\"function\": \"COUNT\", \"field\": \"*\"} or "
     "{\"function\": \"SUM\", \"field\": \"amount\"}. "
     "For filters with comparisons use suffix keys: age_gt (>), age_gte (>=), price_lt (<), price_lte (<=), field_ne (!=). "
     "For nested relations use the exact relation name from the schema. "
+    "Set distinct=true when the question asks for unique/distinct values. "
+    "Use having for post-aggregation conditions like 'more than 5 orders'. "
     "Example filter: {\"age_gt\": 20, \"status\": \"active\"}."
 )
 
@@ -161,6 +165,25 @@ GRAPHQL_INTENT_JSON_SCHEMA: dict = {
             },
             "description": "Nested relation fetches. Use exact relation names from the schema.",
         },
+        "distinct": {
+            "type": "boolean",
+            "description": "True when the query should return unique/distinct values.",
+        },
+        "having": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "function": {"type": "string", "enum": ["COUNT", "SUM", "AVG", "MIN", "MAX"]},
+                    "field": {"type": "string"},
+                    "operator": {"type": "string", "enum": [">", ">=", "<", "<=", "=", "!="]},
+                    "value": {},
+                },
+                "required": ["function", "field", "operator", "value"],
+                "additionalProperties": False,
+            },
+            "description": "Post-aggregation filter conditions.",
+        },
         "explanation": {
             "type": "string",
             "description": "Human-readable explanation of the generated intent.",
@@ -172,7 +195,7 @@ GRAPHQL_INTENT_JSON_SCHEMA: dict = {
             "description": "Confidence score in [0, 1].",
         },
     },
-    "required": ["entity", "fields", "filters", "aggregations", "nested", "explanation", "confidence"],
+    "required": ["entity", "fields", "filters", "aggregations", "nested", "distinct", "having", "explanation", "confidence"],
     "additionalProperties": False,
 }
 

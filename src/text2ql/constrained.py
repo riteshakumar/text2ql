@@ -18,6 +18,8 @@ class GraphQLIntent:
     confidence: float
     aggregations: list[dict]
     nested: list[dict]
+    distinct: bool
+    having: list[dict]
 
 
 @dataclass(slots=True)
@@ -84,6 +86,13 @@ def parse_graphql_intent(
         nested = []
     nested = [n for n in nested if isinstance(n, dict) and "relation" in n]
 
+    distinct = bool(payload.get("distinct", False))
+
+    having = payload.get("having", [])
+    if not isinstance(having, list):
+        having = []
+    having = [h for h in having if isinstance(h, dict) and "function" in h and "operator" in h and "value" in h]
+
     canonical_entity = _canonicalize_entity(entity.strip(), config)
     canonical_fields = [_canonicalize_field(field.strip(), config) for field in fields]
     canonical_filters = {
@@ -103,6 +112,8 @@ def parse_graphql_intent(
         confidence=normalized_confidence,
         aggregations=aggregations,
         nested=nested,
+        distinct=distinct,
+        having=having,
     )
 
 
