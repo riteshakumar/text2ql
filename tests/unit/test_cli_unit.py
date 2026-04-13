@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from text2ql.cli import _build_hybrid_mapping_from_args, _load_json_object, build_parser
+from text2ql.cli import _build_hybrid_mapping_from_args, _build_provider, _load_json_object, build_parser, main
 
 pytestmark = pytest.mark.unit
 
@@ -116,3 +116,63 @@ def test_cli_parser_exposes_llm_rewrite_flag() -> None:
 
     assert args.mode == "llm"
     assert args.llm_rewrite == "on"
+
+
+def test_cli_parser_accepts_function_calling_mode() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(
+        [
+            "list users",
+            "--mode",
+            "function_calling",
+        ]
+    )
+
+    assert args.mode == "function_calling"
+
+
+def test_build_provider_requires_api_key_for_llm_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    parser = build_parser()
+    args = parser.parse_args(["list users", "--mode", "llm"])
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("TEXT2QL_API_KEY", raising=False)
+
+    with pytest.raises(ValueError, match="LLM mode requires an API key"):
+        _build_provider(args)
+
+
+def test_build_provider_uses_structured_output_for_function_calling_mode() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "list users",
+            "--mode",
+            "function_calling",
+            "--llm-api-key",
+            "sk-test",
+        ]
+    )
+
+    provider = _build_provider(args)
+
+    assert getattr(provider, "use_structured_output", False) is True
+
+
+def test_main_exits_cleanly_when_llm_api_key_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("TEXT2QL_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["text2ql", "list users", "--mode", "llm", "--schema", '{"entities":["users"],"fields":{"users":["id"]}}'],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    captured = capsys.readouterr()
+    assert exc.value.code == 2
+    assert "LLM mode requires an API key" in captured.err

@@ -814,7 +814,8 @@ text2ql "show latest 5 orders with status active" \
   --schema '{"entities":["orders"],"fields":{"orders":["id","status","createdAt"]}}'
 ```
 
-If you do not pass `--mode llm`, CLI runs deterministic mode.
+If you do not pass `--mode llm` or `--mode function_calling`, CLI runs deterministic mode.
+`--mode function_calling` enables the schema-constrained intent path (`complete_structured`) and turns on provider structured output when supported.
 `--system-context` is consumed in LLM mode and ignored in deterministic mode.
 `--llm-rewrite on` can still apply LLM rewrite even when `--mode deterministic` is used.
 
@@ -1348,4 +1349,3 @@ Reports include:
 6. ~~Add Spider/BIRD benchmark evaluation~~ *(done — `load_spider`, `load_bird`, `run_benchmark`, CLI `--benchmark`)*.
 7. Add few-shot example support in LLM mode with dynamic example retrieval based on schema/mapping similarity.
 8. Multilingual prompt support (currently English only).
-

@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sqlite3
 import time
 from collections import defaultdict
@@ -333,8 +334,9 @@ def _execute_sql(
     try:
         cursor.execute(sql)
         return cursor.fetchall()
-    except Exception:
-        raise
+    except sqlite3.Error as exc:
+        compact_sql = re.sub(r"\s+", " ", sql).strip()[:240]
+        raise RuntimeError(f"SQLite execution failed for query: {compact_sql}") from exc
     finally:
         cursor.close()
 

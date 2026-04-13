@@ -73,6 +73,14 @@ _RE_DATE_RANGE = re.compile(
     rf"\b{WORD_IDENTIFIER}\s+from\s+({ISO_DATE})\s+to\s+({ISO_DATE})\b"
 )
 
+#: Owned-asset intent patterns used across engines (e.g. ``how many qqq do i own``).
+_RE_OWNED_ASSET_PATTERNS = (
+    re.compile(r"\bwhat quantity of\s+([a-z0-9_]+)\s+do i own\b"),
+    re.compile(r"\bquantity of\s+([a-z0-9_]+)\s+do i own\b"),
+    re.compile(r"\bhow many\s+([a-z0-9_]+)\s+do i own\b"),
+    re.compile(r"\bhow many\s+([a-z0-9_]+)\s+i own\b"),
+)
+
 #: Values tokenizer used by ``_RE_IN`` matches (splits on comma / "or" / "and").
 _RE_IN_SPLIT = re.compile(r",|\s+or\s+|\s+and\s+")
 
@@ -156,3 +164,17 @@ def detect_date_range_filters(lowered: str) -> dict[str, Any]:
         filters[f"{field}_gte"] = m.group(2)
         filters[f"{field}_lte"] = m.group(3)
     return filters
+
+
+def detect_owned_asset(lowered: str) -> str | None:
+    """Return ticker/symbol token for owned-asset prompts, else ``None``.
+
+    Examples:
+    - ``how many qqq do i own`` -> ``qqq``
+    - ``what quantity of aapl do i own`` -> ``aapl``
+    """
+    for pattern in _RE_OWNED_ASSET_PATTERNS:
+        match = pattern.search(lowered)
+        if match is not None:
+            return match.group(1)
+    return None

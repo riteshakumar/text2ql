@@ -15,6 +15,7 @@ from text2ql.filters import (
     detect_date_range_filters,
     detect_in_filters,
     detect_negation_filters,
+    detect_owned_asset,
 )
 from text2ql.prompting import (
     SQL_INTENT_JSON_SCHEMA,
@@ -28,6 +29,35 @@ from text2ql.schema_config import NormalizedRelation, normalize_schema_config
 from text2ql.types import QueryRequest, QueryResult, ValidationError
 
 from .base import QueryEngine, compute_deterministic_confidence
+from .sql_detection import (
+    detect_columns as _detect_columns_stage,
+    detect_order as _detect_order_stage,
+    detect_table as _detect_table_stage,
+)
+from .sql_filter_parsing import detect_filters as _detect_filters_stage
+from .sql_validation import validate_components as _validate_components_stage
+from .holdings_utils import (
+    identifier_candidates as _identifier_candidates,
+    quantity_candidates as _quantity_candidates,
+    resolve_holdings_container as _resolve_holdings_container,
+    resolve_holdings_projection as _resolve_holdings_projection,
+    resolve_identifier_filter_key as _resolve_identifier_filter_key,
+    score_holdings_container as _score_holdings_container,
+)
+from .text_utils import (
+    contains_column_reference as _contains_column_reference,
+    contains_entity_token as _contains_entity_token,
+    contains_token as _contains_token,
+    extract_filter_value as _extract_filter_value,
+    extract_where_clause as _extract_where_clause,
+    label_match_variants as _label_match_variants,
+    parse_grouped_boolean_filters as _parse_grouped_boolean_filters,
+    sorted_alias_pairs as _sorted_alias_pairs,
+    split_top_level as _split_top_level,
+    strip_outer_parentheses as _strip_outer_parentheses,
+    token_inflections as _token_inflections,
+    unique_in_order as _unique_in_order,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -550,121 +580,55 @@ class SQLEngine(QueryEngine):
         return joins
 
     def _detect_table(self, lowered: str, config: Any) -> str:
-        for alias, canonical in self._sorted_alias_pairs(config.entity_aliases):
-            if self._contains_token(lowered, alias):
-                return canonical
-        for entity in config.entities:
-            if self._contains_entity_token(lowered, entity.lower()):
-                return entity
-        if config.default_entity:
-            return config.default_entity
-        return config.entities[0] if config.entities else self._extract_entity_from_text(lowered)
+        return _detect_table_stage(self, lowered, config)
 
     @staticmethod
     def _detect_owned_asset(lowered: str) -> str | None:
-        match = re.search(r"\bwhat quantity of\s+([a-z0-9_]+)\s+do i own\b", lowered)
-        if match is not None:
-            return match.group(1)
-        match = re.search(r"\bquantity of\s+([a-z0-9_]+)\s+do i own\b", lowered)
-        if match is not None:
-            return match.group(1)
-        match = re.search(r"\bhow many\s+([a-z0-9_]+)\s+do i own\b", lowered)
-        if match is not None:
-            return match.group(1)
-        match = re.search(r"\bhow many\s+([a-z0-9_]+)\s+i own\b", lowered)
-        if match is not None:
-            return match.group(1)
-        return None
+        return detect_owned_asset(lowered)
 
     def _resolve_holdings_table(self, config: Any) -> str | None:
-        best_table: str | None = None
-        best_score = 0
-        for entity in config.entities:
-            columns = self._columns_for_table(config, entity)
-            if not columns:
-                continue
-            score = self._score_holdings_table(entity, columns)
-            if score > best_score:
-                best_score = score
-                best_table = entity
-        return best_table if best_score > 0 else None
+        return _resolve_holdings_container(
+            config.entities,
+            fields_for_container=lambda entity: self._columns_for_table(config, entity),
+            quantity_keys=self._quantity_column_candidates(),
+            identifier_keys=self._identifier_column_candidates(),
+        )
 
     def _score_holdings_table(self, table: str, columns: list[str]) -> int:
-        lowered_table = table.lower()
-        lowered_columns = {column.lower() for column in columns}
-        has_identifier = any(candidate in lowered_columns for candidate in self._identifier_column_candidates())
-        has_quantity = any(candidate in lowered_columns for candidate in self._quantity_column_candidates())
-        if not (has_identifier and has_quantity):
-            return 0
-        score = 1
-        if lowered_table in {"positions", "holdings", "assets"}:
-            score += 4
-        if {"symbol", "securitytype"}.intersection(lowered_columns):
-            score += 1
-        if {"acctnum", "acctname", "accountpositioncount"}.intersection(lowered_columns):
-            score -= 3
-        return score
+        return _score_holdings_container(
+            table,
+            columns,
+            quantity_keys=self._quantity_column_candidates(),
+            identifier_keys=self._identifier_column_candidates(),
+        )
 
     def _resolve_identifier_filter_key(self, config: Any, table: str) -> str | None:
-        table_args = {arg.lower(): arg for arg in config.args_by_entity.get(table, [])}
-        table_columns = {column.lower(): column for column in self._columns_for_table(config, table)}
-        for candidate in self._identifier_column_candidates():
-            if candidate in table_args:
-                return table_args[candidate]
-            if candidate in table_columns:
-                return table_columns[candidate]
-        return None
+        return _resolve_identifier_filter_key(
+            args=config.args_by_entity.get(table, []),
+            fields=self._columns_for_table(config, table),
+            identifier_keys=self._identifier_column_candidates(),
+        )
 
     def _resolve_holdings_columns(self, columns: list[str]) -> list[str]:
-        lowered_to_original = {column.lower(): column for column in columns}
-        selection: list[str] = []
-        for candidate in self._quantity_column_candidates():
-            field = lowered_to_original.get(candidate)
-            if field is not None:
-                selection.append(field)
-                break
-        for candidate in self._identifier_column_candidates():
-            field = lowered_to_original.get(candidate)
-            if field is not None and field not in selection:
-                selection.append(field)
-                break
-        return selection
+        return _resolve_holdings_projection(
+            columns,
+            quantity_keys=self._quantity_column_candidates(),
+            identifier_keys=self._identifier_column_candidates(),
+        )
 
     @staticmethod
     def _quantity_column_candidates() -> tuple[str, ...]:
-        return ("quantity", "qty", "shares", "units", "amount", "holding")
+        return _quantity_candidates()
 
     @staticmethod
     def _identifier_column_candidates() -> tuple[str, ...]:
-        return ("symbol", "ticker", "stock", "asset", "security", "code", "name")
+        return _identifier_candidates()
 
     def _detect_columns(self, lowered: str, config: Any, table: str) -> list[str]:
-        allowed = self._columns_for_table(config, table)
-        selected: list[str] = []
-        for column in allowed:
-            if self._contains_column_reference(lowered, column):
-                selected.append(column)
-        for alias, canonical in self._sorted_alias_pairs(config.field_aliases):
-            if canonical in allowed and self._contains_column_reference(lowered, alias):
-                selected.append(canonical)
-        selected = self._unique_in_order(selected)
-        if selected:
-            return selected
-        if config.default_fields:
-            defaults = [field for field in config.default_fields if field in allowed]
-            if defaults:
-                return defaults
-        return allowed[:3] if allowed else ["id"]
+        return _detect_columns_stage(self, lowered, config, table)
 
     def _detect_filters(self, lowered: str, config: Any, table: str) -> dict[str, Any]:
-        filters: dict[str, Any] = {}
-        where_clause = self._extract_where_clause(lowered) or lowered
-        self._apply_alias_filters(filters, where_clause, lowered, config, table)
-        self._apply_advanced_filters(filters, lowered)
-        grouped = self._parse_grouped_filters(lowered)
-        if grouped:
-            filters.update(grouped)
-        return filters
+        return _detect_filters_stage(self, lowered, config, table)
 
     def _apply_alias_filters(
         self,
@@ -714,21 +678,7 @@ class SQLEngine(QueryEngine):
         return candidate_key
 
     def _parse_grouped_filters(self, lowered: str) -> dict[str, Any]:
-        if " and " not in lowered and " or " not in lowered:
-            return {}
-        where_clause = self._strip_outer_parentheses(self._extract_where_clause(lowered) or lowered)
-        or_parts = self._split_top_level(where_clause, "or")
-        if len(or_parts) <= 1:
-            and_nodes = self._parse_and_nodes(where_clause)
-            return {"and": and_nodes} if len(and_nodes) > 1 else {}
-        nodes: list[dict[str, Any]] = []
-        for part in or_parts:
-            and_nodes = self._parse_and_nodes(part)
-            if len(and_nodes) == 1:
-                nodes.append(and_nodes[0])
-            elif len(and_nodes) > 1:
-                nodes.append({"and": and_nodes})
-        return {"or": nodes} if len(nodes) > 1 else {}
+        return _parse_grouped_boolean_filters(lowered, self._parse_and_nodes)
 
     def _parse_and_nodes(self, text: str) -> list[dict[str, Any]]:
         nodes: list[dict[str, Any]] = []
@@ -770,71 +720,14 @@ class SQLEngine(QueryEngine):
 
     @staticmethod
     def _split_top_level(text: str, operator: str) -> list[str]:
-        if not text:
-            return []
-        parts: list[str] = []
-        depth = 0
-        start = 0
-        i = 0
-        token = f" {operator} "
-        token_len = len(token)
-        while i < len(text):
-            ch = text[i]
-            if ch == "(":
-                depth += 1
-                i += 1
-                continue
-            if ch == ")":
-                depth = max(0, depth - 1)
-                i += 1
-                continue
-            if depth == 0 and text[i : i + token_len] == token:
-                part = text[start:i].strip()
-                if part:
-                    parts.append(part)
-                i += token_len
-                start = i
-                continue
-            i += 1
-        tail = text[start:].strip()
-        if tail:
-            parts.append(tail)
-        return parts
+        return _split_top_level(text, operator)
 
     @staticmethod
     def _strip_outer_parentheses(text: str) -> str:
-        candidate = text.strip()
-        while candidate.startswith("(") and candidate.endswith(")"):
-            depth = 0
-            balanced = True
-            for idx, ch in enumerate(candidate):
-                if ch == "(":
-                    depth += 1
-                elif ch == ")":
-                    depth -= 1
-                    if depth < 0:
-                        balanced = False
-                        break
-                    if depth == 0 and idx != len(candidate) - 1:
-                        balanced = False
-                        break
-            if not balanced or depth != 0:
-                break
-            candidate = candidate[1:-1].strip()
-        return candidate
+        return _strip_outer_parentheses(text)
 
     def _detect_order(self, lowered: str, selected_columns: list[str]) -> tuple[str | None, str | None]:
-        if "latest order" in lowered:
-            return None, None
-        if any(token in lowered for token in ("latest", "newest", "most recent")):
-            return self._detect_order_field(lowered, selected_columns), "DESC"
-        highest = re.search(r"\bhighest\s+([a-zA-Z_][a-zA-Z0-9_]*)\b", lowered)
-        if highest:
-            return highest.group(1), "DESC"
-        lowest = re.search(r"\blowest\s+([a-zA-Z_][a-zA-Z0-9_]*)\b", lowered)
-        if lowest:
-            return lowest.group(1), "ASC"
-        return None, None
+        return _detect_order_stage(self, lowered, selected_columns)
 
     @staticmethod
     def _detect_order_field(lowered: str, selected_columns: list[str]) -> str:
@@ -945,33 +838,16 @@ class SQLEngine(QueryEngine):
         order_dir: str | None,
         config: Any,
     ) -> tuple[str, list[str], dict[str, Any], list[_RelationJoin], str | None, str | None, list[str]]:
-        notes: list[str] = []
-        table = self._resolve_table(table, config, notes)
-        allowed_columns = set(self._columns_for_table(config, table))
-        columns = [column for column in columns if column in allowed_columns] or list(allowed_columns)[:2] or ["id"]
-        allowed_filter_keys = self._allowed_filter_keys(config, table, allowed_columns)
-        filters = self._validate_filters(filters, allowed_filter_keys, notes)
-        self._coerce_filter_values(filters, config, table, notes, known_filter_keys=allowed_filter_keys)
-
-        # Contradiction detection — same field assigned conflicting plain-equality values
-        contradiction_notes = _detect_contradictory_filters(filters)
-        if contradiction_notes:
-            for note in contradiction_notes:
-                logger.warning("SQLEngine [%s]: %s", table, note)
-            notes.extend(contradiction_notes)
-            if self.strict_validation:
-                raise ValidationError(
-                    f"Contradictory filters detected for table '{table}'",
-                    contradiction_notes,
-                )
-
-        if order_by and order_by not in allowed_columns:
-            notes.append(f"dropped invalid orderBy '{order_by}' for '{table}'")
-            order_by = None
-            order_dir = None
-
-        joins = self._validate_joins(joins, config, table, notes)
-        return table, columns, filters, joins, order_by, order_dir, notes
+        return _validate_components_stage(
+            self,
+            table,
+            columns,
+            filters,
+            joins,
+            order_by,
+            order_dir,
+            config,
+        )
 
     def _resolve_table(self, table: str, config: Any, notes: list[str]) -> str:
         known = config.entities
@@ -1347,108 +1223,39 @@ class SQLEngine(QueryEngine):
 
     @staticmethod
     def _extract_where_clause(lowered: str) -> str | None:
-        parts = lowered.split(" where ", maxsplit=1)
-        if len(parts) == 2:
-            return parts[1].strip()
-        return None
+        return _extract_where_clause(lowered)
 
     @staticmethod
     def _extract_filter_value(alias: str, text: str) -> str | None:
-        key_pattern = re.escape(alias)
-        patterns = [
-            rf"\b{key_pattern}\b\s*(?:=|:)\s*([^\s,)\]]+)",
-            rf"\b{key_pattern}\b\s+(?:is\s+|equals\s+|equal to\s+)?([^\s,)\]]+)",
-        ]
-        for pattern in patterns:
-            matches = list(re.finditer(pattern, text))
-            if not matches:
-                continue
-            candidate = matches[-1].group(1).strip().strip('"').strip("'")
-            if candidate.lower() in _SPURIOUS_FILTER_VALUES:
-                continue
-            return candidate
-        return None
+        return _extract_filter_value(alias, text, spurious_values=_SPURIOUS_FILTER_VALUES)
 
     @staticmethod
     def _contains_token(text: str, token: str) -> bool:
-        return re.search(rf"\b{re.escape(token)}\b", text) is not None
+        return _contains_token(text, token)
 
     @classmethod
     def _contains_column_reference(cls, text: str, label: str) -> bool:
-        for variant in cls._label_match_variants(label):
-            if cls._contains_token(text, variant):
-                return True
-        return False
+        return _contains_column_reference(text, label)
 
     @classmethod
     def _label_match_variants(cls, label: str) -> set[str]:
-        lowered = str(label).strip().lower()
-        if not lowered:
-            return set()
-
-        variants: set[str] = {lowered}
-        normalized = re.sub(r"[_\s]+", " ", lowered)
-        normalized = re.sub(r"([a-z])([A-Z])", r"\1 \2", normalized).lower()
-        normalized = re.sub(r"\s+", " ", normalized).strip()
-        if normalized:
-            variants.add(normalized)
-
-        tokens = [token for token in normalized.split(" ") if token]
-        if len(tokens) == 1:
-            variants.update(cls._token_inflections(tokens[0]))
-
-        if tokens:
-            for replacement in cls._token_inflections(tokens[-1]):
-                phrase = " ".join([*tokens[:-1], replacement]).strip()
-                if phrase:
-                    variants.add(phrase)
-
-        return {variant for variant in variants if variant}
+        return _label_match_variants(label)
 
     @staticmethod
     def _token_inflections(token: str) -> set[str]:
-        token = token.strip().lower()
-        if not token:
-            return set()
-        forms: set[str] = {token}
-        if len(token) > 3:
-            if token.endswith("ies"):
-                forms.add(token[:-3] + "y")
-            elif token.endswith("es"):
-                forms.add(token[:-2])
-            elif token.endswith("s"):
-                forms.add(token[:-1])
-            elif token.endswith("y"):
-                forms.add(token[:-1] + "ies")
-                forms.add(token + "s")
-            elif token.endswith(("x", "z", "ch", "sh")):
-                forms.add(token + "es")
-            else:
-                forms.add(token + "s")
-        return {form for form in forms if form}
+        return _token_inflections(token)
 
     @staticmethod
     def _contains_entity_token(text: str, token: str) -> bool:
-        if SQLEngine._contains_token(text, token):
-            return True
-        if token.endswith("s"):
-            return False
-        return SQLEngine._contains_token(text, f"{token}s")
+        return _contains_entity_token(text, token)
 
     @staticmethod
     def _sorted_alias_pairs(alias_map: dict[str, str]) -> list[tuple[str, str]]:
-        return sorted(alias_map.items(), key=lambda pair: len(pair[0]), reverse=True)
+        return _sorted_alias_pairs(alias_map)
 
     @staticmethod
     def _unique_in_order(items: list[str]) -> list[str]:
-        seen: set[str] = set()
-        out: list[str] = []
-        for item in items:
-            if item in seen:
-                continue
-            out.append(item)
-            seen.add(item)
-        return out
+        return _unique_in_order(items)
 
 
 # ---------------------------------------------------------------------------

@@ -5,7 +5,7 @@ import pytest
 
 from text2ql import Text2QL
 from text2ql.dataset import DatasetExample, generate_synthetic_examples, ingest_dataset
-from text2ql.evaluate import evaluate_examples
+from text2ql.evaluate import evaluate_examples, sql_execution_match
 
 pytestmark = pytest.mark.unit
 
@@ -459,3 +459,39 @@ def test_evaluate_examples_structural_execution_for_sql() -> None:
 
     assert report.total == 1
     assert report.execution_accuracy == pytest.approx(1.0)
+
+
+def test_sql_structural_match_detects_missing_join() -> None:
+    predicted = 'SELECT "customers"."id" FROM "customers";'
+    expected = (
+        'SELECT "customers"."id", "orders"."id" AS orders_id '
+        'FROM "customers" LEFT JOIN "orders" "orders" '
+        'ON "orders"."customerId" = "customers"."id";'
+    )
+
+    assert sql_execution_match(predicted, expected) is False
+
+
+def test_sql_structural_match_supports_multi_column_order_by() -> None:
+    predicted = (
+        'SELECT users.id FROM users '
+        'ORDER BY users.created_at DESC, users.id ASC;'
+    )
+    expected = (
+        'SELECT "users"."id" FROM "users" '
+        'ORDER BY "users"."created_at" DESC, "users"."id" ASC;'
+    )
+
+    assert sql_execution_match(predicted, expected) is True
+
+
+def test_sql_structural_match_detects_subquery_table_difference() -> None:
+    predicted = 'SELECT "users"."id" FROM "users";'
+    expected = (
+        'SELECT "users"."id" FROM "users" '
+        'WHERE "users"."id" NOT IN ('
+        'SELECT "banned_users"."user_id" FROM "banned_users"'
+        ');'
+    )
+
+    assert sql_execution_match(predicted, expected) is False

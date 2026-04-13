@@ -34,8 +34,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mode",
         default="deterministic",
-        choices=["deterministic", "llm"],
-        help="Generation mode",
+        choices=["deterministic", "llm", "function_calling"],
+        help="Generation mode (function_calling uses structured-output intent path).",
     )
     parser.add_argument(
         "--language",
@@ -51,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--llm-provider",
         default="openai-compatible",
         choices=["openai-compatible", "rule-based"],
-        help="LLM provider adapter when --mode llm",
+        help="LLM provider adapter when --mode llm or --mode function_calling",
     )
     parser.add_argument(
         "--llm-model",
@@ -247,7 +247,7 @@ def main() -> None:
             from importlib.metadata import version
             print(f"text2ql {version('text2ql')}")
         except Exception:
-            print("text2ql 0.2.0")
+            print("text2ql (version unavailable)")
         return
 
     if args.generate_hybrid_mapping:
@@ -265,7 +265,11 @@ def main() -> None:
     schema = _load_json_object(args.schema, args.schema_file)
     mapping = _load_json_object(args.mapping, args.mapping_file)
     schema, mapping = _resolve_generation_schema_mapping(args, schema, mapping)
-    service = Text2QL(provider=_build_provider(args))
+    try:
+        service = Text2QL(provider=_build_provider(args))
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(2)
     prompts, metadata, use_synthetic = _build_prompts_and_metadata(args, schema, mapping)
     expected_query, expected_execution, execution_eval_enabled, execution_data_payload = _load_execution_eval_inputs(
         args
@@ -573,16 +577,27 @@ def _emit_json_output(payload: dict[str, Any], output_path: str) -> None:
 
 
 def _build_provider(args: argparse.Namespace) -> LLMProvider:
-    if args.mode != "llm":
+    if args.mode not in {"llm", "function_calling"}:
         return RuleBasedProvider()
     if args.llm_provider == "rule-based":
         return RuleBasedProvider()
+    api_key = (
+        (args.llm_api_key or "").strip()
+        or (os.getenv("OPENAI_API_KEY") or "").strip()
+        or (os.getenv("TEXT2QL_API_KEY") or "").strip()
+    )
+    if not api_key:
+        raise ValueError(
+            "LLM mode requires an API key. Pass --llm-api-key "
+            "or set OPENAI_API_KEY/TEXT2QL_API_KEY."
+        )
     return OpenAICompatibleProvider(
-        api_key=(args.llm_api_key or "").strip() or None,
+        api_key=api_key,
         model=args.llm_model,
         base_url=args.llm_base_url,
         max_retries=args.llm_max_retries,
         retry_backoff_seconds=args.llm_retry_backoff,
+        use_structured_output=(args.mode == "function_calling"),
     )
 
 

@@ -17,6 +17,7 @@ from text2ql.filters import (
     detect_date_range_filters,
     detect_in_filters,
     detect_negation_filters,
+    detect_owned_asset,
 )
 from text2ql.prompting import (
     GRAPHQL_INTENT_JSON_SCHEMA,
@@ -34,6 +35,32 @@ from text2ql.schema_config import (
 from text2ql.types import QueryRequest, QueryResult, ValidationError
 
 from .base import QueryEngine, compute_deterministic_confidence
+from .graphql_detection import (
+    detect_aggregations as _detect_aggregations_stage,
+    detect_entity as _detect_entity_stage,
+    detect_fields as _detect_fields_stage,
+)
+from .graphql_filter_parsing import detect_filters as _detect_filters_stage
+from .graphql_validation import validate_components as _validate_components_stage
+from .holdings_utils import (
+    identifier_candidates as _identifier_candidates,
+    quantity_candidates as _quantity_candidates,
+    resolve_holdings_container as _resolve_holdings_container,
+    resolve_holdings_projection as _resolve_holdings_projection,
+    resolve_identifier_filter_key as _resolve_identifier_filter_key,
+    score_holdings_container as _score_holdings_container,
+)
+from .text_utils import (
+    contains_entity_token as _contains_entity_token,
+    contains_token as _contains_token,
+    extract_filter_value as _extract_filter_value,
+    extract_where_clause as _extract_where_clause,
+    parse_grouped_boolean_filters as _parse_grouped_boolean_filters,
+    sorted_alias_pairs as _sorted_alias_pairs,
+    split_top_level as _split_top_level,
+    strip_outer_parentheses as _strip_outer_parentheses,
+    unique_in_order as _unique_in_order,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -441,34 +468,7 @@ class GraphQLEngine(QueryEngine):
         return resolved_entity, resolved_fields, resolved_filters
 
     def _detect_entity(self, text: str, config: NormalizedSchemaConfig) -> str:
-        lowered = text.lower()
-        owned_asset = self._detect_owned_asset(lowered)
-        holdings_entity = self._resolve_holdings_entity(config)
-        if owned_asset and holdings_entity:
-            return holdings_entity
-        special_entity = self._resolve_special_entity(lowered, config)
-        if special_entity is not None:
-            return special_entity
-
-        alias_or_name_entity = self._resolve_entity_by_alias_or_name(lowered, config)
-        if alias_or_name_entity is not None:
-            return alias_or_name_entity
-
-        semantic_entity = self._resolve_entity_by_semantic_field_match(lowered, config)
-        if semantic_entity is not None:
-            return semantic_entity
-
-        if config.default_entity:
-            return config.default_entity
-
-        # Prefer the first schema-declared entity over generic text extraction.
-        if config.entities:
-            return config.entities[0]
-
-        # Last resort when no schema is provided: extract the most noun-like token
-        # from the query text itself.  This is generic (not domain-specific) and
-        # replaces the old hardcoded list.
-        return self._extract_entity_from_text(lowered)
+        return _detect_entity_stage(self, text, config)
 
     def _resolve_special_entity(self, lowered: str, config: NormalizedSchemaConfig) -> str | None:
         """Route compound-keyword intents to their schema entities.
@@ -532,30 +532,7 @@ class GraphQLEngine(QueryEngine):
     def _detect_fields(
         self, text: str, config: NormalizedSchemaConfig, entity: str
     ) -> list[str]:
-        lowered = text.lower()
-        common = ["id", "name", "title", "email", "createdAt", "status", "price"]
-
-        schema_fields = self._fields_for_entity(config, entity)
-        owned_asset = self._detect_owned_asset(lowered)
-        if owned_asset and self._entity_looks_like_holdings(entity, schema_fields):
-            owned_fields = self._resolve_holdings_fields(schema_fields)
-            if owned_fields:
-                return owned_fields
-
-        if not schema_fields:
-            return self._detect_common_fields(lowered, common)
-
-        selected = self._select_fields_from_schema(lowered, schema_fields, config)
-        if selected:
-            return selected
-        if self._entity_looks_like_holdings(entity, schema_fields):
-            contextual = self._resolve_holdings_context_fields(lowered, schema_fields)
-            if contextual:
-                return contextual
-        semantic_fields = self._resolve_fields_by_semantic_match(lowered, schema_fields)
-        if semantic_fields:
-            return semantic_fields
-        return config.default_fields or schema_fields[:3]
+        return _detect_fields_stage(self, text, config, entity)
 
     def _detect_common_fields(self, lowered: str, common_fields: list[str]) -> list[str]:
         selected = [field for field in common_fields if self._contains_field_token(lowered, field.lower())]
@@ -592,36 +569,7 @@ class GraphQLEngine(QueryEngine):
         config: NormalizedSchemaConfig,
         entity: str,
     ) -> dict[str, Any]:
-        lowered = text.lower()
-        where_clause = self._extract_where_clause(lowered)
-        filters = self._extract_limit_filters(lowered)
-
-        filter_key_aliases = {"status": "status"}
-        filter_key_aliases.update(config.filter_key_aliases)
-
-        self._apply_alias_key_filters(
-            filters=filters,
-            lowered=lowered,
-            where_clause=where_clause,
-            config=config,
-            entity=entity,
-            filter_key_aliases=filter_key_aliases,
-        )
-        self._apply_alias_value_filters(
-            filters=filters,
-            lowered=lowered,
-            config=config,
-            entity=entity,
-        )
-        self._apply_owned_asset_filter(
-            filters=filters,
-            lowered=lowered,
-            config=config,
-            entity=entity,
-            filter_key_aliases=filter_key_aliases,
-        )
-        self._apply_advanced_filters(filters=filters, lowered=lowered)
-        return filters
+        return _detect_filters_stage(self, text, config, entity)
 
     @staticmethod
     def _extract_limit_filters(lowered: str) -> dict[str, Any]:
@@ -817,25 +765,7 @@ class GraphQLEngine(QueryEngine):
         return {}
 
     def _parse_grouped_precedence_filters(self, lowered: str) -> dict[str, Any]:
-        if " or " not in lowered and _AND_TOKEN not in lowered:
-            return {}
-        where_clause = self._strip_outer_parentheses(self._extract_where_clause(lowered) or lowered)
-        # Parse OR groups first at top-level only, then AND within each OR branch.
-        or_parts = self._split_top_level(where_clause, "or")
-        if len(or_parts) <= 1:
-            and_conditions = self._parse_and_conditions(where_clause)
-            return {"and": and_conditions} if len(and_conditions) > 1 else {}
-
-        or_group: list[dict[str, Any]] = []
-        for part in or_parts:
-            and_conditions = self._parse_and_conditions(part)
-            if not and_conditions:
-                continue
-            if len(and_conditions) == 1:
-                or_group.append(and_conditions[0])
-            else:
-                or_group.append({"and": and_conditions})
-        return {"or": or_group} if len(or_group) > 1 else {}
+        return _parse_grouped_boolean_filters(lowered, self._parse_and_conditions)
 
     def _parse_and_conditions(self, text: str) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -851,58 +781,11 @@ class GraphQLEngine(QueryEngine):
 
     @staticmethod
     def _split_top_level(text: str, operator: str) -> list[str]:
-        if not text:
-            return []
-        parts: list[str] = []
-        depth = 0
-        start = 0
-        i = 0
-        token = f" {operator} "
-        token_len = len(token)
-        while i < len(text):
-            ch = text[i]
-            if ch == "(":
-                depth += 1
-                i += 1
-                continue
-            if ch == ")":
-                depth = max(0, depth - 1)
-                i += 1
-                continue
-            if depth == 0 and text[i : i + token_len] == token:
-                part = text[start:i].strip()
-                if part:
-                    parts.append(part)
-                i += token_len
-                start = i
-                continue
-            i += 1
-        tail = text[start:].strip()
-        if tail:
-            parts.append(tail)
-        return parts
+        return _split_top_level(text, operator)
 
     @staticmethod
     def _strip_outer_parentheses(text: str) -> str:
-        candidate = text.strip()
-        while candidate.startswith("(") and candidate.endswith(")"):
-            depth = 0
-            balanced = True
-            for idx, ch in enumerate(candidate):
-                if ch == "(":
-                    depth += 1
-                elif ch == ")":
-                    depth -= 1
-                    if depth < 0:
-                        balanced = False
-                        break
-                    if depth == 0 and idx != len(candidate) - 1:
-                        balanced = False
-                        break
-            if not balanced or depth != 0:
-                break
-            candidate = candidate[1:-1].strip()
-        return candidate
+        return _strip_outer_parentheses(text)
 
     def _parse_atomic_filter_condition(self, text: str) -> dict[str, Any] | None:
         in_match = re.match(rf"^{_WORD_IDENTIFIER}\s+in\s+([A-Za-z0-9_,\s-]+)$", text)
@@ -935,43 +818,15 @@ class GraphQLEngine(QueryEngine):
 
     @staticmethod
     def _extract_where_clause(lowered: str) -> str | None:
-        parts = lowered.split(" where ", maxsplit=1)
-        if len(parts) == 2:
-            return parts[1].strip()
-        return None
+        return _extract_where_clause(lowered)
 
     @staticmethod
     def _extract_filter_value(alias: str, text: str) -> str | None:
-        key_pattern = re.escape(alias)
-        patterns = [
-            rf"\b{key_pattern}\b\s*(?:=|:)\s*([^\s,)\]]+)",
-            rf"\b{key_pattern}\b\s+(?:is\s+|equals\s+|equal to\s+)?([^\s,)\]]+)",
-        ]
-        for pattern in patterns:
-            matches = list(re.finditer(pattern, text))
-            if not matches:
-                continue
-            candidate = matches[-1].group(1).strip().strip('"').strip("'")
-            if GraphQLEngine._is_spurious_filter_value(candidate):
-                continue
-            return candidate
-        return None
+        return _extract_filter_value(alias, text, spurious_values=_SPURIOUS_FILTER_VALUES)
 
     @staticmethod
     def _detect_owned_asset(lowered: str) -> str | None:
-        match = re.search(r"\bwhat quantity of\s+([a-z0-9_]+)\s+do i own\b", lowered)
-        if match is not None:
-            return match.group(1)
-        match = re.search(r"\bquantity of\s+([a-z0-9_]+)\s+do i own\b", lowered)
-        if match is not None:
-            return match.group(1)
-        match = re.search(r"\bhow many\s+([a-z0-9_]+)\s+do i own\b", lowered)
-        if match is not None:
-            return match.group(1)
-        match = re.search(r"\bhow many\s+([a-z0-9_]+)\s+i own\b", lowered)
-        if match is not None:
-            return match.group(1)
-        return None
+        return detect_owned_asset(lowered)
 
     def _resolve_identifier_filter_key(
         self,
@@ -979,23 +834,12 @@ class GraphQLEngine(QueryEngine):
         entity: str,
         filter_key_aliases: dict[str, str],
     ) -> str | None:
-        entity_args = {arg.lower(): arg for arg in config.args_by_entity.get(entity, [])}
-        entity_fields = {field.lower(): field for field in self._fields_for_entity(config, entity)}
-        for candidate in self._identifier_field_candidates():
-            canonical = filter_key_aliases.get(candidate)
-            if not (isinstance(canonical, str) and canonical):
-                continue
-            canonical_lower = canonical.lower()
-            if canonical_lower in entity_args:
-                return entity_args[canonical_lower]
-            if canonical_lower in entity_fields:
-                return entity_fields[canonical_lower]
-        for candidate in self._identifier_field_candidates():
-            if candidate in entity_args:
-                return entity_args[candidate]
-            if candidate in entity_fields:
-                return entity_fields[candidate]
-        return None
+        return _resolve_identifier_filter_key(
+            args=config.args_by_entity.get(entity, []),
+            fields=self._fields_for_entity(config, entity),
+            candidate_aliases=filter_key_aliases,
+            identifier_keys=self._identifier_field_candidates(),
+        )
 
     def _resolve_filter_key_for_entity(
         self,
@@ -1048,33 +892,20 @@ class GraphQLEngine(QueryEngine):
         return best_entity
 
     def _resolve_holdings_entity(self, config: NormalizedSchemaConfig) -> str | None:
-        best_entity: str | None = None
-        best_score = 0
-        for entity in config.entities:
-            fields = self._fields_for_entity(config, entity)
-            if not fields:
-                continue
-            score = self._score_holdings_entity(entity, fields)
-            if score > best_score:
-                best_score = score
-                best_entity = entity
-        return best_entity if best_score > 0 else None
+        return _resolve_holdings_container(
+            config.entities,
+            fields_for_container=lambda entity: self._fields_for_entity(config, entity),
+            quantity_keys=self._quantity_field_candidates(),
+            identifier_keys=self._identifier_field_candidates(),
+        )
 
     def _score_holdings_entity(self, entity: str, fields: list[str]) -> int:
-        lowered_entity = entity.lower()
-        lowered_fields = {field.lower() for field in fields}
-        has_identifier = any(candidate in lowered_fields for candidate in self._identifier_field_candidates())
-        has_quantity = any(candidate in lowered_fields for candidate in self._quantity_field_candidates())
-        if not (has_identifier and has_quantity):
-            return 0
-        score = 1
-        if lowered_entity in {"positions", "holdings", "assets"}:
-            score += 4
-        if {"symbol", "securitytype"}.intersection(lowered_fields):
-            score += 1
-        if {"acctnum", "acctname", "accountpositioncount"}.intersection(lowered_fields):
-            score -= 3
-        return score
+        return _score_holdings_container(
+            entity,
+            fields,
+            quantity_keys=self._quantity_field_candidates(),
+            identifier_keys=self._identifier_field_candidates(),
+        )
 
     def _resolve_entity_by_semantic_field_match(
         self,
@@ -1099,19 +930,11 @@ class GraphQLEngine(QueryEngine):
         return self._score_holdings_entity(entity, fields) > 0
 
     def _resolve_holdings_fields(self, fields: list[str]) -> list[str]:
-        lowered_to_original = {field.lower(): field for field in fields}
-        selection: list[str] = []
-        for candidate in self._quantity_field_candidates():
-            field = lowered_to_original.get(candidate)
-            if field is not None:
-                selection.append(field)
-                break
-        for candidate in self._identifier_field_candidates():
-            field = lowered_to_original.get(candidate)
-            if field is not None and field not in selection:
-                selection.append(field)
-                break
-        return selection
+        return _resolve_holdings_projection(
+            fields,
+            quantity_keys=self._quantity_field_candidates(),
+            identifier_keys=self._identifier_field_candidates(),
+        )
 
     def _resolve_holdings_context_fields(self, lowered: str, fields: list[str]) -> list[str]:
         selected = self._resolve_holdings_fields(fields)
@@ -1132,11 +955,11 @@ class GraphQLEngine(QueryEngine):
 
     @staticmethod
     def _quantity_field_candidates() -> tuple[str, ...]:
-        return ("quantity", "qty", "shares", "units", "amount", "holding")
+        return _quantity_candidates()
 
     @staticmethod
     def _identifier_field_candidates() -> tuple[str, ...]:
-        return ("symbol", "ticker", "stock", "asset", "security", "code", "name")
+        return _identifier_candidates()
 
     def _resolve_fields_by_semantic_match(
         self,
@@ -1219,22 +1042,7 @@ class GraphQLEngine(QueryEngine):
         config: NormalizedSchemaConfig,
         entity: str,
     ) -> list[dict[str, str]]:
-        lowered = text.lower()
-        aggregations: list[dict[str, str]] = []
-        candidate_fields = self._fields_for_entity(config, entity)
-
-        if re.search(r"\bcount\b", lowered) or (
-            re.search(r"\bhow many\b", lowered) and self._detect_owned_asset(lowered) is None
-        ):
-            aggregations.append({"function": "count", "field": ""})
-
-        for fn_name in ["sum", "avg", "min", "max"]:
-            if not re.search(rf"\b{fn_name}\b", lowered):
-                continue
-            metric_field = self._detect_metric_field(lowered, candidate_fields)
-            aggregations.append({"function": fn_name, "field": metric_field})
-
-        return aggregations
+        return _detect_aggregations_stage(self, text, config, entity)
 
     def _detect_metric_field(self, lowered: str, candidate_fields: list[str]) -> str:
         preferred_metrics = ["total", "amount", "price", "cost", "score"]
@@ -1406,31 +1214,20 @@ class GraphQLEngine(QueryEngine):
 
     @staticmethod
     def _contains_token(text: str, token: str) -> bool:
-        return re.search(rf"\b{re.escape(token)}\b", text) is not None
+        return _contains_token(text, token)
 
     @staticmethod
     def _contains_entity_token(text: str, token: str) -> bool:
         """Match entity words with simple singular/plural tolerance."""
-        if GraphQLEngine._contains_token(text, token):
-            return True
-        if token.endswith("s"):
-            return False
-        return GraphQLEngine._contains_token(text, f"{token}s")
+        return _contains_entity_token(text, token)
 
     @staticmethod
     def _sorted_alias_pairs(alias_map: dict[str, str]) -> list[tuple[str, str]]:
-        return sorted(alias_map.items(), key=lambda pair: len(pair[0]), reverse=True)
+        return _sorted_alias_pairs(alias_map)
 
     @staticmethod
     def _unique_in_order(items: list[str]) -> list[str]:
-        seen: set[str] = set()
-        ordered: list[str] = []
-        for item in items:
-            if item in seen:
-                continue
-            ordered.append(item)
-            seen.add(item)
-        return ordered
+        return _unique_in_order(items)
 
     def _validate_components(
         self,
@@ -1441,59 +1238,14 @@ class GraphQLEngine(QueryEngine):
         nested: list[dict[str, Any]],
         config: NormalizedSchemaConfig,
     ) -> tuple[str, list[str], dict[str, Any], list[dict[str, str]], list[dict[str, Any]], list[str]]:
-        notes: list[str] = []
-        validated_entity = self._resolve_entity_for_schema(entity, config, notes)
-        allowed_fields = self._resolve_allowed_fields(validated_entity, config)
-        validated_fields = self._validate_fields(
-            fields=fields,
-            allowed_fields=allowed_fields,
-            default_fields=config.default_fields,
-            entity=validated_entity,
-            notes=notes,
-            aggregation_only=not fields and bool(aggregations),
-        )
-        allowed_args = self._resolve_allowed_args(validated_entity, config)
-        validated_filters = self._validate_filters(
-            filters=filters,
-            allowed_args=allowed_args,
-            entity=validated_entity,
-            config=config,
-            notes=notes,
-        )
-
-        # Contradiction detection — same field with conflicting plain-equality values
-        from text2ql.engines.sql import _detect_contradictory_filters
-        contradiction_notes = _detect_contradictory_filters(validated_filters)
-        if contradiction_notes:
-            for note in contradiction_notes:
-                logger.warning("GraphQLEngine [%s]: %s", validated_entity, note)
-            notes.extend(contradiction_notes)
-            if self.strict_validation:
-                raise ValidationError(
-                    f"Contradictory filters detected for entity '{validated_entity}'",
-                    contradiction_notes,
-                )
-
-        validated_aggregations = self._validate_aggregations(
-            aggregations=aggregations,
-            allowed_fields=allowed_fields,
-            entity=validated_entity,
-            notes=notes,
-        )
-        validated_nested = self._validate_nested_nodes(
-            nested=nested,
-            entity=validated_entity,
-            config=config,
-            notes=notes,
-        )
-
-        return (
-            validated_entity,
-            validated_fields,
-            validated_filters,
-            validated_aggregations,
-            validated_nested,
-            notes,
+        return _validate_components_stage(
+            self,
+            entity,
+            fields,
+            filters,
+            aggregations,
+            nested,
+            config,
         )
 
     def _resolve_entity_for_schema(

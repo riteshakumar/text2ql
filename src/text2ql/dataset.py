@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any, Callable, Iterable, Sequence
 from text2ql.providers.base import LLMProvider
 
 RewritePlugin = Callable[["DatasetExample"], list[str]]
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -204,7 +206,14 @@ def _collect_rewrite_candidates(
     for plugin_name, plugin in plugins:
         try:
             outputs = plugin(example)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Synthetic rewrite plugin '%s' failed for text=%r: %s: %s",
+                plugin_name,
+                example.text,
+                type(exc).__name__,
+                exc,
+            )
             continue
         for candidate in outputs:
             _append_candidate(

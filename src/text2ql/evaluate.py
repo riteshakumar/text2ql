@@ -264,12 +264,21 @@ def _strip_sql_quotes(name: str) -> str:
 
 def _parse_sql_signature(
     query: str,
-) -> tuple[str, tuple[str, ...], tuple[tuple[str, str], ...], tuple[str, ...]] | None:
+) -> tuple[
+    str,
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[tuple[str, str], ...],
+    tuple[str, ...],
+    tuple[str, ...],
+] | None:
     # Support both quoted ("table") and unquoted (table) identifiers after FROM
     table_match = re.search(r'\bfrom\s+"?([A-Za-z_]\w*)"?\b', query, re.I)
     if not table_match:
         return None
     table = table_match.group(1).lower()
+    source_tables = _extract_source_tables(query)
+    join_predicates = _extract_join_predicates(query)
 
     select_match = re.search(r"\bselect\s+(.*?)\s+\bfrom\b", query, re.I | re.S)
     if not select_match:
@@ -310,24 +319,65 @@ def _parse_sql_signature(
                 value = parts[2].strip().lower() if len(parts) > 2 else ""
                 filters[f"{key} {op}"] = value
 
-    # Support both quoted and unquoted identifiers in ORDER BY
-    order_match = re.search(r'\border by\s+"?([A-Za-z_]\w*)"?\."?([A-Za-z_][\w]*)"?\s*(asc|desc)?\b', query, re.I)
-    if not order_match:
-        order_match = re.search(r'\border by\s+"?([A-Za-z_][\w.]*)"?\s*(asc|desc)?\b', query, re.I)
-    ordering: list[str] = []
-    if order_match:
-        if order_match.lastindex == 3:
-            # "table"."col" form — use only the column part for comparison
-            col = order_match.group(2).lower()
-            direction = (order_match.group(3) or "asc").lower()
-        else:
-            raw_col = order_match.group(1).lower()
-            # Strip table prefix if present (e.g. "singer.age" → "age")
-            col = raw_col.split(".")[-1] if "." in raw_col else raw_col
-            direction = (order_match.group(2) or "asc").lower()
-        ordering.append(f"{col} {direction}")
+    ordering = _extract_ordering_signature(query)
 
-    return (table, fields, tuple(sorted(filters.items())), tuple(ordering))
+    return (
+        table,
+        source_tables,
+        fields,
+        tuple(sorted(filters.items())),
+        tuple(ordering),
+        join_predicates,
+    )
+
+
+def _extract_source_tables(query: str) -> tuple[str, ...]:
+    tables: list[str] = []
+    for pattern in (r'\bfrom\s+"?([A-Za-z_]\w*)"?\b', r'\bjoin\s+"?([A-Za-z_]\w*)"?\b'):
+        for match in re.finditer(pattern, query, re.I):
+            tables.append(match.group(1).lower())
+    return tuple(sorted(_dedupe(tables)))
+
+
+def _extract_join_predicates(query: str) -> tuple[str, ...]:
+    """Collect normalized JOIN ON predicates from SQL query text."""
+    predicates: list[str] = []
+    for match in re.finditer(
+        r"\bon\s+(.*?)(?=\b(?:left|right|inner|outer|cross)?\s*join\b|\bwhere\b|\border by\b|\blimit\b|\boffset\b|;|$)",
+        query,
+        re.I | re.S,
+    ):
+        predicate = match.group(1).strip()
+        if not predicate:
+            continue
+        normalized = re.sub(r"\s+", " ", predicate)
+        normalized = re.sub(r'"([A-Za-z_]\w*)"', r"\1", normalized).lower()
+        predicates.append(normalized)
+    return tuple(sorted(_dedupe(predicates)))
+
+
+def _extract_ordering_signature(query: str) -> list[str]:
+    order_match = re.search(
+        r"\border by\s+(.*?)(?:\blimit\b|\boffset\b|;|$)",
+        query,
+        re.I | re.S,
+    )
+    if not order_match:
+        return []
+    order_blob = order_match.group(1).strip()
+    if not order_blob:
+        return []
+    ordering: list[str] = []
+    for clause in [part.strip() for part in order_blob.split(",") if part.strip()]:
+        normalized_clause = re.sub(r'"([A-Za-z_]\w*)"', r"\1", clause).lower()
+        pieces = normalized_clause.split()
+        if not pieces:
+            continue
+        raw_col = pieces[0]
+        col = raw_col.split(".")[-1] if "." in raw_col else raw_col
+        direction = pieces[1] if len(pieces) > 1 and pieces[1] in {"asc", "desc"} else "asc"
+        ordering.append(f"{col} {direction}")
+    return ordering
 
 
 def _parse_graphql_signature(query: str) -> tuple[str, tuple[str, ...], tuple[tuple[str, str], ...]] | None:
