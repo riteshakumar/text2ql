@@ -107,35 +107,9 @@ service = Text2QL(provider=provider)
 
 ## Streamlit Playground
 
-Run the interactive UI for faster schema/prompt iteration.
-Prefer zero setup? Use the hosted app: https://text2ql.streamlit.app/
-Local run remains available for private schemas and payloads.
-
-```bash
-# from repo root
-pip install -e ".[app]"
-python -m streamlit run examples/streamlit_app.py
-```
-
-What you get:
-
-- GraphQL and SQL targets with `deterministic` or `llm` mode.
-- Bundled sample files (`examples/sample_schema.json`, `examples/sample_data.json`) or your own uploads.
-- Synthetic prompt variants + domain rewrite plugins.
-- Optional JSON execution checks and expected-query comparison.
-- Engine metadata, validation notes, and timing shown per variant.
-
-API key options for LLM mode:
-
-```bash
-OPENAI_API_KEY=... python -m streamlit run examples/streamlit_app.py
-```
-
-Or set Streamlit secrets (`.streamlit/secrets.toml`):
-
-```toml
-OPENAI_API_KEY="your-key"
-```
+Use hosted app: https://text2ql.streamlit.app/
+For local/private data: `pip install -e ".[app]"`.
+Run locally: `python -m streamlit run examples/streamlit_app.py`.
 
 ## Modes at a glance
 
