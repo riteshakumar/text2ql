@@ -610,14 +610,35 @@ class GraphQLEngine(QueryEngine):
         config: NormalizedSchemaConfig,
         entity: str,
     ) -> None:
+        value_alias_candidates: list[tuple[float, int, int, str, Any]] = []
         for canonical, alias_map in config.filter_value_aliases.items():
             resolved_canonical = self._resolve_filter_key_for_entity(config, entity, canonical)
             if str(resolved_canonical) in filters or not isinstance(alias_map, dict):
                 continue
+            best_match = None
             for alias, mapped_value in alias_map.items():
-                if self._contains_token(lowered, str(alias).lower()):
-                    filters[str(resolved_canonical)] = mapped_value
-                    break
+                score = self._alias_match_score(lowered, str(alias))
+                if score <= 0:
+                    continue
+                candidate = (
+                    score,
+                    self._canonical_filter_priority(str(resolved_canonical)),
+                    self._alias_specificity(str(alias)),
+                    str(resolved_canonical),
+                    mapped_value,
+                )
+                if best_match is None or candidate[:3] > best_match[:3]:
+                    best_match = candidate
+            if best_match is not None:
+                value_alias_candidates.append(best_match)
+
+        single_value_focus = "how many" in lowered and " where " not in lowered
+        if single_value_focus and value_alias_candidates:
+            _, _, _, resolved, mapped_value = max(value_alias_candidates, key=lambda item: item[:3])
+            filters[str(resolved)] = mapped_value
+            return
+        for _, _, _, resolved, mapped_value in value_alias_candidates:
+            filters[str(resolved)] = mapped_value
 
     def _apply_owned_asset_filter(
         self,
@@ -1196,6 +1217,54 @@ class GraphQLEngine(QueryEngine):
     @staticmethod
     def _contains_token(text: str, token: str) -> bool:
         return _contains_token(text, token)
+
+    def _alias_match_score(self, text: str, alias: str) -> float:
+        alias_text = str(alias).strip().lower()
+        if not alias_text:
+            return 0.0
+        if self._contains_token(text, alias_text):
+            return 3.0
+        alias_tokens = [token for token in re.findall(r"[a-z0-9]+", alias_text) if len(token) >= 4]
+        if not alias_tokens:
+            return 0.0
+        text_tokens = set(re.findall(r"[a-z0-9]+", str(text).lower()))
+        if len(alias_tokens) <= 3:
+            return 2.0 if all(token in text_tokens for token in alias_tokens) else 0.0
+        overlap = sum(1 for token in alias_tokens if token in text_tokens)
+        return 1.0 if overlap >= 2 else 0.0
+
+    @staticmethod
+    def _matches_filter_value_alias(lowered: str, alias: str) -> bool:
+        alias_text = str(alias).strip().lower()
+        if not alias_text:
+            return False
+        if GraphQLEngine._contains_token(lowered, alias_text):
+            return True
+        alias_tokens = [token for token in re.findall(r"[a-z0-9]+", alias_text) if len(token) >= 4]
+        if not alias_tokens:
+            return False
+        lowered_tokens = set(re.findall(r"[a-z0-9]+", lowered))
+        if len(alias_tokens) <= 3:
+            return all(token in lowered_tokens for token in alias_tokens)
+        overlap = sum(1 for token in alias_tokens if token in lowered_tokens)
+        return overlap >= 2
+
+    @staticmethod
+    def _canonical_filter_priority(key: str) -> int:
+        lowered = str(key).lower()
+        if lowered.endswith("typedesc"):
+            return 4
+        if lowered.endswith("status") or lowered == "status":
+            return 3
+        if lowered.endswith("subcatdesc"):
+            return 2
+        if lowered.endswith("desc"):
+            return 1
+        return 0
+
+    @staticmethod
+    def _alias_specificity(alias: str) -> int:
+        return len(re.findall(r"[a-z0-9]+", str(alias).lower()))
 
     @staticmethod
     def _contains_entity_token(text: str, token: str) -> bool:

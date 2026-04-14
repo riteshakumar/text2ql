@@ -22,6 +22,10 @@ def detect_entity(engine: "GraphQLEngine", text: str, config: "NormalizedSchemaC
     if alias_or_name_entity is not None:
         return alias_or_name_entity
 
+    inferred_from_values = _infer_entity_from_filter_value_aliases(engine, lowered, config)
+    if inferred_from_values is not None:
+        return inferred_from_values
+
     semantic_entity = engine._resolve_entity_by_semantic_field_match(lowered, config)
     if semantic_entity is not None:
         return semantic_entity
@@ -35,6 +39,91 @@ def detect_entity(engine: "GraphQLEngine", text: str, config: "NormalizedSchemaC
 
     # Last resort when no schema is provided: extract a noun-like token.
     return engine._extract_entity_from_text(lowered)
+
+
+def _infer_entity_from_filter_value_aliases(
+    engine: "GraphQLEngine",
+    lowered: str,
+    config: "NormalizedSchemaConfig",
+) -> str | None:
+    value_aliases = getattr(config, "filter_value_aliases", {})
+    if not isinstance(value_aliases, dict) or not value_aliases:
+        return None
+
+    scores: dict[str, float] = {}
+    widths: dict[str, int] = {}
+    for canonical, alias_map in value_aliases.items():
+        if not isinstance(alias_map, dict):
+            continue
+        if not any(_matches_value_alias(lowered, str(alias)) for alias in alias_map.keys()):
+            continue
+        for entity in getattr(config, "entities", []):
+            support = _entity_filter_key_support_score(engine, config, entity, str(canonical))
+            if support <= 0:
+                continue
+            scores[entity] = scores.get(entity, 0.0) + support
+            widths[entity] = min(
+                widths.get(entity, 10_000),
+                _entity_specificity_width(engine, config, entity),
+            )
+
+    if not scores:
+        return None
+
+    max_score = max(scores.values())
+    top = [entity for entity, score in scores.items() if score == max_score]
+    if len(top) == 1:
+        return top[0]
+
+    narrowest_width = min(widths.get(entity, 10_000) for entity in top)
+    narrowed = [entity for entity in top if widths.get(entity, 10_000) == narrowest_width]
+    if len(narrowed) == 1:
+        return narrowed[0]
+    return None
+
+
+def _entity_filter_key_support_score(
+    engine: "GraphQLEngine",
+    config: "NormalizedSchemaConfig",
+    entity: str,
+    candidate_key: str,
+) -> float:
+    canonical = str(candidate_key).lower()
+    args = [str(arg).lower() for arg in getattr(config, "args_by_entity", {}).get(entity, [])]
+    fields = [str(field).lower() for field in engine._fields_for_entity(config, entity)]
+    in_args = canonical in args
+    in_fields = canonical in fields
+    if not in_args and not in_fields:
+        return 0.0
+    # Prefer entities that can both filter and project by the canonical key.
+    return 1.25 if in_fields else 1.0
+
+
+def _entity_specificity_width(
+    engine: "GraphQLEngine",
+    config: "NormalizedSchemaConfig",
+    entity: str,
+) -> int:
+    args = {str(arg) for arg in getattr(config, "args_by_entity", {}).get(entity, [])}
+    fields = {str(field) for field in engine._fields_for_entity(config, entity)}
+    width = len(args.union(fields))
+    return width or 10_000
+
+
+def _matches_value_alias(lowered: str, alias: str) -> bool:
+    alias_text = str(alias).strip().lower()
+    if not alias_text:
+        return False
+    if re.search(rf"\b{re.escape(alias_text)}\b", lowered):
+        return True
+    alias_tokens = [token for token in re.findall(r"[a-z0-9]+", alias_text) if len(token) >= 4]
+    if not alias_tokens:
+        return False
+    lowered_tokens = set(re.findall(r"[a-z0-9]+", lowered))
+    if len(alias_tokens) <= 3:
+        return all(token in lowered_tokens for token in alias_tokens)
+    overlap = sum(1 for token in alias_tokens if token in lowered_tokens)
+    return overlap >= 2
 
 
 def detect_fields(

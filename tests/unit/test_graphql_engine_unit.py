@@ -451,6 +451,46 @@ def test_engine_uses_semantic_field_match_for_metric_prompt() -> None:
     assert "totalMarketVal" in result.query
 
 
+def test_engine_routes_dividend_count_intent_to_transactions_via_value_alias() -> None:
+    engine = GraphQLEngine()
+    request = QueryRequest(
+        text="how many dividend I received",
+        target="graphql",
+        schema={
+            "entities": ["accounts", "transactions"],
+            "fields": {
+                "accounts": ["acctNum", "acctName", "accountPositionCount"],
+                "transactions": ["quantity", "txnTypeDesc", "postedDate"],
+            },
+            "args": {
+                "accounts": ["limit"],
+                "transactions": ["txnTypeDesc", "limit", "orderBy", "orderDirection"],
+            },
+            "default_entity": "accounts",
+            "default_fields": ["acctNum", "acctName"],
+        },
+        mapping={
+            "filter_values": {
+                "txnTypeDesc": {
+                    "dividend received": "Dividend Received",
+                }
+            }
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert result.metadata.get("entity") == "transactions"
+    assert "transactions(" in result.query
+    assert 'txnTypeDesc: "Dividend Received"' in result.query
+    filters = result.metadata.get("filters", {})
+    assert filters.get("txnTypeDesc") == "Dividend Received"
+    assert "desc" not in filters
+    assert "mobileDesc" not in filters
+    assert "txnSubCatDesc" not in filters
+    assert any(agg.get("function") == "count" for agg in result.metadata.get("aggregations", []))
+
+
 def test_engine_parses_grouped_filters_with_parentheses_precedence() -> None:
     engine = GraphQLEngine()
     request = QueryRequest(
