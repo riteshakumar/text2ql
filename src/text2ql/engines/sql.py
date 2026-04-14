@@ -1673,6 +1673,16 @@ class SQLEngine(QueryEngine):
         owned_asset_intent = self._detect_owned_asset(lowered) is not None
         if explicit_count or number_of or (how_many and not owned_asset_intent):
             aggregations.append({"function": "COUNT", "field": "*", "alias": "count"})
+
+        # Ranking prompts like "highest total first 5" should stay as ORDER BY
+        # selection queries, not aggregate projections.
+        ranking_window_intent = (
+            re.search(r"\b(highest|lowest|youngest|oldest)\b", lowered) is not None
+            and re.search(r"\b(top|first|limit)\s+\d+\b", lowered) is not None
+        )
+        if ranking_window_intent and not (explicit_count or number_of or how_many):
+            return aggregations
+
         if "best finish" in lowered and table_columns:
             best_finish_col = next((column for column in table_columns if "best" in str(column).lower() and "finish" in str(column).lower()), None)
             if best_finish_col is not None:

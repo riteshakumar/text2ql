@@ -183,19 +183,12 @@ text2ql --benchmark bird --benchmark-path /path/to/bird-minidev --benchmark-mode
 
 Using `run_llm_benchmark.py` (50 Spider-style + 50 BIRD-style synthetic examples, `mode=llm`, `gpt-4o-mini`):
 
+Raw summary:
+
 | Benchmark | Exact | Structural | Execution | Errors |
 |---|---:|---:|---:|---:|
 | Spider (50) | 62.0% | 64.0% | 84.0% | 0/50 |
 | BIRD (50) | 70.0% | 78.0% | 90.0% | 0/50 |
-
-Raw summary:
-
-```text
-  SUMMARY
-====================================================================
-  Spider    Exact=62.0%  Structural=64.0%  Execution=84.0%  Errors=0/50
-  BIRD      Exact=70.0%  Structural=78.0%  Execution=90.0%  Errors=0/50
-```
 
 Reproduce:
 
@@ -203,6 +196,25 @@ Reproduce:
 OPENAI_API_KEY=... ./venv/bin/python run_llm_benchmark.py
 # or
 OPENAI_API_KEY=... python3 run_llm_benchmark.py
+```
+
+### Latest deterministic benchmark snapshot (synthetic harness)
+
+Using `run_deterministic_benchmark.py` (50 Spider-style + 50 BIRD-style synthetic examples, `mode=deterministic`):
+
+Raw summary:
+
+| Benchmark | Exact | Structural | Execution | Errors |
+|---|---:|---:|---:|---:|
+| Spider (50) | 0.0% | 32.0% | 100.0% | 0/50 |
+| BIRD (50) | 0.0% | 52.0% | 100.0% | 0/50 |
+
+Reproduce:
+
+```bash
+./venv/bin/python run_deterministic_benchmark.py
+# or
+python3 run_deterministic_benchmark.py
 ```
 
 ## Evaluation + Synthetic Data Utilities
