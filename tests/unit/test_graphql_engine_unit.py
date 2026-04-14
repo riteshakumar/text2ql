@@ -504,6 +504,92 @@ def test_engine_available_cash_prefers_withdrawable_cash_entity() -> None:
     assert "brokerageHoldingType:" not in result.query
 
 
+def test_engine_detects_name_and_theme_projection_for_concerts() -> None:
+    engine = GraphQLEngine()
+    request = QueryRequest(
+        text="What are the names and themes of all concerts?",
+        target="graphql",
+        schema={
+            "entities": ["concert"],
+            "fields": {"concert": ["concert_ID", "concert_Name", "Theme", "Stadium_ID"]},
+            "default_entity": "concert",
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert "concert_Name" in result.query
+    assert "Theme" in result.query
+
+
+def test_engine_orders_highest_metric_by_canonical_field_name() -> None:
+    engine = GraphQLEngine()
+    request = QueryRequest(
+        text="Show the name and nationality of the player with the highest earnings.",
+        target="graphql",
+        schema={
+            "entities": ["poker_player"],
+            "fields": {
+                "poker_player": ["People_ID", "Name", "Nationality", "Money_Rank", "Earnings"],
+            },
+            "args": {
+                "poker_player": ["limit", "orderBy", "orderDirection"],
+            },
+            "default_entity": "poker_player",
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert 'orderBy: "Earnings"' in result.query
+    assert 'orderDirection: "DESC"' in result.query
+    assert "limit: 1" in result.query
+    assert "Name" in result.query
+    assert "Nationality" in result.query
+
+
+def test_engine_detects_youngest_ordering_intent() -> None:
+    engine = GraphQLEngine()
+    request = QueryRequest(
+        text="show the youngest singer",
+        target="graphql",
+        schema={
+            "entities": ["singer"],
+            "fields": {"singer": ["Singer_ID", "Name", "Age", "Birth_Year"]},
+            "args": {"singer": ["limit", "orderBy", "orderDirection"]},
+            "default_entity": "singer",
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert 'orderDirection: "ASC"' in result.query
+    assert "limit: 1" in result.query
+    assert 'orderBy: "createdAt"' not in result.query
+
+
+def test_engine_detects_having_count_for_more_than_phrase() -> None:
+    engine = GraphQLEngine()
+    request = QueryRequest(
+        text="which courses have more than 1 student registered",
+        target="graphql",
+        schema={
+            "entities": ["courses"],
+            "fields": {"courses": ["course_id", "course_name"]},
+            "args": {"courses": ["having"]},
+            "default_entity": "courses",
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert "count" in result.query
+    assert "having:" in result.query
+    assert "_gt: 1" in result.query
+    assert any(agg.get("function") == "count" for agg in result.metadata.get("aggregations", []))
+    assert result.metadata.get("having") == [{"function": "COUNT", "field": "*", "operator": ">", "value": 1}]
+
+
 def test_engine_routes_dividend_count_intent_to_transactions_via_value_alias() -> None:
     engine = GraphQLEngine()
     request = QueryRequest(

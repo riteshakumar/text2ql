@@ -114,6 +114,8 @@ class GraphQLEngine(QueryEngine):
         logger.debug("GraphQLEngine: detected filters=%r", filters)
         aggregations = self._detect_aggregations(prompt, config, entity)
         logger.debug("GraphQLEngine: detected aggregations=%r", aggregations)
+        having = self._detect_having(prompt, aggregations)
+        logger.debug("GraphQLEngine: detected having=%r", having)
         nested = self._detect_nested(prompt, config, entity)
         logger.debug("GraphQLEngine: detected nested=%r", nested)
         entity, fields, filters, aggregations, nested, validation_notes = self._validate_components(
@@ -121,7 +123,7 @@ class GraphQLEngine(QueryEngine):
         )
         logger.debug("GraphQLEngine: after validation entity=%r fields=%r notes=%r", entity, fields, validation_notes)
 
-        query = self._build_query(entity, fields, filters, aggregations, nested)
+        query = self._build_query(entity, fields, filters, aggregations, nested, having=having)
         logger.debug("GraphQLEngine: built query=%r", query)
         validation_notes.extend(self._validate_generated_query_against_introspection(query, config))
 
@@ -137,7 +139,7 @@ class GraphQLEngine(QueryEngine):
             filters=filters,
             validation_notes=validation_notes,
             config=config,
-            extra_signals={"aggregations": aggregations, "nested": nested},
+            extra_signals={"aggregations": aggregations, "nested": nested, "having": having},
         )
 
         return QueryResult(
@@ -150,6 +152,7 @@ class GraphQLEngine(QueryEngine):
                 "fields": fields,
                 "filters": filters,
                 "aggregations": aggregations,
+                "having": having,
                 "nested": nested,
                 "mode": "deterministic",
                 "llm_error": llm_error,
@@ -245,7 +248,7 @@ class GraphQLEngine(QueryEngine):
             filters=filters,
             validation_notes=validation_notes,
             config=config,
-            extra_signals={"aggregations": aggregations, "nested": nested},
+            extra_signals={"aggregations": aggregations, "nested": nested, "having": intent.having},
         )
         return QueryResult(
             query=query,
@@ -681,13 +684,18 @@ class GraphQLEngine(QueryEngine):
             return False
         return value.strip().lower() in _SPURIOUS_FILTER_VALUES
 
-    def _apply_advanced_filters(self, filters: dict[str, Any], lowered: str) -> None:
+    def _apply_advanced_filters(
+        self,
+        filters: dict[str, Any],
+        lowered: str,
+        candidate_fields: list[str] | None = None,
+    ) -> None:
         range_filters = self._detect_between_filters(lowered)
         in_filters = self._detect_in_filters(lowered)
         comparison_filters = self._detect_comparison_filters(lowered)
         negation_filters = self._detect_negation_filters(lowered)
         date_range_filters = self._detect_date_range_filters(lowered)
-        ordering_filters = self._detect_ordering_filters(lowered, filters)
+        ordering_filters = self._detect_ordering_filters(lowered, filters, candidate_fields=candidate_fields)
         grouped_filters = self._detect_grouped_filters(lowered, range_filters, in_filters)
 
         filters.update(range_filters)
@@ -708,32 +716,109 @@ class GraphQLEngine(QueryEngine):
     def _detect_date_range_filters(self, lowered: str) -> dict[str, Any]:
         return detect_date_range_filters(lowered)
 
-    def _detect_ordering_filters(self, lowered: str, existing_filters: dict[str, Any]) -> dict[str, Any]:
+    def _detect_ordering_filters(
+        self,
+        lowered: str,
+        existing_filters: dict[str, Any],
+        *,
+        candidate_fields: list[str] | None = None,
+    ) -> dict[str, Any]:
         filters: dict[str, Any] = {}
         if "latest order" in lowered:
             return filters
         if any(token in lowered for token in ("latest", "newest", "most recent")):
-            order_field = self._detect_order_field(lowered)
+            order_field = self._detect_order_field(lowered, candidate_fields)
             filters["orderBy"] = order_field
             filters["orderDirection"] = "DESC"
             if "limit" not in existing_filters and "first" not in existing_filters:
                 filters["limit"] = "1"
-        highest = re.search(rf"\bhighest\s+{_WORD_IDENTIFIER}\b", lowered)
-        if highest:
-            filters["orderBy"] = highest.group(1)
-            filters["orderDirection"] = "DESC"
-        lowest = re.search(rf"\blowest\s+{_WORD_IDENTIFIER}\b", lowered)
-        if lowest:
-            filters["orderBy"] = lowest.group(1)
+        if "youngest" in lowered:
+            order_field = self._best_matching_field("age birth year", candidate_fields or [])
+            filters["orderBy"] = order_field or "age"
             filters["orderDirection"] = "ASC"
+            if "limit" not in existing_filters and "first" not in existing_filters:
+                filters["limit"] = "1"
+        if "oldest" in lowered:
+            order_field = self._best_matching_field("age birth year", candidate_fields or [])
+            filters["orderBy"] = order_field or "age"
+            filters["orderDirection"] = "DESC"
+            if "limit" not in existing_filters and "first" not in existing_filters:
+                filters["limit"] = "1"
+        highest = re.search(r"\bhighest\s+([a-zA-Z_][\w\s]{0,40})\b", lowered)
+        if highest:
+            phrase = highest.group(1).strip()
+            for marker in (" for ", " in ", " from ", " among ", " across "):
+                if marker in phrase:
+                    phrase = phrase.split(marker, maxsplit=1)[0].strip()
+            filters["orderBy"] = self._best_matching_field(phrase, candidate_fields or []) or phrase.split(" ")[0]
+            filters["orderDirection"] = "DESC"
+            if "limit" not in existing_filters and "first" not in existing_filters:
+                filters["limit"] = "1"
+        lowest = re.search(r"\blowest\s+([a-zA-Z_][\w\s]{0,40})\b", lowered)
+        if lowest:
+            phrase = lowest.group(1).strip()
+            for marker in (" for ", " in ", " from ", " among ", " across "):
+                if marker in phrase:
+                    phrase = phrase.split(marker, maxsplit=1)[0].strip()
+            filters["orderBy"] = self._best_matching_field(phrase, candidate_fields or []) or phrase.split(" ")[0]
+            filters["orderDirection"] = "ASC"
+            if "limit" not in existing_filters and "first" not in existing_filters:
+                filters["limit"] = "1"
         return filters
 
     @staticmethod
-    def _detect_order_field(lowered: str) -> str:
+    def _detect_order_field(lowered: str, candidate_fields: list[str] | None = None) -> str:
+        recency_priority = (
+            "createdAt",
+            "postedDate",
+            "tradedDate",
+            "updatedAt",
+            "asOfDateTime",
+            "asOfDate",
+            "date",
+            "timestamp",
+            "time",
+            "year",
+        )
+        field_lookup = {str(field).lower(): str(field) for field in (candidate_fields or [])}
+
+        for candidate in recency_priority:
+            if candidate.lower() in lowered and candidate.lower() in field_lookup:
+                return field_lookup[candidate.lower()]
+        for candidate in recency_priority:
+            if candidate.lower() in field_lookup:
+                return field_lookup[candidate.lower()]
         for candidate in ("createdAt", "updatedAt", "date", "timestamp", "asOfDate", "asOfDateTime"):
             if candidate.lower() in lowered:
                 return candidate
         return "createdAt"
+
+    def _best_matching_field(self, phrase: str, fields: list[str]) -> str | None:
+        phrase_text = str(phrase).strip().lower()
+        if not phrase_text or not fields:
+            return None
+        best_field: str | None = None
+        best_score = 0.0
+        for field in fields:
+            score = self._field_phrase_score(phrase_text, str(field))
+            if score > best_score:
+                best_score = score
+                best_field = str(field)
+        return best_field if best_score > 0 else None
+
+    def _field_phrase_score(self, phrase: str, field: str) -> float:
+        phrase_tokens = self._expanded_tokens(self._tokenize(phrase))
+        field_tokens = self._expanded_tokens(self._tokenize(field))
+        if not phrase_tokens or not field_tokens:
+            return 0.0
+        overlap = len(phrase_tokens.intersection(field_tokens))
+        if overlap == 0:
+            return 0.0
+        score = overlap / max(1, len(field_tokens))
+        lowered_field = str(field).lower()
+        if lowered_field.endswith("detail"):
+            score -= 0.2
+        return score
 
     def _detect_between_filters(self, lowered: str) -> dict[str, Any]:
         return detect_between_filters(lowered)
@@ -1016,6 +1101,8 @@ class GraphQLEngine(QueryEngine):
     @staticmethod
     def _expanded_tokens(tokens: set[str]) -> set[str]:
         expanded = set(tokens)
+        for token in list(tokens):
+            expanded.update(GraphQLEngine._token_inflections(token))
         synonyms = {
             "val": "value",
             "value": "val",
@@ -1031,12 +1118,51 @@ class GraphQLEngine(QueryEngine):
             "account": "acct",
             "todays": "today",
             "today": "todays",
+            "amt": "amount",
+            "amount": "amt",
+            "qty": "quantity",
+            "quantity": "qty",
+            "desc": "description",
+            "description": "desc",
+            "bal": "balance",
+            "balance": "bal",
+            "avail": "available",
+            "available": "avail",
+            "num": "number",
+            "number": "num",
+            "scr": "score",
+            "score": "scr",
+            "percent": "percentage",
+            "percentage": "percent",
         }
-        for token in tokens:
+        for token in list(expanded):
             mapped = synonyms.get(token)
             if mapped:
                 expanded.add(mapped)
         return expanded
+
+    @staticmethod
+    def _token_inflections(token: str) -> set[str]:
+        token = str(token).strip().lower()
+        if not token:
+            return set()
+        forms: set[str] = {token}
+        if len(token) <= 3:
+            return forms
+        if token.endswith("ies") and len(token) > 4:
+            forms.add(token[:-3] + "y")
+        elif token.endswith("es") and len(token) > 4:
+            forms.add(token[:-2])
+        elif token.endswith("s") and len(token) > 3:
+            forms.add(token[:-1])
+        elif token.endswith("y"):
+            forms.add(token[:-1] + "ies")
+            forms.add(token + "s")
+        elif token.endswith(("x", "z", "ch", "sh")):
+            forms.add(token + "es")
+        else:
+            forms.add(token + "s")
+        return {form for form in forms if form}
 
     def _detect_aggregations(
         self,
@@ -1045,6 +1171,35 @@ class GraphQLEngine(QueryEngine):
         entity: str,
     ) -> list[dict[str, str]]:
         return _detect_aggregations_stage(self, text, config, entity)
+
+    def _detect_having(
+        self,
+        text: str,
+        aggregations: list[dict[str, str]],
+    ) -> list[dict[str, Any]]:
+        lowered = text.lower()
+        if not (
+            any(str(agg.get("function", "")).lower() == "count" for agg in aggregations)
+            or "more than" in lowered
+            or "less than" in lowered
+            or "at least" in lowered
+            or "at most" in lowered
+        ):
+            return []
+
+        patterns: tuple[tuple[str, str], ...] = (
+            (r"\b(?:have|has|with)\s+more than\s+(\d+)\b", ">"),
+            (r"\b(?:have|has|with)\s+less than\s+(\d+)\b", "<"),
+            (r"\b(?:have|has|with)\s+at least\s+(\d+)\b", ">="),
+            (r"\b(?:have|has|with)\s+at most\s+(\d+)\b", "<="),
+        )
+        for pattern, operator in patterns:
+            match = re.search(pattern, lowered)
+            if match is None:
+                continue
+            value = int(match.group(1))
+            return [{"function": "COUNT", "field": "*", "operator": operator, "value": value}]
+        return []
 
     def _detect_metric_field(self, lowered: str, candidate_fields: list[str]) -> str:
         preferred_metrics = ["total", "amount", "price", "cost", "score"]

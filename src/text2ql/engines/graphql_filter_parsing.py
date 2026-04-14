@@ -41,5 +41,9 @@ def detect_filters(
         entity=entity,
         filter_key_aliases=filter_key_aliases,
     )
-    engine._apply_advanced_filters(filters=filters, lowered=lowered)
+    engine._apply_advanced_filters(
+        filters=filters,
+        lowered=lowered,
+        candidate_fields=engine._fields_for_entity(config, entity),
+    )
     return filters

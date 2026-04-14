@@ -18,12 +18,17 @@ def detect_entity(engine: "GraphQLEngine", text: str, config: "NormalizedSchemaC
     if special_entity is not None:
         return special_entity
 
-    alias_or_name_entity = engine._resolve_entity_by_alias_or_name(lowered, config)
+    mentioned_entities = _entities_mentioned_by_alias_or_name(engine, lowered, config)
+    alias_or_name_entity = mentioned_entities[0] if mentioned_entities else None
     metric_entity = _infer_entity_from_metric_intent(engine, lowered, config)
     if metric_entity is not None and metric_entity != alias_or_name_entity:
         return metric_entity
-    if alias_or_name_entity is not None:
-        return alias_or_name_entity
+
+    if mentioned_entities:
+        disambiguated = _disambiguate_mentioned_entity(engine, lowered, config, mentioned_entities)
+        if disambiguated is not None:
+            return disambiguated
+        return mentioned_entities[0]
 
     inferred_from_values = _infer_entity_from_filter_value_aliases(engine, lowered, config)
     if inferred_from_values is not None:
@@ -42,6 +47,101 @@ def detect_entity(engine: "GraphQLEngine", text: str, config: "NormalizedSchemaC
 
     # Last resort when no schema is provided: extract a noun-like token.
     return engine._extract_entity_from_text(lowered)
+
+
+def _entities_mentioned_by_alias_or_name(
+    engine: "GraphQLEngine",
+    lowered: str,
+    config: "NormalizedSchemaConfig",
+) -> list[str]:
+    mentions: list[tuple[int, int, str]] = []
+    seen: set[str] = set()
+
+    for alias, canonical in engine._sorted_alias_pairs(config.entity_aliases):
+        position = _match_position(engine, lowered, alias)
+        if position is None:
+            continue
+        lowered_canonical = str(canonical).lower()
+        if lowered_canonical in seen:
+            continue
+        mentions.append((position, -len(str(alias)), str(canonical)))
+        seen.add(lowered_canonical)
+
+    for entity in config.entities:
+        position = _match_position(engine, lowered, str(entity).lower())
+        if position is None:
+            continue
+        lowered_entity = str(entity).lower()
+        if lowered_entity in seen:
+            continue
+        mentions.append((position, -len(str(entity)), str(entity)))
+        seen.add(lowered_entity)
+
+    mentions.sort(key=lambda item: (item[0], item[1], item[2]))
+    return [entity for _, _, entity in mentions]
+
+
+def _match_position(engine: "GraphQLEngine", lowered: str, token: str) -> int | None:
+    token_text = str(token).strip().lower()
+    if not token_text:
+        return None
+
+    variants: list[str] = [token_text]
+    if token_text.endswith("s") and len(token_text) > 3:
+        variants.append(token_text[:-1])
+    elif len(token_text) > 2:
+        variants.append(token_text + "s")
+
+    best_pos: int | None = None
+    for candidate in variants:
+        match = re.search(rf"\b{re.escape(candidate)}\b", lowered)
+        if match is None:
+            continue
+        if best_pos is None or match.start() < best_pos:
+            best_pos = match.start()
+
+    if best_pos is not None:
+        return best_pos
+    return 10_000 if engine._contains_entity_token(lowered, token_text) else None
+
+
+def _disambiguate_mentioned_entity(
+    engine: "GraphQLEngine",
+    lowered: str,
+    config: "NormalizedSchemaConfig",
+    candidates: list[str],
+) -> str | None:
+    if len(candidates) <= 1:
+        return None
+
+    scored: list[tuple[float, str]] = []
+    for entity in candidates:
+        score = _entity_composite_score(engine, lowered, config, entity)
+        scored.append((score, entity))
+    scored.sort(key=lambda item: item[0], reverse=True)
+
+    if not scored:
+        return None
+    if len(scored) == 1:
+        return scored[0][1]
+
+    best_score, best_entity = scored[0]
+    second_score, _ = scored[1]
+    if best_score >= second_score + 0.15:
+        return best_entity
+    return None
+
+
+def _entity_composite_score(
+    engine: "GraphQLEngine",
+    lowered: str,
+    config: "NormalizedSchemaConfig",
+    entity: str,
+) -> float:
+    fields = engine._fields_for_entity(config, entity)
+    field_score = engine._score_fields_for_prompt(lowered, fields)
+    entity_score = engine._score_entity_name_for_prompt(lowered, entity)
+    return (1.6 * field_score) + (1.0 * entity_score)
 
 
 def _infer_entity_from_metric_intent(
@@ -196,20 +296,88 @@ def detect_fields(
 
     selected = engine._select_fields_from_schema(lowered, schema_fields, config)
     if selected:
-        return selected
+        return _enrich_selected_fields(engine, lowered, schema_fields, selected)
     if engine._entity_looks_like_holdings(entity, schema_fields):
         contextual = engine._resolve_holdings_context_fields(lowered, schema_fields)
         if contextual:
             return contextual
     semantic_fields = engine._resolve_fields_by_semantic_match(lowered, schema_fields)
     if semantic_fields:
-        return semantic_fields
+        return _enrich_selected_fields(engine, lowered, schema_fields, semantic_fields)
     entity_defaults = config.default_fields_by_entity.get(entity, [])
     if entity_defaults:
         defaults = [field for field in entity_defaults if field in schema_fields]
         if defaults:
             return defaults
     return config.default_fields or schema_fields[:3]
+
+
+def _enrich_selected_fields(
+    engine: "GraphQLEngine",
+    lowered: str,
+    schema_fields: list[str],
+    selected: list[str],
+) -> list[str]:
+    out = list(dict.fromkeys(selected))
+    if not schema_fields:
+        return out
+
+    desired_min = _desired_projection_width(lowered)
+    semantic_ranked = _rank_semantic_fields(engine, lowered, schema_fields)
+
+    if _prompt_requests_name(lowered) and not any(_is_name_like_field(field) for field in out):
+        name_candidate = next((field for _, field in semantic_ranked if _is_name_like_field(field)), None)
+        if name_candidate is not None:
+            out.insert(0, name_candidate)
+
+    if len(out) < desired_min:
+        for score, field in semantic_ranked:
+            if score <= 0:
+                continue
+            if field in out:
+                continue
+            out.append(field)
+            if len(out) >= desired_min:
+                break
+
+    return list(dict.fromkeys(out))
+
+
+def _rank_semantic_fields(
+    engine: "GraphQLEngine",
+    lowered: str,
+    schema_fields: list[str],
+) -> list[tuple[float, str]]:
+    ranked: list[tuple[float, str]] = []
+    for field in schema_fields:
+        score = engine._score_field_for_prompt(lowered, field)
+        if score > 0:
+            ranked.append((score, field))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return ranked
+
+
+def _desired_projection_width(lowered: str) -> int:
+    if " and " in lowered:
+        return 2
+    if re.search(r"\bnames?\b", lowered) is not None:
+        return 2
+    return 1
+
+
+def _prompt_requests_name(lowered: str) -> bool:
+    return re.search(r"\bnames?\b", lowered) is not None
+
+
+def _is_name_like_field(field: str) -> bool:
+    lowered = str(field).lower()
+    return (
+        lowered == "name"
+        or lowered.endswith("name")
+        or lowered.endswith("_name")
+        or "name_" in lowered
+        or "fullname" in lowered
+    )
 
 
 def detect_aggregations(
@@ -224,6 +392,11 @@ def detect_aggregations(
 
     if re.search(r"\bcount\b", lowered) or (
         re.search(r"\bhow many\b", lowered) and engine._detect_owned_asset(lowered) is None
+    ):
+        aggregations.append({"function": "count", "field": ""})
+    if (
+        re.search(r"\b(?:have|has|with)\s+more than\s+\d+\b", lowered)
+        and not any(agg.get("function") == "count" for agg in aggregations)
     ):
         aggregations.append({"function": "count", "field": ""})
 
