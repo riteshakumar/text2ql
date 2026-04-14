@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ from typing import Any
 
 from text2ql._cli_utils import (
     as_unit_float,
+    collect_entity_rows,
     dynamic_synthetic_meta,
     execute_sql_on_json,
     stable_json,
@@ -379,6 +381,9 @@ def _resolve_generation_schema_mapping(
 
     inferred_schema = infer_schema_from_json_payload(root_payload)
     schema_payload = schema or inferred_schema
+    target = str(getattr(args, "target", "")).strip().lower()
+    if target == "sql" and isinstance(schema_payload, dict):
+        schema_payload = _restrict_sql_schema_to_materialized_columns(schema_payload, root_payload)
     hybrid_mapping = generate_hybrid_mapping(
         schema_payload=schema_payload,
         data_payload=root_payload,
@@ -387,6 +392,66 @@ def _resolve_generation_schema_mapping(
     # Keep caller-provided schema for generation; only use payload-inferred
     # schema as a fallback when no schema was supplied.
     return schema_payload, hybrid_mapping
+
+
+def _restrict_sql_schema_to_materialized_columns(
+    schema_payload: dict[str, Any],
+    root_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep SQL generation fields aligned with columns materialized by SQL-on-JSON execution.
+
+    SQL execution builds one table per entity using top-level keys from each row.
+    Nested keys like ``securityDetail.symbol`` are not materialized as
+    ``transactions.symbol`` columns, so we restrict schema fields/defaults to
+    avoid generating non-executable SQL.
+    """
+    entity_rows = collect_entity_rows(root_payload)
+    materialized: dict[str, set[str]] = {}
+    for entity, rows in entity_rows.items():
+        cols: set[str] = set()
+        for row in rows:
+            if isinstance(row, dict):
+                cols.update(str(k) for k in row.keys())
+        if cols:
+            materialized[str(entity)] = cols
+    if not materialized:
+        return schema_payload
+
+    schema_out = copy.deepcopy(schema_payload)
+    fields_payload = schema_out.get("fields")
+    if isinstance(fields_payload, dict):
+        for entity, fields in list(fields_payload.items()):
+            if not isinstance(entity, str) or not isinstance(fields, list):
+                continue
+            allowed = materialized.get(entity)
+            if not allowed:
+                continue
+            filtered = [str(field) for field in fields if isinstance(field, str) and field in allowed]
+            fields_payload[entity] = filtered or sorted(allowed)
+
+    default_entity = schema_out.get("default_entity")
+    if isinstance(default_entity, str):
+        allowed_defaults = materialized.get(default_entity)
+        if allowed_defaults:
+            defaults = schema_out.get("default_fields")
+            if isinstance(defaults, list):
+                filtered_defaults = [str(field) for field in defaults if isinstance(field, str) and field in allowed_defaults]
+                if filtered_defaults:
+                    schema_out["default_fields"] = filtered_defaults
+
+    by_entity_defaults = schema_out.get("default_fields_by_entity")
+    if isinstance(by_entity_defaults, dict):
+        for entity, defaults in list(by_entity_defaults.items()):
+            if not isinstance(entity, str) or not isinstance(defaults, list):
+                continue
+            allowed = materialized.get(entity)
+            if not allowed:
+                continue
+            filtered = [str(field) for field in defaults if isinstance(field, str) and field in allowed]
+            if filtered:
+                by_entity_defaults[entity] = filtered
+
+    return schema_out
 
 
 def _build_prompts_and_metadata(

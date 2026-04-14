@@ -88,7 +88,7 @@ def test_resolve_generation_schema_mapping_preserves_provided_schema(tmp_path: P
         '{"portfolio_data":{"accounts":[{"acctNum":"A1","balance":{"recentBalanceDetail":{"buyingPowerDetail":{"margin":42}}}}]}}',
         encoding="utf-8",
     )
-    args = argparse.Namespace(data_file=str(data_file))
+    args = argparse.Namespace(data_file=str(data_file), target="graphql")
     provided_schema = {
         "entities": ["accounts"],
         "fields": {"accounts": ["acctNum", "acctName"]},
@@ -106,12 +106,42 @@ def test_resolve_generation_schema_mapping_uses_inferred_schema_when_missing(tmp
         '{"portfolio_data":{"accounts":[{"acctNum":"A1"}]}}',
         encoding="utf-8",
     )
-    args = argparse.Namespace(data_file=str(data_file))
+    args = argparse.Namespace(data_file=str(data_file), target="graphql")
 
     resolved_schema, resolved_mapping = _resolve_generation_schema_mapping(args, None, None)
 
     assert isinstance(resolved_schema, dict)
     assert "fields" in resolved_schema
+    assert isinstance(resolved_mapping, dict)
+
+
+def test_resolve_generation_schema_mapping_sql_drops_non_materialized_nested_columns(tmp_path: Path) -> None:
+    data_file = tmp_path / "data.json"
+    data_file.write_text(
+        (
+            '{"portfolio_data":{"transactions":[{"quantity":10,"postedDate":1700000000,'
+            '"securityDetail":{"symbol":"QQQ","securityDescription":"INVESCO QQQ"}}]}}'
+        ),
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(data_file=str(data_file), target="sql")
+    provided_schema = {
+        "entities": ["transactions"],
+        "fields": {"transactions": ["quantity", "symbol", "postedDate", "securityDescription"]},
+        "default_entity": "transactions",
+        "default_fields": ["quantity", "symbol"],
+        "default_fields_by_entity": {"transactions": ["quantity", "symbol"]},
+    }
+
+    resolved_schema, resolved_mapping = _resolve_generation_schema_mapping(args, provided_schema, None)
+
+    tx_fields = resolved_schema["fields"]["transactions"]
+    assert "quantity" in tx_fields
+    assert "postedDate" in tx_fields
+    assert "symbol" not in tx_fields
+    assert "securityDescription" not in tx_fields
+    assert resolved_schema["default_fields"] == ["quantity"]
+    assert resolved_schema["default_fields_by_entity"]["transactions"] == ["quantity"]
     assert isinstance(resolved_mapping, dict)
 
 
