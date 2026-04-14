@@ -154,7 +154,8 @@ def execute_sql_on_json(
         for table_name, rows in entity_rows.items():
             if not rows:
                 continue
-            columns = sorted({str(key) for row in rows for key in row.keys()})
+            flat_rows = [_flatten_row_for_sql(row) for row in rows if isinstance(row, dict)]
+            columns = sorted({str(key) for row in flat_rows for key in row.keys()})
             if not columns:
                 continue
             conn.execute(
@@ -166,7 +167,7 @@ def execute_sql_on_json(
                 f"({', '.join(_quote_ident(col) for col in columns)}) "
                 f"VALUES ({', '.join(['?'] * len(columns))});"
             )
-            values = [[_to_sql_scalar(row.get(column)) for column in columns] for row in rows]
+            values = [[_to_sql_scalar(row.get(column)) for column in columns] for row in flat_rows]
             conn.executemany(insert_sql, values)
             created_tables += 1
 
@@ -178,3 +179,27 @@ def execute_sql_on_json(
         return [], f"SQL execution error: {exc}"
     finally:
         conn.close()
+
+
+def _flatten_row_for_sql(row: dict[str, Any]) -> dict[str, Any]:
+    """Flatten nested dict leaves into top-level columns for SQL execution.
+
+    Keeps original top-level keys and additionally exposes nested scalar leaves
+    by their leaf key names when they don't collide with existing top-level keys.
+    Example: ``securityDetail.symbol`` becomes column ``symbol``.
+    """
+    flat: dict[str, Any] = dict(row)
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if isinstance(value, dict):
+                    walk(value)
+                    continue
+                if isinstance(value, list):
+                    continue
+                if key not in flat:
+                    flat[str(key)] = value
+
+    walk(row)
+    return flat
