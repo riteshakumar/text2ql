@@ -324,6 +324,36 @@ def test_sql_engine_prefers_schema_default_fields_by_entity_over_semantic_fallba
     assert '"transactions"."txnTypeCode"' not in result.query
 
 
+def test_sql_engine_how_many_dividend_routes_to_transactions_with_count_and_filter() -> None:
+    engine = SQLEngine()
+    request = QueryRequest(
+        text="how many dividend I received",
+        target="sql",
+        schema={
+            "entities": ["accounts", "transactions"],
+            "fields": {
+                "accounts": ["acctNum", "acctName"],
+                "transactions": ["quantity", "txnTypeDesc", "postedDate"],
+            },
+            "default_entity": "accounts",
+            "default_fields": ["acctNum", "acctName"],
+        },
+        mapping={
+            "filter_values": {
+                "txnTypeDesc": {
+                    "dividend received": "Dividend Received",
+                }
+            }
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert 'FROM "transactions"' in result.query
+    assert "COUNT(*)" in result.query
+    assert '"transactions"."txnTypeDesc" = \'Dividend Received\'' in result.query
+
+
 def test_sql_engine_llm_reconciles_owned_asset_filter_when_missing() -> None:
     class _StubProvider(LLMProvider):
         def complete(self, system_prompt: str, user_prompt: str) -> str:

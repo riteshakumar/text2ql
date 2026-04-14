@@ -128,6 +128,9 @@ class SQLEngine(QueryEngine):
         )
         limit, offset = self._detect_pagination(lowered)
         aggregations = self._detect_aggregations(lowered)
+        count_only_intent = any(str(agg.get("function", "")).upper() == "COUNT" for agg in aggregations) and "how many" in lowered
+        if count_only_intent:
+            columns = []
 
         (
             table,
@@ -146,6 +149,8 @@ class SQLEngine(QueryEngine):
             order_dir=order_dir,
             config=config,
         )
+        if count_only_intent:
+            columns = []
         exact_filter_keys = self._allowed_filter_keys(config, table, set(columns))
 
         query = self._build_sql(
@@ -614,14 +619,36 @@ class SQLEngine(QueryEngine):
             mapped = config.filter_value_aliases.get(str(resolved).lower(), {}).get(value.lower(), value)
             filters[str(resolved)] = mapped
 
+        value_alias_candidates: list[tuple[float, int, int, str, Any]] = []
         for canonical, alias_map in config.filter_value_aliases.items():
             resolved = self._resolve_filter_key_for_table(config, table, canonical)
             if str(resolved) in filters or not isinstance(alias_map, dict):
                 continue
+            best_match = None
             for alias, mapped_value in alias_map.items():
-                if self._contains_token(lowered, str(alias).lower()):
-                    filters[str(resolved)] = mapped_value
-                    break
+                alias_text = str(alias).lower()
+                score = self._alias_match_score(lowered, alias_text)
+                if score <= 0:
+                    continue
+                candidate = (
+                    score,
+                    self._canonical_filter_priority(str(resolved)),
+                    self._alias_specificity(alias_text),
+                    str(resolved),
+                    mapped_value,
+                )
+                if best_match is None or candidate[:3] > best_match[:3]:
+                    best_match = candidate
+            if best_match is not None:
+                value_alias_candidates.append(best_match)
+
+        single_value_focus = "how many" in lowered and " where " not in lowered
+        if single_value_focus and value_alias_candidates:
+            _, _, _, resolved, mapped_value = max(value_alias_candidates, key=lambda item: item[:3])
+            filters[str(resolved)] = mapped_value
+            return
+        for _, _, _, resolved, mapped_value in value_alias_candidates:
+            filters[str(resolved)] = mapped_value
 
     def _apply_advanced_filters(self, filters: dict[str, Any], lowered: str) -> None:
         """Populate *filters* from comparison, range, negation, and IN expressions."""
@@ -750,7 +777,7 @@ class SQLEngine(QueryEngine):
         and :class:`~text2ql.ir.IRAggregation`.
         """
         aggregations: list[dict[str, str]] = []
-        if re.search(r"\bcount\b", lowered):
+        if re.search(r"\bcount\b", lowered) or re.search(r"\bhow many\b", lowered):
             aggregations.append({"function": "COUNT", "field": "*", "alias": "count"})
             return aggregations  # count overrides other aggs — keep it simple
         agg_patterns = [
@@ -1401,6 +1428,47 @@ class SQLEngine(QueryEngine):
     @staticmethod
     def _contains_entity_token(text: str, token: str) -> bool:
         return _contains_entity_token(text, token)
+
+    @staticmethod
+    def _contains_alias_terms(text: str, alias: str) -> bool:
+        alias_tokens = [token for token in re.findall(r"[a-z0-9]+", str(alias).lower()) if len(token) >= 4]
+        if not alias_tokens:
+            return False
+        text_tokens = set(re.findall(r"[a-z0-9]+", str(text).lower()))
+        if len(alias_tokens) <= 3:
+            return all(token in text_tokens for token in alias_tokens)
+        overlap = sum(1 for token in alias_tokens if token in text_tokens)
+        return overlap >= 2
+
+    def _alias_match_score(self, text: str, alias: str) -> float:
+        alias_text = str(alias).strip().lower()
+        if not alias_text:
+            return 0.0
+        if self._contains_token(text, alias_text):
+            return 3.0
+        if self._contains_alias_terms(text, alias_text):
+            tokens = [token for token in re.findall(r"[a-z0-9]+", alias_text) if len(token) >= 4]
+            if len(tokens) <= 3:
+                return 2.0
+            return 1.0
+        return 0.0
+
+    @staticmethod
+    def _canonical_filter_priority(key: str) -> int:
+        lowered = str(key).lower()
+        if lowered.endswith("typedesc"):
+            return 4
+        if lowered.endswith("status") or lowered == "status":
+            return 3
+        if lowered.endswith("subcatdesc"):
+            return 2
+        if lowered.endswith("desc"):
+            return 1
+        return 0
+
+    @staticmethod
+    def _alias_specificity(alias: str) -> int:
+        return len(re.findall(r"[a-z0-9]+", str(alias).lower()))
 
     @staticmethod
     def _sorted_alias_pairs(alias_map: dict[str, str]) -> list[tuple[str, str]]:

@@ -14,6 +14,9 @@ def detect_table(engine: "SQLEngine", lowered: str, config: Any) -> str:
     for entity in config.entities:
         if engine._contains_entity_token(lowered, entity.lower()):
             return entity
+    inferred_from_values = _infer_table_from_filter_value_aliases(engine, lowered, config)
+    if inferred_from_values:
+        return inferred_from_values
     inferred = _infer_table_from_column_mentions(engine, lowered, config)
     if inferred:
         return inferred
@@ -53,6 +56,39 @@ def _infer_table_from_column_mentions(engine: "SQLEngine", lowered: str, config:
     narrowest = [entity for entity, width in top if width == narrowest_width]
     if len(narrowest) == 1:
         return narrowest[0]
+    return None
+
+
+def _infer_table_from_filter_value_aliases(engine: "SQLEngine", lowered: str, config: Any) -> str | None:
+    value_aliases = getattr(config, "filter_value_aliases", {})
+    if not isinstance(value_aliases, dict) or not value_aliases:
+        return None
+
+    scores: dict[str, float] = {}
+    widths: dict[str, int] = {}
+    for canonical, alias_map in value_aliases.items():
+        if not isinstance(alias_map, dict):
+            continue
+        if not any(_matches_value_alias(lowered, str(alias)) for alias in alias_map.keys()):
+            continue
+        for entity in getattr(config, "entities", []):
+            if not _entity_supports_filter_key(engine, config, entity, str(canonical)):
+                continue
+            scores[entity] = scores.get(entity, 0.0) + 1.0
+            widths[entity] = min(widths.get(entity, 10_000), len(engine._columns_for_table(config, entity)))
+
+    if not scores:
+        return None
+
+    max_score = max(scores.values())
+    top = [entity for entity, score in scores.items() if score == max_score]
+    if len(top) == 1:
+        return top[0]
+
+    narrowest_width = min(widths.get(entity, 10_000) for entity in top)
+    narrowed = [entity for entity in top if widths.get(entity, 10_000) == narrowest_width]
+    if len(narrowed) == 1:
+        return narrowed[0]
     return None
 
 
@@ -245,3 +281,26 @@ def _expanded_tokens(tokens: set[str]) -> set[str]:
         if mapped:
             expanded.add(mapped)
     return expanded
+
+
+def _entity_supports_filter_key(engine: "SQLEngine", config: Any, entity: str, candidate_key: str) -> bool:
+    canonical = str(candidate_key).lower()
+    args = [str(arg).lower() for arg in getattr(config, "args_by_entity", {}).get(entity, [])]
+    columns = [str(col).lower() for col in engine._columns_for_table(config, entity)]
+    return canonical in args or canonical in columns
+
+
+def _matches_value_alias(lowered: str, alias: str) -> bool:
+    alias_text = str(alias).strip().lower()
+    if not alias_text:
+        return False
+    if re.search(rf"\b{re.escape(alias_text)}\b", lowered):
+        return True
+    alias_tokens = [token for token in re.findall(r"[a-z0-9]+", alias_text) if len(token) >= 4]
+    if not alias_tokens:
+        return False
+    lowered_tokens = set(re.findall(r"[a-z0-9]+", lowered))
+    if len(alias_tokens) <= 3:
+        return all(token in lowered_tokens for token in alias_tokens)
+    overlap = sum(1 for token in alias_tokens if token in lowered_tokens)
+    return overlap >= 2
