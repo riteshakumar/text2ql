@@ -250,6 +250,33 @@ def test_sql_engine_recent_query_prefers_date_like_order_column() -> None:
     assert "LIMIT 1" in result.query
 
 
+def test_sql_engine_recent_transaction_prefers_snapshot_fields_over_codes() -> None:
+    engine = SQLEngine()
+    request = QueryRequest(
+        text="show my most recent transaction",
+        target="sql",
+        schema={
+            "entities": ["transactions"],
+            "fields": {
+                "transactions": [
+                    "txnCatCode",
+                    "txnTypeCode",
+                    "txnCatDesc",
+                    "quantity",
+                    "symbol",
+                    "postedDate",
+                ]
+            },
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert '"transactions"."quantity"' in result.query
+    assert '"transactions"."symbol"' in result.query
+    assert '"transactions"."txnCatCode"' not in result.query
+
+
 def test_sql_engine_fallback_avoids_detail_container_fields() -> None:
     engine = SQLEngine()
     request = QueryRequest(

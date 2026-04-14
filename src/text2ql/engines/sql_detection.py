@@ -77,7 +77,10 @@ def detect_columns(engine: "SQLEngine", lowered: str, config: Any, table: str) -
         defaults = [field for field in config.default_fields if field in allowed]
         if defaults:
             return defaults
-    semantic = _select_semantic_columns(lowered, allowed)
+    recent_snapshot = _select_recent_snapshot_columns(lowered, allowed)
+    if recent_snapshot:
+        return recent_snapshot
+    semantic = _select_semantic_columns(lowered, allowed, table=table)
     if semantic:
         return semantic
     return _ranked_fallback_columns(allowed)
@@ -102,10 +105,21 @@ def detect_order(
     return None, None
 
 
-def _select_semantic_columns(lowered: str, allowed: list[str], max_fields: int = 3) -> list[str]:
+def _select_semantic_columns(
+    lowered: str,
+    allowed: list[str],
+    *,
+    table: str = "",
+    max_fields: int = 3,
+) -> list[str]:
     if not allowed:
         return []
     prompt_tokens = _expanded_tokens(_tokenize(lowered))
+    # Avoid selecting fields solely because prompt repeats the entity name.
+    if table:
+        prompt_tokens -= _expanded_tokens(_tokenize(table))
+    if not prompt_tokens:
+        return []
     scored: list[tuple[float, int, str]] = []
     for idx, column in enumerate(allowed):
         score = _column_semantic_score(prompt_tokens, column)
@@ -116,6 +130,32 @@ def _select_semantic_columns(lowered: str, allowed: list[str], max_fields: int =
         return []
     scored.sort(key=lambda item: (-item[0], item[1]))
     return [column for _, _, column in scored[:max_fields]]
+
+
+def _select_recent_snapshot_columns(lowered: str, allowed: list[str]) -> list[str]:
+    if not any(token in lowered for token in ("latest", "newest", "most recent")):
+        return []
+    lower_to_original = {str(column).lower(): str(column) for column in allowed}
+    priority = (
+        "quantity",
+        "symbol",
+        "securityDescription",
+        "shortDesc",
+        "mobileDesc",
+        "desc",
+        "net",
+        "amount",
+        "price",
+        "principal",
+    )
+    selected: list[str] = []
+    for candidate in priority:
+        match = lower_to_original.get(candidate.lower())
+        if match is not None and match not in selected:
+            selected.append(match)
+        if len(selected) >= 2:
+            break
+    return selected
 
 
 def _column_semantic_score(prompt_tokens: set[str], column: str) -> float:
