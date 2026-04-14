@@ -354,6 +354,38 @@ def test_sql_engine_how_many_dividend_routes_to_transactions_with_count_and_filt
     assert '"transactions"."txnTypeDesc" = \'Dividend Received\'' in result.query
 
 
+def test_sql_engine_value_alias_table_inference_ignores_args_only_entities() -> None:
+    engine = SQLEngine()
+    request = QueryRequest(
+        text="how many dividend I received",
+        target="sql",
+        schema={
+            "entities": ["balanceSummary", "transactions"],
+            "fields": {
+                "transactions": ["quantity", "txnTypeDesc", "postedDate"],
+            },
+            "args": {
+                "balanceSummary": ["txnTypeDesc", "limit"],
+                "transactions": ["txnTypeDesc", "limit"],
+            },
+            "default_entity": "balanceSummary",
+            "default_fields": ["asOfDateTime"],
+        },
+        mapping={
+            "filter_values": {
+                "txnTypeDesc": {
+                    "dividend received": "Dividend Received",
+                }
+            }
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert 'FROM "transactions"' in result.query
+    assert '"transactions"."txnTypeDesc" = \'Dividend Received\'' in result.query
+
+
 def test_sql_engine_llm_reconciles_owned_asset_filter_when_missing() -> None:
     class _StubProvider(LLMProvider):
         def complete(self, system_prompt: str, user_prompt: str) -> str:

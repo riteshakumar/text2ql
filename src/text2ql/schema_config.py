@@ -760,4 +760,8 @@ def _candidate_fields_for_entity(config: NormalizedSchemaConfig, entity: str) ->
     entity_fields = config.fields_by_entity.get(entity, [])
     if entity_fields:
         return [field for field in entity_fields if isinstance(field, str) and field.strip()]
+    if config.fields_by_entity:
+        # When we have per-entity fields, avoid falling back to global fields.
+        # That fallback makes "empty" entities look filterable/selectable in SQL.
+        return []
     return [field for field in config.fields if isinstance(field, str) and field.strip()]

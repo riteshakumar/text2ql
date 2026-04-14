@@ -285,9 +285,10 @@ def _expanded_tokens(tokens: set[str]) -> set[str]:
 
 def _entity_supports_filter_key(engine: "SQLEngine", config: Any, entity: str, candidate_key: str) -> bool:
     canonical = str(candidate_key).lower()
-    args = [str(arg).lower() for arg in getattr(config, "args_by_entity", {}).get(entity, [])]
     columns = [str(col).lower() for col in engine._columns_for_table(config, entity)]
-    return canonical in args or canonical in columns
+    # SQL table inference should only consider physically queryable columns.
+    # Args-only matches can route to entities that are not materialized as tables.
+    return canonical in columns
 
 
 def _matches_value_alias(lowered: str, alias: str) -> bool:

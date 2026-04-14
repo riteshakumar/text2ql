@@ -121,3 +121,16 @@ def test_normalize_schema_config_auto_discovers_args_from_fields_when_missing() 
     assert "isPartialBalance" in config.args_by_entity["accountSummary"]
     assert "asOfDateTime" in config.args_by_entity["accountSummary"]
     assert "limit" in config.args_by_entity["accountSummary"]
+
+
+def test_normalize_schema_config_does_not_bleed_global_fields_into_empty_entity_args() -> None:
+    payload = {
+        "accounts": [{"acctNum": "X123", "transactions": [{"txnTypeDesc": "Dividend Received"}]}],
+        "summary": {"balanceSummary": {}},
+    }
+
+    config = normalize_schema_config(payload)
+
+    assert "balanceSummary" in config.entities
+    assert config.fields_by_entity.get("balanceSummary") in (None, [])
+    assert "txnTypeDesc" not in config.args_by_entity.get("balanceSummary", [])
