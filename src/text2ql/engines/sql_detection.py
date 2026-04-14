@@ -8,12 +8,23 @@ if TYPE_CHECKING:
 
 
 def detect_table(engine: "SQLEngine", lowered: str, config: Any) -> str:
+    alias_or_name_table: str | None = None
     for alias, canonical in engine._sorted_alias_pairs(config.entity_aliases):
         if engine._contains_token(lowered, alias):
-            return canonical
-    for entity in config.entities:
-        if engine._contains_entity_token(lowered, entity.lower()):
-            return entity
+            alias_or_name_table = canonical
+            break
+    if alias_or_name_table is None:
+        for entity in config.entities:
+            if engine._contains_entity_token(lowered, entity.lower()):
+                alias_or_name_table = entity
+                break
+
+    metric_table = _infer_table_from_metric_intent(engine, lowered, config)
+    if metric_table is not None and metric_table != alias_or_name_table:
+        return metric_table
+    if alias_or_name_table is not None:
+        return alias_or_name_table
+
     inferred_from_values = _infer_table_from_filter_value_aliases(engine, lowered, config)
     if inferred_from_values:
         return inferred_from_values
@@ -23,6 +34,46 @@ def detect_table(engine: "SQLEngine", lowered: str, config: Any) -> str:
     if config.default_entity:
         return config.default_entity
     return config.entities[0] if config.entities else engine._extract_entity_from_text(lowered)
+
+
+def _infer_table_from_metric_intent(engine: "SQLEngine", lowered: str, config: Any) -> str | None:
+    phrase_to_fields: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("net worth", ("netWorth", "regulatoryNetWorth", "totalMarketVal", "marketVal")),
+        ("market value", ("totalMarketVal", "marketVal", "fidelityTotalMktVal", "nonFidelityTotalMktVal")),
+        ("gain loss", ("totalGainLoss", "todaysGainLoss", "netWorthChg")),
+    )
+    for phrase, field_candidates in phrase_to_fields:
+        if phrase not in lowered:
+            continue
+        return _best_entity_for_field_candidates(engine, config, field_candidates)
+    return None
+
+
+def _best_entity_for_field_candidates(
+    engine: "SQLEngine",
+    config: Any,
+    field_candidates: tuple[str, ...],
+) -> str | None:
+    candidates: list[tuple[str, int, int]] = []
+    wanted = {str(field).lower() for field in field_candidates}
+    for entity in getattr(config, "entities", []):
+        columns = engine._columns_for_table(config, entity)
+        if not columns:
+            continue
+        lowered_cols = {str(column).lower() for column in columns}
+        score = sum(1 for field in wanted if field in lowered_cols)
+        if score <= 0:
+            continue
+        candidates.append((str(entity), score, len(columns)))
+    if not candidates:
+        return None
+    max_score = max(score for _, score, _ in candidates)
+    top = [(entity, width) for entity, score, width in candidates if score == max_score]
+    narrowest = min(width for _, width in top)
+    narrowed = [entity for entity, width in top if width == narrowest]
+    if len(narrowed) == 1:
+        return narrowed[0]
+    return None
 
 
 def _infer_table_from_column_mentions(engine: "SQLEngine", lowered: str, config: Any) -> str | None:

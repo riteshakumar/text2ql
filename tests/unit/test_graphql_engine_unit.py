@@ -451,6 +451,29 @@ def test_engine_uses_semantic_field_match_for_metric_prompt() -> None:
     assert "totalMarketVal" in result.query
 
 
+def test_engine_account_net_worth_prefers_metric_entity_over_accounts_alias() -> None:
+    engine = GraphQLEngine()
+    request = QueryRequest(
+        text="what is my account net worth",
+        target="graphql",
+        schema={
+            "entities": ["accounts", "acctValDetail"],
+            "fields": {
+                "accounts": ["acctNum", "acctName", "acctType"],
+                "acctValDetail": ["netWorth", "marketVal"],
+            },
+            "default_entity": "accounts",
+            "default_fields": ["acctNum", "acctName"],
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert result.metadata.get("entity") == "acctValDetail"
+    assert "acctValDetail {" in result.query
+    assert "netWorth" in result.query
+
+
 def test_engine_routes_dividend_count_intent_to_transactions_via_value_alias() -> None:
     engine = GraphQLEngine()
     request = QueryRequest(

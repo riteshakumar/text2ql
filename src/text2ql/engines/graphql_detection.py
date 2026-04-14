@@ -19,6 +19,9 @@ def detect_entity(engine: "GraphQLEngine", text: str, config: "NormalizedSchemaC
         return special_entity
 
     alias_or_name_entity = engine._resolve_entity_by_alias_or_name(lowered, config)
+    metric_entity = _infer_entity_from_metric_intent(engine, lowered, config)
+    if metric_entity is not None and metric_entity != alias_or_name_entity:
+        return metric_entity
     if alias_or_name_entity is not None:
         return alias_or_name_entity
 
@@ -39,6 +42,50 @@ def detect_entity(engine: "GraphQLEngine", text: str, config: "NormalizedSchemaC
 
     # Last resort when no schema is provided: extract a noun-like token.
     return engine._extract_entity_from_text(lowered)
+
+
+def _infer_entity_from_metric_intent(
+    engine: "GraphQLEngine",
+    lowered: str,
+    config: "NormalizedSchemaConfig",
+) -> str | None:
+    phrase_to_fields: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("net worth", ("netWorth", "regulatoryNetWorth", "totalMarketVal", "marketVal")),
+        ("market value", ("totalMarketVal", "marketVal", "fidelityTotalMktVal", "nonFidelityTotalMktVal")),
+        ("gain loss", ("totalGainLoss", "todaysGainLoss", "netWorthChg")),
+    )
+    for phrase, field_candidates in phrase_to_fields:
+        if phrase not in lowered:
+            continue
+        return _best_entity_for_field_candidates(engine, config, field_candidates)
+    return None
+
+
+def _best_entity_for_field_candidates(
+    engine: "GraphQLEngine",
+    config: "NormalizedSchemaConfig",
+    field_candidates: tuple[str, ...],
+) -> str | None:
+    candidates: list[tuple[str, int, int]] = []
+    wanted = {str(field).lower() for field in field_candidates}
+    for entity in getattr(config, "entities", []):
+        fields = engine._fields_for_entity(config, entity)
+        if not fields:
+            continue
+        lowered_fields = {str(field).lower() for field in fields}
+        score = sum(1 for field in wanted if field in lowered_fields)
+        if score <= 0:
+            continue
+        candidates.append((str(entity), score, len(fields)))
+    if not candidates:
+        return None
+    max_score = max(score for _, score, _ in candidates)
+    top = [(entity, width) for entity, score, width in candidates if score == max_score]
+    narrowest = min(width for _, width in top)
+    narrowed = [entity for entity, width in top if width == narrowest]
+    if len(narrowed) == 1:
+        return narrowed[0]
+    return None
 
 
 def _infer_entity_from_filter_value_aliases(

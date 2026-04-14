@@ -199,6 +199,28 @@ def test_sql_engine_infers_table_from_column_mention_before_default() -> None:
     assert '"buyingPowerDetail"."margin"' in result.query
 
 
+def test_sql_engine_account_net_worth_prefers_metric_entity_over_accounts_alias() -> None:
+    engine = SQLEngine()
+    request = QueryRequest(
+        text="what is my account net worth",
+        target="sql",
+        schema={
+            "entities": ["accounts", "acctValDetail"],
+            "fields": {
+                "accounts": ["acctNum", "acctName", "acctType"],
+                "acctValDetail": ["netWorth", "marketVal"],
+            },
+            "default_entity": "accounts",
+            "default_fields": ["acctNum", "acctName"],
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert 'FROM "acctValDetail"' in result.query
+    assert '"acctValDetail"."netWorth"' in result.query
+
+
 def test_sql_engine_prefers_narrower_entity_on_column_match_tie() -> None:
     engine = SQLEngine()
     request = QueryRequest(
