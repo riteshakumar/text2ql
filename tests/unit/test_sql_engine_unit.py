@@ -354,6 +354,27 @@ def test_sql_engine_how_many_dividend_routes_to_transactions_with_count_and_filt
     assert '"transactions"."txnTypeDesc" = \'Dividend Received\'' in result.query
 
 
+def test_sql_engine_how_many_owned_asset_keeps_holdings_projection_not_count() -> None:
+    engine = SQLEngine()
+    request = QueryRequest(
+        text="how many qqq do i own",
+        target="sql",
+        schema={
+            "entities": ["positions"],
+            "fields": {"positions": ["symbol", "quantity"]},
+            "args": {"positions": ["symbol"]},
+        },
+        mapping={"filter_values": {"symbol": {"qqq": "QQQ"}}},
+    )
+
+    result = engine.generate(request)
+
+    assert "COUNT(*)" not in result.query
+    assert '"positions"."quantity"' in result.query
+    assert '"positions"."symbol"' in result.query
+    assert '"positions"."symbol" = \'QQQ\'' in result.query
+
+
 def test_sql_engine_value_alias_table_inference_ignores_args_only_entities() -> None:
     engine = SQLEngine()
     request = QueryRequest(

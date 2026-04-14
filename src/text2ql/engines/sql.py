@@ -777,7 +777,10 @@ class SQLEngine(QueryEngine):
         and :class:`~text2ql.ir.IRAggregation`.
         """
         aggregations: list[dict[str, str]] = []
-        if re.search(r"\bcount\b", lowered) or re.search(r"\bhow many\b", lowered):
+        explicit_count = re.search(r"\bcount\b", lowered) is not None
+        how_many = re.search(r"\bhow many\b", lowered) is not None
+        owned_asset_intent = self._detect_owned_asset(lowered) is not None
+        if explicit_count or (how_many and not owned_asset_intent):
             aggregations.append({"function": "COUNT", "field": "*", "alias": "count"})
             return aggregations  # count overrides other aggs — keep it simple
         agg_patterns = [
