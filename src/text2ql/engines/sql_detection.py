@@ -14,9 +14,46 @@ def detect_table(engine: "SQLEngine", lowered: str, config: Any) -> str:
     for entity in config.entities:
         if engine._contains_entity_token(lowered, entity.lower()):
             return entity
+    inferred = _infer_table_from_column_mentions(engine, lowered, config)
+    if inferred:
+        return inferred
     if config.default_entity:
         return config.default_entity
     return config.entities[0] if config.entities else engine._extract_entity_from_text(lowered)
+
+
+def _infer_table_from_column_mentions(engine: "SQLEngine", lowered: str, config: Any) -> str | None:
+    """Infer table from explicit column mentions when entity is not named."""
+    candidates: list[tuple[str, int, int]] = []
+    field_alias_pairs = engine._sorted_alias_pairs(config.field_aliases)
+
+    for entity in config.entities:
+        columns = engine._columns_for_table(config, entity)
+        if not columns:
+            continue
+
+        score = 0
+        for column in columns:
+            if engine._contains_column_reference(lowered, column):
+                score += 2
+
+        for alias, canonical in field_alias_pairs:
+            if canonical in columns and engine._contains_column_reference(lowered, alias):
+                score += 1
+
+        if score > 0:
+            candidates.append((entity, score, len(columns)))
+
+    if not candidates:
+        return None
+
+    max_score = max(score for _, score, _ in candidates)
+    top = [(entity, width) for entity, score, width in candidates if score == max_score]
+    narrowest_width = min(width for _, width in top)
+    narrowest = [entity for entity, width in top if width == narrowest_width]
+    if len(narrowest) == 1:
+        return narrowest[0]
+    return None
 
 
 def detect_columns(engine: "SQLEngine", lowered: str, config: Any, table: str) -> list[str]:

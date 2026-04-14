@@ -177,6 +177,50 @@ def test_sql_engine_extract_filter_value_ignores_spurious_token() -> None:
     assert SQLEngine._extract_filter_value("status", "show account where status is") is None
 
 
+def test_sql_engine_infers_table_from_column_mention_before_default() -> None:
+    engine = SQLEngine()
+    request = QueryRequest(
+        text="what is my available margin",
+        target="sql",
+        schema={
+            "entities": ["accounts", "buyingPowerDetail"],
+            "fields": {
+                "accounts": ["acctNum", "acctName", "accountPositionCount"],
+                "buyingPowerDetail": ["margin", "cash"],
+            },
+            "default_entity": "accounts",
+            "default_fields": ["acctNum", "acctName", "accountPositionCount"],
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert 'FROM "buyingPowerDetail"' in result.query
+    assert '"buyingPowerDetail"."margin"' in result.query
+
+
+def test_sql_engine_prefers_narrower_entity_on_column_match_tie() -> None:
+    engine = SQLEngine()
+    request = QueryRequest(
+        text="show margin",
+        target="sql",
+        schema={
+            "entities": ["accounts", "recentBalanceDetail", "buyingPowerDetail"],
+            "fields": {
+                "accounts": ["acctNum", "acctName"],
+                "recentBalanceDetail": ["margin", "cash", "cashWithMargin", "withoutMarginImpact"],
+                "buyingPowerDetail": ["margin", "cash"],
+            },
+            "default_entity": "accounts",
+            "default_fields": ["acctNum", "acctName"],
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert 'FROM "buyingPowerDetail"' in result.query
+
+
 def test_sql_engine_llm_reconciles_owned_asset_filter_when_missing() -> None:
     class _StubProvider(LLMProvider):
         def complete(self, system_prompt: str, user_prompt: str) -> str:

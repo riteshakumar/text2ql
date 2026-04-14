@@ -3,7 +3,14 @@ from pathlib import Path
 
 import pytest
 
-from text2ql.cli import _build_hybrid_mapping_from_args, _build_provider, _load_json_object, build_parser, main
+from text2ql.cli import (
+    _build_hybrid_mapping_from_args,
+    _build_provider,
+    _load_json_object,
+    _resolve_generation_schema_mapping,
+    build_parser,
+    main,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -73,6 +80,39 @@ def test_build_hybrid_mapping_from_args_requires_data_file() -> None:
 
     with pytest.raises(ValueError, match="--data-file"):
         _build_hybrid_mapping_from_args(args)
+
+
+def test_resolve_generation_schema_mapping_preserves_provided_schema(tmp_path: Path) -> None:
+    data_file = tmp_path / "data.json"
+    data_file.write_text(
+        '{"portfolio_data":{"accounts":[{"acctNum":"A1","balance":{"recentBalanceDetail":{"buyingPowerDetail":{"margin":42}}}}]}}',
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(data_file=str(data_file))
+    provided_schema = {
+        "entities": ["accounts"],
+        "fields": {"accounts": ["acctNum", "acctName"]},
+    }
+
+    resolved_schema, resolved_mapping = _resolve_generation_schema_mapping(args, provided_schema, None)
+
+    assert resolved_schema == provided_schema
+    assert isinstance(resolved_mapping, dict)
+
+
+def test_resolve_generation_schema_mapping_uses_inferred_schema_when_missing(tmp_path: Path) -> None:
+    data_file = tmp_path / "data.json"
+    data_file.write_text(
+        '{"portfolio_data":{"accounts":[{"acctNum":"A1"}]}}',
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(data_file=str(data_file))
+
+    resolved_schema, resolved_mapping = _resolve_generation_schema_mapping(args, None, None)
+
+    assert isinstance(resolved_schema, dict)
+    assert "fields" in resolved_schema
+    assert isinstance(resolved_mapping, dict)
 
 
 def test_cli_parser_exposes_synthetic_and_execution_eval_flags() -> None:

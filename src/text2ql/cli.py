@@ -384,7 +384,9 @@ def _resolve_generation_schema_mapping(
         data_payload=root_payload,
         overrides=mapping,
     )
-    return inferred_schema, hybrid_mapping
+    # Keep caller-provided schema for generation; only use payload-inferred
+    # schema as a fallback when no schema was supplied.
+    return schema_payload, hybrid_mapping
 
 
 def _build_prompts_and_metadata(
