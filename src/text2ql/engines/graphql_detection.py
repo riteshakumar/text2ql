@@ -50,6 +50,8 @@ def _infer_entity_from_metric_intent(
     config: "NormalizedSchemaConfig",
 ) -> str | None:
     phrase_to_fields: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("available cash", ("cashOnly", "cashWithMargin", "cashWithoutEquity", "cash", "withoutMarginImpact")),
+        ("cash available", ("cashOnly", "cashWithMargin", "cashWithoutEquity", "cash", "withoutMarginImpact")),
         ("net worth", ("netWorth", "regulatoryNetWorth", "totalMarketVal", "marketVal")),
         ("market value", ("totalMarketVal", "marketVal", "fidelityTotalMktVal", "nonFidelityTotalMktVal")),
         ("gain loss", ("totalGainLoss", "todaysGainLoss", "netWorthChg")),

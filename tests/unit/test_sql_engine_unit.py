@@ -221,6 +221,31 @@ def test_sql_engine_account_net_worth_prefers_metric_entity_over_accounts_alias(
     assert '"acctValDetail"."netWorth"' in result.query
 
 
+def test_sql_engine_available_cash_prefers_withdrawable_cash_entity() -> None:
+    engine = SQLEngine()
+    request = QueryRequest(
+        text="what is my available cash",
+        target="sql",
+        schema={
+            "entities": ["accounts", "securityDetail", "availableToWithdrawDetail"],
+            "fields": {
+                "accounts": ["acctNum", "acctName", "acctType"],
+                "securityDetail": ["isCash", "isAdvised", "isEligibleForLots", "brokerageHoldingType"],
+                "availableToWithdrawDetail": ["cashOnly", "cashWithMargin", "cashWithoutEquity"],
+            },
+            "default_entity": "accounts",
+            "default_fields": ["acctNum", "acctName"],
+        },
+        mapping={"filter_values": {"brokerageHoldingType": {"cash": "Cash"}}},
+    )
+
+    result = engine.generate(request)
+
+    assert 'FROM "availableToWithdrawDetail"' in result.query
+    assert '"availableToWithdrawDetail"."cashOnly"' in result.query
+    assert "brokerageHoldingType" not in result.query
+
+
 def test_sql_engine_prefers_narrower_entity_on_column_match_tie() -> None:
     engine = SQLEngine()
     request = QueryRequest(

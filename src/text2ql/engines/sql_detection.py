@@ -38,6 +38,8 @@ def detect_table(engine: "SQLEngine", lowered: str, config: Any) -> str:
 
 def _infer_table_from_metric_intent(engine: "SQLEngine", lowered: str, config: Any) -> str | None:
     phrase_to_fields: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("available cash", ("cashOnly", "cashWithMargin", "cashWithoutEquity", "cash", "withoutMarginImpact")),
+        ("cash available", ("cashOnly", "cashWithMargin", "cashWithoutEquity", "cash", "withoutMarginImpact")),
         ("net worth", ("netWorth", "regulatoryNetWorth", "totalMarketVal", "marketVal")),
         ("market value", ("totalMarketVal", "marketVal", "fidelityTotalMktVal", "nonFidelityTotalMktVal")),
         ("gain loss", ("totalGainLoss", "todaysGainLoss", "netWorthChg")),

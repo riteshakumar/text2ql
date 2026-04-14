@@ -474,6 +474,36 @@ def test_engine_account_net_worth_prefers_metric_entity_over_accounts_alias() ->
     assert "netWorth" in result.query
 
 
+def test_engine_available_cash_prefers_withdrawable_cash_entity() -> None:
+    engine = GraphQLEngine()
+    request = QueryRequest(
+        text="what is my available cash",
+        target="graphql",
+        schema={
+            "entities": ["accounts", "securityDetail", "availableToWithdrawDetail"],
+            "fields": {
+                "accounts": ["acctNum", "acctName", "acctType"],
+                "securityDetail": ["isCash", "isAdvised", "isEligibleForLots", "brokerageHoldingType"],
+                "availableToWithdrawDetail": ["cashOnly", "cashWithMargin", "cashWithoutEquity"],
+            },
+            "args": {
+                "securityDetail": ["brokerageHoldingType"],
+                "availableToWithdrawDetail": [],
+            },
+            "default_entity": "accounts",
+            "default_fields": ["acctNum", "acctName"],
+        },
+        mapping={"filter_values": {"brokerageHoldingType": {"cash": "Cash"}}},
+    )
+
+    result = engine.generate(request)
+
+    assert result.metadata.get("entity") == "availableToWithdrawDetail"
+    assert "availableToWithdrawDetail {" in result.query
+    assert "cashOnly" in result.query
+    assert "brokerageHoldingType:" not in result.query
+
+
 def test_engine_routes_dividend_count_intent_to_transactions_via_value_alias() -> None:
     engine = GraphQLEngine()
     request = QueryRequest(
