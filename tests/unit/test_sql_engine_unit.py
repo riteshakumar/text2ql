@@ -386,6 +386,45 @@ def test_sql_engine_value_alias_table_inference_ignores_args_only_entities() -> 
     assert '"transactions"."txnTypeDesc" = \'Dividend Received\'' in result.query
 
 
+def test_sql_engine_cash_positions_only_prefers_holdings_projection() -> None:
+    engine = SQLEngine()
+    request = QueryRequest(
+        text="show cash positions only",
+        target="sql",
+        schema={
+            "entities": ["positions"],
+            "fields": {"positions": ["symbol", "quantity", "isCash", "brokerageHoldingType"]},
+            "args": {"positions": ["brokerageHoldingType"]},
+        },
+        mapping={"filter_values": {"brokerageHoldingType": {"cash": "Cash"}}},
+    )
+
+    result = engine.generate(request)
+
+    assert '"positions"."quantity"' in result.query
+    assert '"positions"."symbol"' in result.query
+    assert 'SELECT "positions"."isCash"' not in result.query
+    assert '"positions"."brokerageHoldingType" = \'Cash\'' in result.query
+
+
+def test_sql_engine_explicit_is_cash_prompt_keeps_is_cash_projection() -> None:
+    engine = SQLEngine()
+    request = QueryRequest(
+        text="show positions is cash",
+        target="sql",
+        schema={
+            "entities": ["positions"],
+            "fields": {"positions": ["symbol", "quantity", "isCash", "brokerageHoldingType"]},
+            "args": {"positions": ["brokerageHoldingType"]},
+        },
+        mapping={"filter_values": {"brokerageHoldingType": {"cash": "Cash"}}},
+    )
+
+    result = engine.generate(request)
+
+    assert '"positions"."isCash"' in result.query
+
+
 def test_sql_engine_llm_reconciles_owned_asset_filter_when_missing() -> None:
     class _StubProvider(LLMProvider):
         def complete(self, system_prompt: str, user_prompt: str) -> str:

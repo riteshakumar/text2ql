@@ -103,6 +103,15 @@ def detect_columns(engine: "SQLEngine", lowered: str, config: Any, table: str) -
             selected.append(canonical)
     selected = engine._unique_in_order(selected)
     if selected:
+        cash_projection = _select_cash_holdings_projection(
+            engine=engine,
+            lowered=lowered,
+            table=table,
+            allowed=allowed,
+            selected=selected,
+        )
+        if cash_projection:
+            return cash_projection
         return selected
     by_entity_defaults = getattr(config, "default_fields_by_entity", {}).get(table, [])
     if by_entity_defaults:
@@ -118,6 +127,15 @@ def detect_columns(engine: "SQLEngine", lowered: str, config: Any, table: str) -
         return recent_snapshot
     semantic = _select_semantic_columns(lowered, allowed, table=table)
     if semantic:
+        cash_projection = _select_cash_holdings_projection(
+            engine=engine,
+            lowered=lowered,
+            table=table,
+            allowed=allowed,
+            selected=semantic,
+        )
+        if cash_projection:
+            return cash_projection
         return semantic
     return _ranked_fallback_columns(allowed)
 
@@ -166,6 +184,52 @@ def _select_semantic_columns(
         return []
     scored.sort(key=lambda item: (-item[0], item[1]))
     return [column for _, _, column in scored[:max_fields]]
+
+
+def _select_cash_holdings_projection(
+    engine: "SQLEngine",
+    lowered: str,
+    table: str,
+    allowed: list[str],
+    selected: list[str],
+) -> list[str]:
+    """Prefer useful holdings snapshots for prompts like 'cash positions only'.
+
+    Without this guard, lexical matching often selects only ``isCash``, which is
+    valid but less useful than returning the matching positions themselves.
+    """
+    if len(selected) != 1 or str(selected[0]).lower() != "iscash":
+        return []
+    if "cash" not in lowered:
+        return []
+    if "only" not in lowered and "position" not in lowered:
+        return []
+    if _is_explicit_is_cash_request(lowered):
+        return []
+    if engine._score_holdings_table(table, allowed) <= 0:
+        return []
+
+    lower_to_original = {str(column).lower(): str(column) for column in allowed}
+    preferred = (
+        "quantity",
+        "symbol",
+        "securityDescription",
+        "shortDesc",
+        "mobileDesc",
+        "desc",
+    )
+    projected: list[str] = []
+    for candidate in preferred:
+        match = lower_to_original.get(candidate.lower())
+        if match is not None and match not in projected:
+            projected.append(match)
+        if len(projected) >= 2:
+            break
+    return projected
+
+
+def _is_explicit_is_cash_request(lowered: str) -> bool:
+    return "iscash" in lowered or re.search(r"\bis\s+cash\b", lowered) is not None
 
 
 def _select_recent_snapshot_columns(lowered: str, allowed: list[str]) -> list[str]:
