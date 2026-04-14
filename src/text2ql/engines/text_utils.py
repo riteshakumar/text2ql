@@ -11,11 +11,21 @@ def contains_token(text: str, token: str) -> bool:
 
 
 def contains_entity_token(text: str, token: str) -> bool:
-    if contains_token(text, token):
-        return True
-    if token.endswith("s"):
+    normalized = str(token).strip().lower()
+    if not normalized:
         return False
-    return contains_token(text, f"{token}s")
+
+    for variant in label_match_variants(normalized):
+        if contains_token(text, variant):
+            return True
+
+    if normalized.endswith("s"):
+        return False
+
+    for variant in label_match_variants(f"{normalized}s"):
+        if contains_token(text, variant):
+            return True
+    return False
 
 
 def sorted_alias_pairs(alias_map: dict[str, str]) -> list[tuple[str, str]]:

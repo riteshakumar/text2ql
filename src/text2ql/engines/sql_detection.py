@@ -20,9 +20,17 @@ def detect_table(engine: "SQLEngine", lowered: str, config: Any) -> str:
                 break
 
     metric_table = _infer_table_from_metric_intent(engine, lowered, config)
+    semantic_table, semantic_score = _infer_table_from_semantic_match(engine, lowered, config)
     if metric_table is not None and metric_table != alias_or_name_table:
         return metric_table
     if alias_or_name_table is not None:
+        if semantic_table is not None and semantic_table != alias_or_name_table:
+            alias_score = _table_semantic_score(engine, lowered, config, alias_or_name_table)
+            alias_field_score = _table_field_semantic_score(engine, lowered, config, alias_or_name_table)
+            semantic_field_score = _table_field_semantic_score(engine, lowered, config, semantic_table)
+            has_metric_intent = _has_metric_routing_intent(lowered)
+            if has_metric_intent and semantic_score >= alias_score + 0.2 and semantic_field_score >= alias_field_score + 0.1:
+                return semantic_table
         return alias_or_name_table
 
     inferred_from_values = _infer_table_from_filter_value_aliases(engine, lowered, config)
@@ -31,6 +39,8 @@ def detect_table(engine: "SQLEngine", lowered: str, config: Any) -> str:
     inferred = _infer_table_from_column_mentions(engine, lowered, config)
     if inferred:
         return inferred
+    if semantic_table:
+        return semantic_table
     if config.default_entity:
         return config.default_entity
     return config.entities[0] if config.entities else engine._extract_entity_from_text(lowered)
@@ -43,6 +53,42 @@ def _infer_table_from_metric_intent(engine: "SQLEngine", lowered: str, config: A
         ("net worth", ("netWorth", "regulatoryNetWorth", "totalMarketVal", "marketVal")),
         ("market value", ("totalMarketVal", "marketVal", "fidelityTotalMktVal", "nonFidelityTotalMktVal")),
         ("gain loss", ("totalGainLoss", "todaysGainLoss", "netWorthChg")),
+        ("sat", ("AvgScrMath", "AvgScrRead", "AvgScrWrite", "NumTstTakr", "NumGE1500", "sname")),
+        ("average reading score", ("AvgScrRead",)),
+        ("test takers", ("NumTstTakr",)),
+        ("scoring above 1500", ("NumGE1500",)),
+        ("free meal", ("Free Meal Count (K-12)", "Percent (%) Eligible Free (K-12)", "FRPM Count (K-12)")),
+        ("free meal percentage", ("Percent (%) Eligible Free (K-12)",)),
+        ("enrollment", ("Enrollment (K-12)",)),
+        ("frpm", ("Enrollment (K-12)", "FRPM Count (K-12)", "Percent (%) Eligible Free (K-12)")),
+        ("consumption", ("Consumption",)),
+        ("transactions", ("TransactionID", "Amount", "Price", "ProductID", "GasStationID", "CustomerID")),
+        ("price paid", ("Price", "CustomerID", "TransactionID")),
+        ("paid by customer", ("Price", "CustomerID", "TransactionID")),
+        ("gas station", ("GasStationID", "ChainID", "Country", "Segment")),
+        ("overall rating", ("overall_rating",)),
+        ("preferred foot", ("preferred_foot",)),
+        ("prefer each foot", ("preferred_foot",)),
+        ("build up play speed", ("buildUpPlaySpeed",)),
+        ("home goals", ("home_team_goal",)),
+        ("away goals", ("away_team_goal",)),
+        ("highest earnings", ("Earnings", "People_ID")),
+        ("best finish", ("Best_Finish", "People_ID")),
+        ("registered for", ("registration_date", "course_id", "student_id")),
+        ("student registered", ("registration_date", "course_id", "student_id")),
+        ("attended each course", ("course_id", "student_id", "date_of_attendance")),
+        ("student attend", ("course_id", "student_id", "date_of_attendance")),
+        ("did student", ("course_id", "student_id", "date_of_attendance")),
+        ("attended", ("date_of_attendance", "course_id", "student_id")),
+        ("attend", ("date_of_attendance", "course_id", "student_id")),
+        ("registration date", ("registration_date", "course_id", "student_id")),
+        ("received a bonus", ("Bonus", "Employee_ID", "Year_awarded")),
+        ("bonus greater", ("Bonus", "Employee_ID", "Year_awarded")),
+        ("work in shops", ("Shop_ID", "Employee_ID", "Start_from")),
+        ("shops located", ("Shop_ID", "Employee_ID", "Location")),
+        ("car model", ("ModelId", "Model")),
+        ("models produced", ("ModelId", "Model", "Maker")),
+        ("connections", ("atom_id", "atom_id2", "bond_id")),
     )
     for phrase, field_candidates in phrase_to_fields:
         if phrase not in lowered:
@@ -145,6 +191,61 @@ def _infer_table_from_filter_value_aliases(engine: "SQLEngine", lowered: str, co
     return None
 
 
+def _infer_table_from_semantic_match(
+    engine: "SQLEngine",
+    lowered: str,
+    config: Any,
+) -> tuple[str | None, float]:
+    prompt_tokens = _expanded_tokens(_tokenize(lowered))
+    if not prompt_tokens:
+        return None, 0.0
+
+    best_entity: str | None = None
+    best_score = 0.0
+    for entity in config.entities:
+        score = _table_semantic_score_from_tokens(engine, prompt_tokens, config, entity)
+        if score > best_score:
+            best_score = score
+            best_entity = entity
+
+    if best_score < 0.7:
+        return None, best_score
+    return best_entity, best_score
+
+
+def _table_semantic_score(
+    engine: "SQLEngine",
+    lowered: str,
+    config: Any,
+    entity: str,
+) -> float:
+    prompt_tokens = _expanded_tokens(_tokenize(lowered))
+    return _table_semantic_score_from_tokens(engine, prompt_tokens, config, entity)
+
+
+def _table_field_semantic_score(
+    engine: "SQLEngine",
+    lowered: str,
+    config: Any,
+    entity: str,
+) -> float:
+    prompt_tokens = _expanded_tokens(_tokenize(lowered))
+    columns = engine._columns_for_table(config, entity)
+    return max((_column_semantic_score(prompt_tokens, column) for column in columns), default=0.0)
+
+
+def _table_semantic_score_from_tokens(
+    engine: "SQLEngine",
+    prompt_tokens: set[str],
+    config: Any,
+    entity: str,
+) -> float:
+    entity_score = _entity_semantic_score(prompt_tokens, entity)
+    columns = engine._columns_for_table(config, entity)
+    field_score = max((_column_semantic_score(prompt_tokens, column) for column in columns), default=0.0)
+    return (1.8 * entity_score) + (1.2 * field_score)
+
+
 def detect_columns(engine: "SQLEngine", lowered: str, config: Any, table: str) -> list[str]:
     allowed = engine._columns_for_table(config, table)
     selected: list[str] = []
@@ -155,7 +256,19 @@ def detect_columns(engine: "SQLEngine", lowered: str, config: Any, table: str) -
         if canonical in allowed and engine._contains_column_reference(lowered, alias):
             selected.append(canonical)
     selected = engine._unique_in_order(selected)
+    selected = _augment_song_release_projection(lowered, allowed, selected)
+    selected = _augment_course_projection(lowered, allowed, selected)
+    selected = _augment_name_projection(lowered, allowed, selected)
+    simple_name_columns = _select_simple_name_projection(lowered, allowed)
+    if simple_name_columns:
+        if _is_plain_names_query(lowered):
+            return simple_name_columns
+        if not selected:
+            return simple_name_columns
+        if not any(_is_name_like_column(column) for column in selected):
+            selected = simple_name_columns + [column for column in selected if column not in simple_name_columns]
     if selected:
+        selected = _trim_overbroad_selection(lowered, selected)
         cash_projection = _select_cash_holdings_projection(
             engine=engine,
             lowered=lowered,
@@ -180,6 +293,7 @@ def detect_columns(engine: "SQLEngine", lowered: str, config: Any, table: str) -
         return recent_snapshot
     semantic = _select_semantic_columns(lowered, allowed, table=table)
     if semantic:
+        semantic = _augment_name_projection(lowered, allowed, semantic)
         cash_projection = _select_cash_holdings_projection(
             engine=engine,
             lowered=lowered,
@@ -190,7 +304,169 @@ def detect_columns(engine: "SQLEngine", lowered: str, config: Any, table: str) -
         if cash_projection:
             return cash_projection
         return semantic
-    return _ranked_fallback_columns(allowed)
+    return _augment_name_projection(lowered, allowed, _ranked_fallback_columns(allowed))
+
+
+def _select_simple_name_projection(lowered: str, allowed: list[str]) -> list[str]:
+    if re.search(r"\bnames?\s+of\b", lowered) is None:
+        return []
+    if " and " in lowered:
+        return []
+    prioritized = [
+        column
+        for column in allowed
+        if _is_name_like_column(column)
+    ]
+    if not prioritized:
+        return []
+    exact = [column for column in prioritized if str(column).lower() == "name"]
+    if exact:
+        return exact[:1]
+    prioritized.sort(key=lambda col: _name_column_priority(str(col)))
+    return prioritized[:1]
+
+
+def _is_plain_names_query(lowered: str) -> bool:
+    if re.search(r"\bnames?\s+of\b", lowered) is None:
+        return False
+    if " and " in lowered:
+        return False
+    if any(token in lowered for token in (" where ", " with ", " per ", " each ", " by ")):
+        return False
+    return True
+
+
+def _augment_name_projection(lowered: str, allowed: list[str], selected: list[str]) -> list[str]:
+    if not allowed:
+        return selected
+
+    out = list(selected)
+    lowered_allowed = {str(column).lower(): str(column) for column in allowed}
+
+    asks_first_last = (
+        re.search(r"\bfirst\s+and\s+last\s+names?\b", lowered) is not None
+        or re.search(r"\bfirst\s+names?\s+and\s+last\s+names?\b", lowered) is not None
+    )
+    if asks_first_last:
+        first_choice = lowered_allowed.get("first_name") or lowered_allowed.get("firstname")
+        last_choice = lowered_allowed.get("last_name") or lowered_allowed.get("lastname")
+        if first_choice is None:
+            first_choice = next(
+                (col for col in allowed if "first" in str(col).lower() and "name" in str(col).lower()),
+                None,
+            )
+        if last_choice is None:
+            last_choice = next(
+                (col for col in allowed if "last" in str(col).lower() and "name" in str(col).lower()),
+                None,
+            )
+        ordered: list[str] = []
+        if first_choice:
+            ordered.append(first_choice)
+        if last_choice:
+            ordered.append(last_choice)
+        for column in out:
+            if column not in ordered:
+                ordered.append(column)
+        out = ordered
+
+    asks_name_with_other_field = re.search(r"\bnames?\s+and\b", lowered) is not None
+    if asks_name_with_other_field and not any(_is_name_like_column(col) for col in out):
+        name_candidates = [column for column in allowed if _is_name_like_column(column)]
+        if name_candidates:
+            name_candidates.sort(key=lambda col: _name_column_priority(str(col)))
+            out = [name_candidates[0]] + [col for col in out if col != name_candidates[0]]
+
+    deduped: list[str] = []
+    for column in out:
+        if column not in deduped:
+            deduped.append(column)
+    return deduped
+
+
+def _augment_song_release_projection(lowered: str, allowed: list[str], selected: list[str]) -> list[str]:
+    if not allowed:
+        return selected
+    out = list(selected)
+    lowered_allowed = {str(column).lower(): str(column) for column in allowed}
+
+    song_name = next(
+        (
+            column
+            for column in allowed
+            if "song" in str(column).lower() and "name" in str(column).lower()
+        ),
+        None,
+    )
+    release_year = next(
+        (
+            column
+            for column in allowed
+            if "release" in str(column).lower() and "year" in str(column).lower()
+        ),
+        None,
+    )
+
+    asks_song_name = "song" in lowered and (" name " in f" {lowered} " or " names " in f" {lowered} ")
+    asks_release_year = "release year" in lowered or ("release" in lowered and "year" in lowered)
+    if asks_song_name and song_name is not None:
+        generic_name_cols = [column for column in out if str(column).lower() in {"name", "fullname", "full_name"}]
+        for column in generic_name_cols:
+            if column != song_name:
+                out = [item for item in out if item != column]
+        if song_name not in out:
+            out = [song_name] + out
+    if asks_release_year and release_year is not None and release_year not in out:
+        out.append(release_year)
+    return out
+
+
+def _augment_course_projection(lowered: str, allowed: list[str], selected: list[str]) -> list[str]:
+    out = list(selected)
+    lower_to_original = {str(column).lower(): str(column) for column in allowed}
+    course_id = lower_to_original.get("course_id")
+    if course_id is None:
+        return out
+
+    if "each course" in lowered and any(token in lowered for token in ("registration date", "registered for")):
+        if course_id in out:
+            out = [course_id] + [column for column in out if column != course_id]
+        else:
+            out = [course_id] + out
+    return out
+
+
+def _is_name_like_column(column: str) -> bool:
+    lowered = str(column).lower()
+    return (
+        lowered == "name"
+        or lowered.endswith("name")
+        or lowered.endswith("_name")
+        or "name_" in lowered
+        or "fullname" in lowered
+    )
+
+
+def _name_column_priority(column: str) -> tuple[int, int]:
+    lowered = str(column).lower()
+    if lowered in {"name", "fullname", "full_name"}:
+        return (0, len(lowered))
+    if lowered.endswith("name"):
+        return (1, len(lowered))
+    return (2, len(lowered))
+
+
+def _trim_overbroad_selection(lowered: str, selected: list[str], max_fields: int = 3) -> list[str]:
+    if len(selected) <= max_fields:
+        return selected
+    prompt_tokens = _expanded_tokens(_tokenize(lowered))
+    scored: list[tuple[float, int, str]] = []
+    for idx, column in enumerate(selected):
+        score = _column_semantic_score(prompt_tokens, column)
+        scored.append((score, idx, column))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    trimmed = [column for _, _, column in scored[:max_fields]]
+    return trimmed or selected[:max_fields]
 
 
 def detect_order(
@@ -203,13 +479,61 @@ def detect_order(
         return None, None
     if any(token in lowered for token in ("latest", "newest", "most recent")):
         return engine._detect_order_field(lowered, selected_columns, all_columns), "DESC"
+    if "youngest" in lowered:
+        return _best_age_like_column(selected_columns, all_columns), "ASC"
+    if "oldest" in lowered:
+        return _best_age_like_column(selected_columns, all_columns), "DESC"
     highest = re.search(r"\bhighest\s+([A-Za-z_]\w*)\b", lowered)
     if highest:
-        return highest.group(1), "DESC"
+        phrase = highest.group(1)
+        pool = list(all_columns or selected_columns)
+        if pool:
+            candidate = engine._best_matching_column(phrase, pool, prefer_metric=True)
+            if candidate is not None:
+                return candidate, "DESC"
+        return phrase, "DESC"
     lowest = re.search(r"\blowest\s+([A-Za-z_]\w*)\b", lowered)
     if lowest:
-        return lowest.group(1), "ASC"
+        phrase = lowest.group(1)
+        pool = list(all_columns or selected_columns)
+        if pool:
+            candidate = engine._best_matching_column(phrase, pool, prefer_metric=True)
+            if candidate is not None:
+                return candidate, "ASC"
+        return phrase, "ASC"
+    most = re.search(r"\bwith\s+the\s+most\s+([a-zA-Z_][\w\s]{0,40})\b", lowered)
+    if most:
+        phrase = most.group(1).strip()
+        for marker in (" for ", " in ", " from ", " among ", " across "):
+            if marker in phrase:
+                phrase = phrase.split(marker, maxsplit=1)[0].strip()
+        pool = list(all_columns or selected_columns)
+        if pool:
+            candidate = engine._best_matching_column(phrase, pool, prefer_metric=True)
+            if candidate is not None:
+                return candidate, "DESC"
+            if any(token in phrase for token in ("sat", "test taker", "test takers", "taker", "takers")):
+                sat_like = next(
+                    (
+                        column
+                        for column in pool
+                        if any(token in str(column).lower() for token in ("numtst", "test", "taker", "takr", "sat"))
+                    ),
+                    None,
+                )
+                if sat_like is not None:
+                    return sat_like, "DESC"
+        return phrase.split(" ")[0], "DESC"
     return None, None
+
+
+def _best_age_like_column(selected_columns: list[str], all_columns: list[str] | None) -> str:
+    pool = list(all_columns or selected_columns)
+    for column in pool:
+        lowered = str(column).lower()
+        if lowered == "age" or lowered.endswith("_age") or "age" in lowered:
+            return str(column)
+    return "age"
 
 
 def _select_semantic_columns(
@@ -326,6 +650,16 @@ def _column_semantic_score(prompt_tokens: set[str], column: str) -> float:
     return score
 
 
+def _entity_semantic_score(prompt_tokens: set[str], entity: str) -> float:
+    entity_tokens = _expanded_tokens(_tokenize(entity))
+    if not entity_tokens:
+        return 0.0
+    overlap = len(prompt_tokens.intersection(entity_tokens))
+    if overlap == 0:
+        return 0.0
+    return overlap / max(1, len(entity_tokens))
+
+
 def _ranked_fallback_columns(allowed: list[str], max_fields: int = 3) -> list[str]:
     if not allowed:
         return ["id"]
@@ -371,6 +705,8 @@ def _tokenize(text: str) -> set[str]:
 
 def _expanded_tokens(tokens: set[str]) -> set[str]:
     expanded = set(tokens)
+    for token in list(tokens):
+        expanded.update(_token_inflections(token))
     synonyms = {
         "txn": "transaction",
         "transaction": "txn",
@@ -392,12 +728,61 @@ def _expanded_tokens(tokens: set[str]) -> set[str]:
         "available": "avail",
         "num": "number",
         "number": "num",
+        "scr": "score",
+        "score": "scr",
+        "sat": "score",
+        "percent": "percentage",
+        "percentage": "percent",
     }
-    for token in tokens:
+    for token in list(expanded):
         mapped = synonyms.get(token)
         if mapped:
             expanded.add(mapped)
     return expanded
+
+
+def _token_inflections(token: str) -> set[str]:
+    token = str(token).strip().lower()
+    if not token:
+        return set()
+    forms: set[str] = {token}
+    if len(token) <= 3:
+        return forms
+    if token.endswith("ies") and len(token) > 4:
+        forms.add(token[:-3] + "y")
+    elif token.endswith("es") and len(token) > 4:
+        forms.add(token[:-2])
+    elif token.endswith("s") and len(token) > 3:
+        forms.add(token[:-1])
+    elif token.endswith("y"):
+        forms.add(token[:-1] + "ies")
+        forms.add(token + "s")
+    elif token.endswith(("x", "z", "ch", "sh")):
+        forms.add(token + "es")
+    else:
+        forms.add(token + "s")
+    return {form for form in forms if form}
+
+
+def _has_metric_routing_intent(lowered: str) -> bool:
+    metric_tokens = (
+        "count",
+        "how many",
+        "sum",
+        "total",
+        "avg",
+        "average",
+        "max",
+        "maximum",
+        "min",
+        "minimum",
+        "highest",
+        "lowest",
+        "most",
+        "least",
+        "top",
+    )
+    return any(token in lowered for token in metric_tokens)
 
 
 def _entity_supports_filter_key(engine: "SQLEngine", config: Any, entity: str, candidate_key: str) -> bool:

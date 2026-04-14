@@ -1752,6 +1752,7 @@ class GraphQLEngine(QueryEngine):
                 return NormalizedRelation(
                     name=relation.name,
                     target=target_type,
+                    on=relation.on,
                     fields=filtered_fields or intro_fields,
                     args=relation.args,
                     aliases=relation.aliases,
@@ -1763,6 +1764,7 @@ class GraphQLEngine(QueryEngine):
         return NormalizedRelation(
             name=relation_name,
             target=target_type,
+            on="",
             fields=sorted(config.introspection_entity_fields.get(target_type, {"id"})),
             args=[],
         )

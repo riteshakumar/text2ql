@@ -8,6 +8,7 @@ from typing import Any
 class NormalizedRelation:
     name: str
     target: str
+    on: str = ""
     fields: list[str] = field(default_factory=list)
     args: list[str] = field(default_factory=list)
     aliases: list[str] = field(default_factory=list)
@@ -329,6 +330,16 @@ def _accumulate_field_alias_map(
 
 
 def _parse_entity_relations(relation_map: Any) -> dict[str, NormalizedRelation]:
+    if isinstance(relation_map, list):
+        entity_relations: dict[str, NormalizedRelation] = {}
+        for item in relation_map:
+            if not isinstance(item, dict):
+                continue
+            relation_name = item.get("name") or item.get("target")
+            relation = _parse_single_relation(relation_name, item)
+            if relation is not None:
+                entity_relations[str(relation.name)] = relation
+        return entity_relations
     if not isinstance(relation_map, dict):
         return {}
     entity_relations: dict[str, NormalizedRelation] = {}
@@ -344,19 +355,23 @@ def _parse_single_relation(relation_name: Any, relation_spec: Any) -> Normalized
         return None
     if isinstance(relation_spec, dict):
         target = relation_spec.get("target", relation_name)
+        on = relation_spec.get("on", "")
         fields = relation_spec.get("fields", [])
         args = relation_spec.get("args", [])
         aliases = relation_spec.get("aliases", [])
     else:
         target = relation_name
+        on = ""
         fields = []
         args = []
         aliases = []
 
     target_name = target.strip() if isinstance(target, str) and target.strip() else relation_name
+    on_clause = on.strip() if isinstance(on, str) else ""
     return NormalizedRelation(
         name=relation_name,
         target=target_name,
+        on=on_clause,
         fields=[str(v).strip() for v in fields if str(v).strip()],
         args=[str(v).strip() for v in args if str(v).strip()],
         aliases=[str(v).strip() for v in aliases if str(v).strip()],

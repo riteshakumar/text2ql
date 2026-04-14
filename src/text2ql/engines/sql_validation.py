@@ -23,8 +23,9 @@ def validate_components(
 ) -> tuple[str, list[str], dict[str, Any], list["_RelationJoin"], str | None, str | None, list[str]]:
     notes: list[str] = []
     table = engine._resolve_table(table, config, notes)
-    allowed_columns = set(engine._columns_for_table(config, table))
-    columns = [column for column in columns if column in allowed_columns] or list(allowed_columns)[:2] or ["id"]
+    allowed_columns_ordered = engine._columns_for_table(config, table)
+    allowed_columns = set(allowed_columns_ordered)
+    columns = [column for column in columns if column in allowed_columns] or allowed_columns_ordered[:2] or ["id"]
     allowed_filter_keys = engine._allowed_filter_keys(config, table, allowed_columns)
     filters = engine._validate_filters(filters, allowed_filter_keys, notes)
     engine._coerce_filter_values(filters, config, table, notes, known_filter_keys=allowed_filter_keys)

@@ -12,6 +12,7 @@ engine code needs to change.
 
 from __future__ import annotations
 
+import re
 from textwrap import dedent
 from typing import Any
 
@@ -249,9 +250,35 @@ class SQLIRRenderer(IRRenderer):
 
     @staticmethod
     def _render_agg_column(agg: IRAggregation) -> str:
-        field_expr = agg.field if agg.field == "*" else _q(agg.field)
+        raw_field = str(agg.field)
+        if raw_field == "*":
+            field_expr = raw_field
+        elif raw_field.upper().startswith("DISTINCT "):
+            distinct_field = raw_field[len("DISTINCT ") :].strip()
+            field_expr = f"DISTINCT {_q(distinct_field)}"
+        elif re.search(r"\s[+\-*/]\s", raw_field):
+            field_expr = SQLIRRenderer._render_agg_expression(raw_field)
+        else:
+            field_expr = _q(raw_field)
         expr = f"{agg.function}({field_expr})"
         return f"{expr} AS {agg.alias}" if agg.alias else expr
+
+    @staticmethod
+    def _render_agg_expression(expression: str) -> str:
+        pieces = re.split(r"(\+|\-|\*|/)", expression)
+        rendered: list[str] = []
+        for piece in pieces:
+            token = piece.strip()
+            if not token:
+                continue
+            if token in {"+", "-", "*", "/"}:
+                rendered.append(token)
+                continue
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", token):
+                rendered.append(_q(token))
+                continue
+            rendered.append(token)
+        return " ".join(rendered)
 
     def _build_where_parts(
         self,
@@ -296,6 +323,10 @@ class SQLIRRenderer(IRRenderer):
         if f.operator == "eq":
             if f.value is None:
                 return f"{col} IS NULL"
+            if isinstance(f.value, dict) and "$col" in f.value:
+                other = str(f.value.get("$col", "")).strip()
+                if other:
+                    return f"{col} = {_q(alias)}.{_q(other)}"
             return f"{col} = {SQLIRRenderer._sql_literal(f.value)}"
         if f.operator == "ne":
             return f"{col} != {SQLIRRenderer._sql_literal(f.value)}"
@@ -337,6 +368,10 @@ class SQLIRRenderer(IRRenderer):
                 return suffix_condition
         if value is None:
             return f"{_q(alias)}.{_q(key)} IS NULL"
+        if isinstance(value, dict) and "$col" in value:
+            other = str(value.get("$col", "")).strip()
+            if other:
+                return f"{_q(alias)}.{_q(key)} = {_q(alias)}.{_q(other)}"
         return f"{_q(alias)}.{_q(key)} = {SQLIRRenderer._sql_literal(value)}"
 
     def _render_join_parts(
@@ -400,12 +435,25 @@ class SQLIRRenderer(IRRenderer):
 
     @staticmethod
     def _append_group_by(sql: str, table: str, ir: QueryIR, join_select_cols: list[str]) -> str:
-        if not (ir.aggregations and ir.fields):
+        if not ir.aggregations and not ir.having:
             return sql
         group_cols = [f"{_q(table)}.{_q(col)}" for col in ir.fields]
-        if join_select_cols:
-            group_cols += join_select_cols
+        group_cols += [SQLIRRenderer._groupable_select_expression(col) for col in join_select_cols]
+        group_cols = [col for col in group_cols if col]
+        if group_cols:
+            group_cols = list(dict.fromkeys(group_cols))
+        if not group_cols:
+            return sql
         return sql + " GROUP BY " + ", ".join(group_cols)
+
+    @staticmethod
+    def _groupable_select_expression(select_expr: str) -> str:
+        marker = " AS "
+        upper = select_expr.upper()
+        idx = upper.rfind(marker)
+        if idx < 0:
+            return select_expr.strip()
+        return select_expr[:idx].strip()
 
     @staticmethod
     def _append_having(sql: str, ir: QueryIR) -> str:
