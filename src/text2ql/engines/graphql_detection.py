@@ -66,6 +66,11 @@ def detect_fields(
     semantic_fields = engine._resolve_fields_by_semantic_match(lowered, schema_fields)
     if semantic_fields:
         return semantic_fields
+    entity_defaults = config.default_fields_by_entity.get(entity, [])
+    if entity_defaults:
+        defaults = [field for field in entity_defaults if field in schema_fields]
+        if defaults:
+            return defaults
     return config.default_fields or schema_fields[:3]
 
 

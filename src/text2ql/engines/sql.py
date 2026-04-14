@@ -121,7 +121,11 @@ class SQLEngine(QueryEngine):
             config=config,
         )
         joins = self._detect_joins(lowered, table, config)
-        order_by, order_dir = self._detect_order(lowered, columns)
+        order_by, order_dir = self._detect_order(
+            lowered,
+            columns,
+            self._columns_for_table(config, table),
+        )
         limit, offset = self._detect_pagination(lowered)
         aggregations = self._detect_aggregations(lowered)
 
@@ -673,15 +677,55 @@ class SQLEngine(QueryEngine):
     def _strip_outer_parentheses(text: str) -> str:
         return _strip_outer_parentheses(text)
 
-    def _detect_order(self, lowered: str, selected_columns: list[str]) -> tuple[str | None, str | None]:
-        return _detect_order_stage(self, lowered, selected_columns)
+    def _detect_order(
+        self,
+        lowered: str,
+        selected_columns: list[str],
+        all_columns: list[str] | None = None,
+    ) -> tuple[str | None, str | None]:
+        return _detect_order_stage(self, lowered, selected_columns, all_columns)
 
     @staticmethod
-    def _detect_order_field(lowered: str, selected_columns: list[str]) -> str:
-        for candidate in ("createdAt", "updatedAt", "date", "timestamp"):
+    def _detect_order_field(
+        lowered: str,
+        selected_columns: list[str],
+        all_columns: list[str] | None = None,
+    ) -> str:
+        recency_priority = (
+            "createdAt",
+            "updatedAt",
+            "postedDate",
+            "tradedDate",
+            "asOfDateTime",
+            "asOfDate",
+            "lastActionDate",
+            "cycleDateTime",
+            "acctCreationDate",
+            "date",
+            "timestamp",
+        )
+        for candidate in recency_priority:
             if candidate.lower() in lowered:
                 return candidate
-        return (selected_columns[0] if selected_columns else "id")
+
+        pool = list(all_columns or [])
+        lower_to_original = {str(col).lower(): str(col) for col in pool}
+        for candidate in recency_priority:
+            match = lower_to_original.get(candidate.lower())
+            if match is not None:
+                return match
+
+        for col in pool:
+            lowered_col = str(col).lower()
+            if lowered_col.endswith("detail"):
+                continue
+            if any(token in lowered_col for token in ("date", "time", "timestamp", "created", "updated", "posted", "traded")):
+                return str(col)
+
+        for col in selected_columns:
+            if not str(col).lower().endswith("detail"):
+                return str(col)
+        return (selected_columns[0] if selected_columns else (pool[0] if pool else "id"))
 
     def _detect_pagination(self, lowered: str) -> tuple[int | None, int | None]:
         limit = None

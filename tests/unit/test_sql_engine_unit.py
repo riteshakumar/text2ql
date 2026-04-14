@@ -221,6 +221,82 @@ def test_sql_engine_prefers_narrower_entity_on_column_match_tie() -> None:
     assert 'FROM "buyingPowerDetail"' in result.query
 
 
+def test_sql_engine_recent_query_prefers_date_like_order_column() -> None:
+    engine = SQLEngine()
+    request = QueryRequest(
+        text="show my most recent transaction",
+        target="sql",
+        schema={
+            "entities": ["transactions"],
+            "fields": {
+                "transactions": [
+                    "amtDetail",
+                    "catDetail",
+                    "dateDetail",
+                    "postedDate",
+                    "tradedDate",
+                    "quantity",
+                    "symbol",
+                ]
+            },
+            "default_entity": "transactions",
+            "default_fields": ["amtDetail", "catDetail", "dateDetail"],
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert 'ORDER BY "transactions"."postedDate" DESC' in result.query
+    assert "LIMIT 1" in result.query
+
+
+def test_sql_engine_fallback_avoids_detail_container_fields() -> None:
+    engine = SQLEngine()
+    request = QueryRequest(
+        text="show transactions",
+        target="sql",
+        schema={
+            "entities": ["transactions"],
+            "fields": {
+                "transactions": [
+                    "amtDetail",
+                    "catDetail",
+                    "dateDetail",
+                    "quantity",
+                    "symbol",
+                ]
+            },
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert '"transactions"."quantity"' in result.query
+    assert '"transactions"."symbol"' in result.query
+    assert '"transactions"."amtDetail"' not in result.query
+
+
+def test_sql_engine_prefers_schema_default_fields_by_entity_over_semantic_fallback() -> None:
+    engine = SQLEngine()
+    request = QueryRequest(
+        text="show my most recent transaction",
+        target="sql",
+        schema={
+            "entities": ["transactions"],
+            "fields": {
+                "transactions": ["txnTypeCode", "txnDetailType", "quantity", "symbol", "postedDate"]
+            },
+            "default_fields_by_entity": {"transactions": ["quantity", "symbol"]},
+        },
+    )
+
+    result = engine.generate(request)
+
+    assert '"transactions"."quantity"' in result.query
+    assert '"transactions"."symbol"' in result.query
+    assert '"transactions"."txnTypeCode"' not in result.query
+
+
 def test_sql_engine_llm_reconciles_owned_asset_filter_when_missing() -> None:
     class _StubProvider(LLMProvider):
         def complete(self, system_prompt: str, user_prompt: str) -> str:

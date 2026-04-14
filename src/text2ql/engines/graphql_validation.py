@@ -27,7 +27,7 @@ def validate_components(
     validated_fields = engine._validate_fields(
         fields=fields,
         allowed_fields=allowed_fields,
-        default_fields=config.default_fields,
+        default_fields=config.default_fields_by_entity.get(validated_entity, config.default_fields),
         entity=validated_entity,
         notes=notes,
         aggregation_only=not fields and bool(aggregations),

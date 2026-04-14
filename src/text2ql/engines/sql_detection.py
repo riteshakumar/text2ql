@@ -68,18 +68,31 @@ def detect_columns(engine: "SQLEngine", lowered: str, config: Any, table: str) -
     selected = engine._unique_in_order(selected)
     if selected:
         return selected
+    by_entity_defaults = getattr(config, "default_fields_by_entity", {}).get(table, [])
+    if by_entity_defaults:
+        defaults = [field for field in by_entity_defaults if field in allowed]
+        if defaults:
+            return defaults
     if config.default_fields:
         defaults = [field for field in config.default_fields if field in allowed]
         if defaults:
             return defaults
-    return allowed[:3] if allowed else ["id"]
+    semantic = _select_semantic_columns(lowered, allowed)
+    if semantic:
+        return semantic
+    return _ranked_fallback_columns(allowed)
 
 
-def detect_order(engine: "SQLEngine", lowered: str, selected_columns: list[str]) -> tuple[str | None, str | None]:
+def detect_order(
+    engine: "SQLEngine",
+    lowered: str,
+    selected_columns: list[str],
+    all_columns: list[str] | None = None,
+) -> tuple[str | None, str | None]:
     if "latest order" in lowered:
         return None, None
     if any(token in lowered for token in ("latest", "newest", "most recent")):
-        return engine._detect_order_field(lowered, selected_columns), "DESC"
+        return engine._detect_order_field(lowered, selected_columns, all_columns), "DESC"
     highest = re.search(r"\bhighest\s+([A-Za-z_]\w*)\b", lowered)
     if highest:
         return highest.group(1), "DESC"
@@ -87,3 +100,108 @@ def detect_order(engine: "SQLEngine", lowered: str, selected_columns: list[str])
     if lowest:
         return lowest.group(1), "ASC"
     return None, None
+
+
+def _select_semantic_columns(lowered: str, allowed: list[str], max_fields: int = 3) -> list[str]:
+    if not allowed:
+        return []
+    prompt_tokens = _expanded_tokens(_tokenize(lowered))
+    scored: list[tuple[float, int, str]] = []
+    for idx, column in enumerate(allowed):
+        score = _column_semantic_score(prompt_tokens, column)
+        if score <= 0:
+            continue
+        scored.append((score, idx, column))
+    if not scored:
+        return []
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [column for _, _, column in scored[:max_fields]]
+
+
+def _column_semantic_score(prompt_tokens: set[str], column: str) -> float:
+    column_tokens = _expanded_tokens(_tokenize(column))
+    if not column_tokens:
+        return 0.0
+    overlap = len(prompt_tokens.intersection(column_tokens))
+    if overlap == 0:
+        return 0.0
+    score = overlap / max(1, len(column_tokens))
+    if _is_detail_container(column):
+        score -= 0.35
+    if _looks_scalar_column(column):
+        score += 0.05
+    return score
+
+
+def _ranked_fallback_columns(allowed: list[str], max_fields: int = 3) -> list[str]:
+    if not allowed:
+        return ["id"]
+    scored: list[tuple[float, int, str]] = []
+    for idx, column in enumerate(allowed):
+        score = _fallback_column_score(column)
+        scored.append((score, idx, column))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [column for _, _, column in scored[:max_fields]]
+
+
+def _fallback_column_score(column: str) -> float:
+    lowered = str(column).lower()
+    score = 0.0
+    if _is_detail_container(lowered):
+        score -= 2.0
+    if any(token in lowered for token in ("date", "time", "timestamp", "created", "updated", "posted", "traded")):
+        score += 0.9
+    if any(token in lowered for token in ("symbol", "quantity", "amount", "price", "value", "balance", "status")):
+        score += 0.8
+    if lowered in {"id", "name", "title"}:
+        score += 0.7
+    if lowered.endswith(("id", "num", "code")):
+        score += 0.3
+    return score
+
+
+def _is_detail_container(column: str) -> bool:
+    lowered = str(column).lower()
+    return lowered.endswith("detail")
+
+
+def _looks_scalar_column(column: str) -> bool:
+    lowered = str(column).lower()
+    return not lowered.endswith("detail")
+
+
+def _tokenize(text: str) -> set[str]:
+    with_spaces = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(text))
+    with_spaces = with_spaces.replace("_", " ")
+    return {token for token in re.findall(r"[a-z0-9]+", with_spaces.lower()) if token}
+
+
+def _expanded_tokens(tokens: set[str]) -> set[str]:
+    expanded = set(tokens)
+    synonyms = {
+        "txn": "transaction",
+        "transaction": "txn",
+        "acct": "account",
+        "account": "acct",
+        "amt": "amount",
+        "amount": "amt",
+        "qty": "quantity",
+        "quantity": "qty",
+        "desc": "description",
+        "description": "desc",
+        "bal": "balance",
+        "balance": "bal",
+        "mkt": "market",
+        "market": "mkt",
+        "chg": "change",
+        "change": "chg",
+        "avail": "available",
+        "available": "avail",
+        "num": "number",
+        "number": "num",
+    }
+    for token in tokens:
+        mapped = synonyms.get(token)
+        if mapped:
+            expanded.add(mapped)
+    return expanded

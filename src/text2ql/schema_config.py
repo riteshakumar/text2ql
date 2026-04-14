@@ -30,6 +30,7 @@ class NormalizedSchemaConfig:
     introspection_enum_values: dict[str, set[str]] = field(default_factory=dict)
     default_entity: str | None = None
     default_fields: list[str] = field(default_factory=list)
+    default_fields_by_entity: dict[str, list[str]] = field(default_factory=dict)
     #: Domain-specific keyword → entity routing rules.  Each entry is a dict
     #: with a ``"keywords"`` key (str or list[str]) that must all appear in the
     #: lowered query, plus either ``"find_entity_by_name"`` (str) or
@@ -71,6 +72,14 @@ def normalize_schema_config(
     default_fields = schema.get("default_fields")
     if isinstance(default_fields, list):
         config.default_fields = [str(v) for v in default_fields if str(v).strip()]
+    default_fields_by_entity = schema.get("default_fields_by_entity")
+    if isinstance(default_fields_by_entity, dict):
+        for entity, fields in default_fields_by_entity.items():
+            if not isinstance(entity, str) or not isinstance(fields, list):
+                continue
+            normalized = [str(v) for v in fields if str(v).strip()]
+            if normalized:
+                config.default_fields_by_entity[entity] = normalized
 
     keyword_intents = schema.get("keyword_intents")
     if isinstance(keyword_intents, list):
@@ -94,6 +103,7 @@ def infer_schema_from_json_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "args": normalized.args_by_entity,
         "default_entity": normalized.default_entity,
         "default_fields": normalized.default_fields,
+        "default_fields_by_entity": normalized.default_fields_by_entity,
     }
 
 
@@ -593,6 +603,8 @@ def _apply_inferred_defaults(config: NormalizedSchemaConfig) -> None:
         config.default_entity = "accounts" if "accounts" in config.entities else config.entities[0]
     if not config.default_fields and config.default_entity:
         config.default_fields = config.fields_by_entity.get(config.default_entity, [])[:5]
+    if config.default_entity and config.default_fields:
+        config.default_fields_by_entity.setdefault(config.default_entity, list(config.default_fields))
 
 
 def _walk_payload_dict(

@@ -14,6 +14,7 @@ def test_normalize_schema_config_from_structured_schema() -> None:
         ],
         "default_entity": "customers",
         "default_fields": ["id", "email"],
+        "default_fields_by_entity": {"customers": ["id", "email"]},
     }
 
     config = normalize_schema_config(schema)
@@ -23,6 +24,7 @@ def test_normalize_schema_config_from_structured_schema() -> None:
     assert config.field_aliases["mail"] == "email"
     assert config.default_entity == "customers"
     assert config.default_fields == ["id", "email"]
+    assert config.default_fields_by_entity["customers"] == ["id", "email"]
 
 
 def test_normalize_schema_config_merges_mapping_and_value_aliases() -> None:
@@ -104,6 +106,7 @@ def test_infer_schema_from_json_payload_returns_text2ql_shape() -> None:
     assert "fields" in inferred
     assert "args" in inferred
     assert "default_entity" in inferred
+    assert "default_fields_by_entity" in inferred
 
 
 def test_normalize_schema_config_auto_discovers_args_from_fields_when_missing() -> None:
