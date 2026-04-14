@@ -206,7 +206,7 @@ Raw summary:
 
 | Benchmark | Exact | Structural | Execution | Errors |
 |---|---:|---:|---:|---:|
-| Spider (50) | 0.0% | 32.0% | 100.0% | 0/50 |
+| Spider (50) | 0.0% | 40.0% | 100.0% | 0/50 |
 | BIRD (50) | 0.0% | 52.0% | 100.0% | 0/50 |
 
 Reproduce:

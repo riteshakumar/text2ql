@@ -384,17 +384,16 @@ def _parse_where_filters(query: str) -> dict[str, str]:
 
 
 def _parse_filter_condition(condition: str) -> tuple[str, str, str]:
-    parts = re.split(
-        r"\s*(>=|<=|!=|=|>|<|in|not in|is null|is not null)\s*",
+    op_match = re.search(
+        r"\s*(>=|<=|!=|=|>|<|\bnot\s+in\b|\bin\b|\bis\s+not\s+null\b|\bis\s+null\b)\s*",
         condition,
-        maxsplit=1,
         flags=re.I,
     )
-    if len(parts) < 2:
+    if op_match is None:
         return "", "", ""
-    key = _normalize_filter_key(parts[0].strip())
-    op = parts[1].strip().lower()
-    value = parts[2].strip().lower() if len(parts) > 2 else ""
+    key = _normalize_filter_key(condition[: op_match.start()].strip())
+    op = re.sub(r"\s+", " ", op_match.group(1).strip().lower())
+    value = condition[op_match.end() :].strip().lower()
     return key, op, value
 
 

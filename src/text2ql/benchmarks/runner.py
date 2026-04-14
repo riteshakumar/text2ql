@@ -29,7 +29,7 @@ from typing import Any
 
 from text2ql.core import Text2QL
 from text2ql.dataset import DatasetExample
-from text2ql.evaluate import normalize_query, structural_execution_match
+from text2ql.evaluate import structural_execution_match
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,7 @@ class BenchmarkConfig:
     Parameters
     ----------
     mode:
-        Evaluation mode: ``"exact"`` (string match), ``"structural"``
+        Evaluation mode: ``"exact"`` (literal SQL string match), ``"structural"``
         (parsed-signature match), or ``"execution"`` (run against SQLite
         and compare result sets).
     service:
@@ -260,8 +260,8 @@ def _evaluate_one(
 
     gold_sql = example.expected_query.strip()
 
-    # Exact match (normalized whitespace)
-    exact_match = normalize_query(predicted_sql) == normalize_query(gold_sql)
+    # Exact match (literal SQL string match)
+    exact_match = predicted_sql == gold_sql
 
     # Structural match
     if predicted_sql:
