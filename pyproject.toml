@@ -11,7 +11,10 @@ requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [
-  {name = "text2ql contributors"}
+  {name = "Ritesh Kumar"}
+]
+maintainers = [
+  {name = "Ritesh Kumar"}
 ]
 keywords = ["nl2sql", "nl2graphql", "text2query", "llm", "graphql"]
 classifiers = [
