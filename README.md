@@ -1,4 +1,5 @@
 # text2ql
+[![PyPI Downloads](https://static.pepy.tech/personalized-badge/text2ql?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/text2ql)
 
 Natural-language to query-language toolkit for **GraphQL** and **SQL**.
 
