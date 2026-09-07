@@ -25,7 +25,7 @@ ISO_DATE: str = r"\d{4}-\d{2}-\d{2}"
 
 #: Words that are never valid filter values when matched in isolation.
 SPURIOUS_FILTER_VALUES: frozenset[str] = frozenset(
-    {"where", "with", "and", "or", "for", "of", "in", "is"}
+    {"where", "with", "and", "or", "for", "of", "in", "is", "from", "having", "by", "order", "group", "limit", "offset"}
 )
 
 #: Convenience alias so engines can import the AND token from one place.

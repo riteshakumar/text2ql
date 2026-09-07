@@ -134,11 +134,23 @@ def execute_sql_on_json(
     query: str,
     data_payload: dict[str, Any],
     root_key: str = "portfolio_data",
+    *,
+    row_limit: int = 10_000,
+    timeout_seconds: float = 30.0,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Execute *query* against an in-memory SQLite database built from *data_payload*.
 
     Returns ``(rows, error_note)`` where ``error_note`` is ``None`` on success.
     """
+    from text2ql.query_validation import validate_sql
+    from text2ql.sqlite_guard import sqlite_read_guard
+
+    if row_limit <= 0:
+        return [], "SQL execution error: row_limit must be positive."
+    try:
+        validate_sql(query)
+    except ValueError as exc:
+        return [], f"SQL execution error: {exc}"
     root = data_payload.get(root_key, data_payload)
     if not isinstance(root, dict):
         return [], "SQL execution skipped: payload must be a JSON object."
@@ -158,9 +170,13 @@ def execute_sql_on_json(
             columns = sorted({str(key) for row in flat_rows for key in row.keys()})
             if not columns:
                 continue
+            definitions = [
+                f"{_quote_ident(col)} {_sqlite_column_type([row.get(col) for row in flat_rows])}"
+                for col in columns
+            ]
             conn.execute(
                 f"CREATE TABLE {_quote_ident(table_name)} "
-                f"({', '.join(f'{_quote_ident(col)} TEXT' for col in columns)});"
+                f"({', '.join(definitions)});"
             )
             insert_sql = (
                 f"INSERT INTO {_quote_ident(table_name)} "
@@ -173,12 +189,25 @@ def execute_sql_on_json(
 
         if created_tables == 0:
             return [], "SQL execution skipped: no usable tables were created."
-        cursor = conn.execute(query)
-        return [dict(row) for row in cursor.fetchall()], None
-    except sqlite3.Error as exc:
+        with sqlite_read_guard(conn, timeout_seconds):
+            cursor = conn.execute(query)
+            try:
+                return [dict(row) for row in cursor.fetchmany(row_limit)], None
+            finally:
+                cursor.close()
+    except (sqlite3.Error, ValueError) as exc:
         return [], f"SQL execution error: {exc}"
     finally:
         conn.close()
+
+
+def _sqlite_column_type(values: list[Any]) -> str:
+    present = [value for value in values if value is not None]
+    if present and all(isinstance(value, (bool, int)) for value in present):
+        return "INTEGER"
+    if present and all(isinstance(value, (bool, int, float)) for value in present):
+        return "REAL"
+    return "TEXT"
 
 
 def _flatten_row_for_sql(row: dict[str, Any]) -> dict[str, Any]:

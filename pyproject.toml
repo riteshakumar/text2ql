@@ -23,7 +23,10 @@ classifiers = [
   "Intended Audience :: Developers",
   "Topic :: Software Development :: Libraries"
 ]
-dependencies = []
+dependencies = [
+  "sqlglot>=30.18,<31",
+  "graphql-core>=3.2.12,<3.3",
+]
 
 [project.urls]
 Homepage = "https://github.com/riteshakumar/text2ql"

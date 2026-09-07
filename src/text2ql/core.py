@@ -19,12 +19,13 @@ class Text2QL:
     """Main service facade for text-to-query conversion."""
 
     provider: LLMProvider = field(default_factory=RuleBasedProvider)
+    strict_validation: bool = True
     _engines: dict[str, Any] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._engines = {
-            "graphql": GraphQLEngine(provider=self.provider),
-            "sql": SQLEngine(provider=self.provider),
+            "graphql": GraphQLEngine(provider=self.provider, strict_validation=self.strict_validation),
+            "sql": SQLEngine(provider=self.provider, strict_validation=self.strict_validation),
         }
 
     def register_engine(self, name: str, engine: object) -> None:
@@ -89,6 +90,8 @@ class Text2QL:
         ``concurrency`` caps simultaneous in-flight requests — use a lower value
         when hitting rate-limited LLM providers.
         """
+        if concurrency < 1:
+            raise ValueError("concurrency must be at least 1")
         sem = asyncio.Semaphore(concurrency)
 
         async def _one(kw: dict[str, Any]) -> QueryResult:

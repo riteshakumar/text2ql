@@ -148,9 +148,11 @@ def _default_api_key() -> str:
 
 
 def _build_service(mode: str, llm_model: str, api_key: str) -> Any:
-    if mode != "llm":
+    if mode not in {"llm", "function_calling"}:
         return Text2QL()
-    return Text2QL(provider=OpenAICompatibleProvider(api_key=api_key or None, model=llm_model))
+    return Text2QL(provider=OpenAICompatibleProvider(
+        api_key=api_key or None, model=llm_model, use_structured_output=(mode == "function_calling"),
+    ))
 
 
 def _build_prompts(
@@ -203,16 +205,16 @@ def _build_prompts(
 def main() -> None:
     st.set_page_config(page_title="text2ql Playground", layout="wide")
     st.title("text2ql Playground")
-    st.caption("v0.2.0 · GraphQL and SQL query generation from natural language · deterministic or LLM mode")
+    st.caption("GraphQL and SQL query generation from natural language")
 
     with st.sidebar:
         st.header("Settings")
         target = st.selectbox("Target", options=["graphql", "sql"], index=0)
-        mode = st.selectbox("Mode", options=["deterministic", "llm"], index=0)
+        mode = st.selectbox("Mode", options=["deterministic", "function_calling", "llm"], index=0)
         llm_model = st.text_input("LLM Model", value="gpt-4o-mini")
         api_key_input = st.text_input(
             "OpenAI API Key",
-            value=_default_api_key(),
+            value="",
             type="password",
             help="Optional. Uses this key first, then Streamlit Secrets/env vars.",
         )
@@ -298,13 +300,13 @@ def main() -> None:
         )
 
         api_key = (api_key_input or "").strip() or _default_api_key()
-        if (mode == "llm" or llm_rewrite) and not api_key:
+        if (mode in {"llm", "function_calling"} or llm_rewrite) and not api_key:
             st.warning(
                 "LLM mode or LLM rewrite selected but no API key found. Set OpenAI API Key in sidebar "
                 "or configure OPENAI_API_KEY/TEXT2QL_API_KEY in Streamlit Secrets."
             )
 
-        service = _build_service(mode, llm_model, api_key=(api_key_input or "").strip())
+        service = _build_service(mode, llm_model, api_key=api_key)
         rewrite_provider = None
         if llm_rewrite and api_key:
             rewrite_provider = OpenAICompatibleProvider(api_key=api_key, model=llm_model)
@@ -335,17 +337,21 @@ def main() -> None:
                     provider=rewrite_provider,
                     system_context=system_context,
                 )
-            result = service.generate(
-                text=rewritten_prompt,
-                target=target,
-                schema=inferred_schema,
-                mapping=mapping,
-                context={
-                    "mode": mode,
-                    "language": "english",
-                    "system_context": system_context,
-                },
-            )
+            try:
+                result = service.generate(
+                    text=rewritten_prompt,
+                    target=target,
+                    schema=inferred_schema,
+                    mapping=mapping,
+                    context={
+                        "mode": mode,
+                        "language": "english",
+                        "system_context": system_context,
+                    },
+                )
+            except ValueError as exc:
+                st.error(f"Could not generate a valid query for {active_prompt!r}: {exc}")
+                continue
             gen_elapsed = time.perf_counter() - gen_start
             total_elapsed = time.perf_counter() - started
 
@@ -356,6 +362,7 @@ def main() -> None:
                 "rewrite_meta": rewrite_meta,
                 "query": result.query,
                 "confidence": result.confidence,
+                "status": result.status,
                 "explanation": result.explanation,
                 "metadata": result.metadata,
                 "timing_ms": {
@@ -371,7 +378,7 @@ def main() -> None:
                 rewrite_meta=rewrite_meta if (llm_rewrite and rewrite_provider is not None) else None,
             )
 
-            if target == "graphql" and execute_on_payload:
+            if target == "graphql" and execute_on_payload and result.executable:
                 exec_start = time.perf_counter()
                 rows, note = execute_query_result_on_json(result, data_payload, root_key="portfolio_data")
                 exec_elapsed = time.perf_counter() - exec_start
@@ -396,9 +403,9 @@ def main() -> None:
                     else:
                         row["execution_match"] = _stable_json(rows) == _stable_json(expected_rows)
 
-            if target == "sql" and execute_on_payload and expected_query.strip():
+            if target == "sql" and execute_on_payload and result.executable and expected_query.strip():
                 row["sql_signature_match"] = sql_execution_match(result.query, expected_query.strip())
-            if target == "sql" and execute_on_payload:
+            if target == "sql" and execute_on_payload and result.executable:
                 exec_start = time.perf_counter()
                 sql_rows, sql_note = _execute_sql_on_json(result.query, data_payload, root_key="portfolio_data")
                 exec_elapsed = time.perf_counter() - exec_start
@@ -412,7 +419,7 @@ def main() -> None:
         for row in results:
             synth = row.get("synthetic", {})
             conf = row.get("confidence")
-            conf_str = f"{conf:.4f}" if isinstance(conf, float) else "—"
+            conf_str = f"{conf:.4f}" if isinstance(conf, float) and row["metadata"].get("confidence_kind") == "heuristic" else "unavailable"
             synth_score = synth.get("synthetic_rewrite_score")
             score_str = f"{synth_score:.2f}" if isinstance(synth_score, float) else "—"
             novelty = synth.get("synthetic_rewrite_novelty")
@@ -422,7 +429,7 @@ def main() -> None:
             with st.expander(f"Variant {row['idx']}: {row['prompt']}", expanded=(row["idx"] == 1)):
                 # Confidence · synthetic · timing — all on one line at a glance.
                 st.caption(
-                    f"confidence={conf_str}  ·  "
+                    f"status={row['status']}  ·  heuristic score={conf_str}  ·  "
                     f"synth_score={score_str}  ·  novelty={novelty_str}  ·  source={source}  ·  "
                     f"generate={row['timing_ms'].get('generate', 0):.1f}ms  ·  "
                     f"execute={row['timing_ms'].get('execute', 0):.1f}ms"

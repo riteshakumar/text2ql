@@ -13,6 +13,16 @@ from .base import LLMProvider
 logger = logging.getLogger(__name__)
 
 
+class Completion(str):
+    """A completion with per-call provenance, safe for concurrent requests."""
+
+    def __new__(cls, value: str, *, structured: bool, fallback_reason: str | None = None):
+        result = super().__new__(cls, value)
+        result.structured = structured
+        result.fallback_reason = fallback_reason
+        return result
+
+
 class OpenAICompatibleProvider(LLMProvider):
     """Minimal OpenAI-compatible chat completions adapter.
 
@@ -34,7 +44,10 @@ class OpenAICompatibleProvider(LLMProvider):
         When ``True``, :meth:`complete_structured` sends the JSON schema via
         ``response_format: {"type": "json_schema", ...}`` (requires a model
         that supports the Structured Outputs feature, e.g. ``gpt-4o-2024-08-06``
-        or later).  Falls back to plain ``complete()`` for unsupported models.
+        or later). Unsupported endpoints fail unless fallback is explicitly enabled.
+    allow_structured_fallback:
+        Opt in to a plain completion after a native structured request fails.
+        The returned completion records the fallback reason.
     """
 
     def __init__(
@@ -46,6 +59,7 @@ class OpenAICompatibleProvider(LLMProvider):
         max_retries: int = 2,
         retry_backoff_seconds: float = 1.5,
         use_structured_output: bool = False,
+        allow_structured_fallback: bool = False,
     ) -> None:
         self.api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("TEXT2QL_API_KEY")
         if not self.api_key:
@@ -56,6 +70,9 @@ class OpenAICompatibleProvider(LLMProvider):
         self.max_retries = max_retries
         self.retry_backoff_seconds = retry_backoff_seconds
         self.use_structured_output = use_structured_output
+        self.allow_structured_fallback = allow_structured_fallback
+        if timeout_seconds <= 0 or max_retries < 0 or retry_backoff_seconds < 0:
+            raise ValueError("Timeout must be positive; retries and backoff must be non-negative")
         logger.debug(
             "OpenAICompatibleProvider initialised: model=%s base_url=%s "
             "use_structured_output=%s",
@@ -122,6 +139,10 @@ class OpenAICompatibleProvider(LLMProvider):
         choices = decoded.get("choices", [])
         if not choices:
             raise RuntimeError("LLM provider returned no choices")
+        if choices[0].get("message", {}).get("refusal"):
+            raise RuntimeError("LLM provider refused the request")
+        if choices[0].get("finish_reason") in {"length", "content_filter"}:
+            raise RuntimeError("LLM provider did not return a complete response")
         content = choices[0].get("message", {}).get("content", "")
         if not isinstance(content, str):
             raise RuntimeError("LLM provider returned invalid content payload")
@@ -144,9 +165,9 @@ class OpenAICompatibleProvider(LLMProvider):
         ``response_format: json_schema`` so the model is forced to emit valid
         JSON matching the schema.
 
-        When ``False`` (or when the model doesn't support the feature), falls
-        back to a plain :meth:`complete` call and lets the downstream
-        constrained parser validate the output.
+        When ``False``, uses a plain :meth:`complete` call and lets the
+        constrained parser validate the output. Native request errors propagate
+        unless ``allow_structured_fallback=True``.
         """
         if not self.use_structured_output:
             logger.debug(
@@ -154,7 +175,8 @@ class OpenAICompatibleProvider(LLMProvider):
                 "using plain complete() for model=%s",
                 self.model,
             )
-            return self.complete(system_prompt, user_prompt)
+            return Completion(self.complete(system_prompt, user_prompt), structured=False,
+                              fallback_reason="native_structured_output_disabled")
 
         logger.debug(
             "complete_structured(): using json_schema response_format for model=%s",
@@ -163,8 +185,10 @@ class OpenAICompatibleProvider(LLMProvider):
         try:
             request = self._build_structured_request(system_prompt, user_prompt, json_schema)
             raw = self._request_with_retries(request)
-            return self._parse_response(raw)
+            return Completion(self._parse_response(raw), structured=True)
         except (RuntimeError, urllib.error.HTTPError) as exc:
+            if not self.allow_structured_fallback:
+                raise
             # Structured output may not be supported by the model/endpoint.
             # Fall back to plain completion and let the parser handle it.
             logger.warning(
@@ -172,7 +196,13 @@ class OpenAICompatibleProvider(LLMProvider):
                 "falling back to plain complete()",
                 exc,
             )
-            return self.complete(system_prompt, user_prompt)
+            return Completion(self.complete(system_prompt, user_prompt), structured=False,
+                              fallback_reason=str(exc))
+
+    def _read_response(self, request: urllib.request.Request) -> str:
+        # Opening, reading and closing all belong in the worker thread.
+        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+            return response.read().decode("utf-8")
 
     async def _aretry_request(self, request: urllib.request.Request) -> str:
         """Execute an HTTP request asynchronously with retry/backoff logic.
@@ -186,13 +216,10 @@ class OpenAICompatibleProvider(LLMProvider):
 
         for attempt in range(attempts):
             try:
-                raw = await asyncio.to_thread(
-                    urllib.request.urlopen, request, self.timeout_seconds
-                )
-                return raw.read().decode("utf-8")
+                return await asyncio.to_thread(self._read_response, request)
             except urllib.error.HTTPError as exc:
                 last_error = exc
-                if exc.code != 429 or attempt == attempts - 1:
+                if exc.code not in {429, 500, 502, 503, 504} or attempt == attempts - 1:
                     logger.warning(
                         "_aretry_request(): HTTP %d on attempt %d/%d",
                         exc.code,
@@ -203,14 +230,14 @@ class OpenAICompatibleProvider(LLMProvider):
                 retry_after = exc.headers.get("Retry-After")
                 delay = self._retry_delay(attempt, retry_after)
                 logger.warning(
-                    "_aretry_request(): rate-limited (429) on attempt %d/%d; "
+                    "_aretry_request(): transient HTTP error on attempt %d/%d; "
                     "retrying in %.1fs",
                     attempt + 1,
                     attempts,
                     delay,
                 )
                 await asyncio.sleep(delay)
-            except urllib.error.URLError as exc:
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 last_error = exc
                 if attempt == attempts - 1:
                     logger.error(
@@ -246,7 +273,8 @@ class OpenAICompatibleProvider(LLMProvider):
     ) -> str:
         """Async variant of :meth:`complete_structured`."""
         if not self.use_structured_output:
-            return await self.acomplete(system_prompt, user_prompt)
+            return Completion(await self.acomplete(system_prompt, user_prompt), structured=False,
+                              fallback_reason="native_structured_output_disabled")
 
         logger.debug(
             "acomplete_structured(): using json_schema response_format for model=%s",
@@ -255,12 +283,15 @@ class OpenAICompatibleProvider(LLMProvider):
         try:
             request = self._build_structured_request(system_prompt, user_prompt, json_schema)
             raw = await self._aretry_request(request)
-            return self._parse_response(raw)
+            return Completion(self._parse_response(raw), structured=True)
         except (RuntimeError, urllib.error.URLError) as exc:
+            if not self.allow_structured_fallback:
+                raise
             logger.warning(
                 "acomplete_structured(): falling back to plain acomplete(): %s", exc
             )
-            return await self.acomplete(system_prompt, user_prompt)
+            return Completion(await self.acomplete(system_prompt, user_prompt), structured=False,
+                              fallback_reason=str(exc))
 
     def _request_with_retries(self, request: urllib.request.Request) -> str:
         attempts = self.max_retries + 1
@@ -268,11 +299,10 @@ class OpenAICompatibleProvider(LLMProvider):
 
         for attempt in range(attempts):
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                    return response.read().decode("utf-8")
+                return self._read_response(request)
             except urllib.error.HTTPError as exc:
                 last_error = exc
-                if exc.code != 429 or attempt == attempts - 1:
+                if exc.code not in {429, 500, 502, 503, 504} or attempt == attempts - 1:
                     logger.warning(
                         "_request_with_retries(): HTTP %d on attempt %d/%d",
                         exc.code,
@@ -283,14 +313,14 @@ class OpenAICompatibleProvider(LLMProvider):
                 retry_after = exc.headers.get("Retry-After")
                 delay = self._retry_delay(attempt, retry_after)
                 logger.warning(
-                    "_request_with_retries(): rate-limited (429) on attempt %d/%d; "
+                    "_request_with_retries(): transient HTTP error on attempt %d/%d; "
                     "retrying in %.1fs",
                     attempt + 1,
                     attempts,
                     delay,
                 )
                 time.sleep(delay)
-            except urllib.error.URLError as exc:
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 last_error = exc
                 if attempt == attempts - 1:
                     logger.error(

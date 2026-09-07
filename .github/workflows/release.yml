@@ -18,9 +18,14 @@ permissions:
   contents: read
 
 jobs:
+  test:
+    name: Validate Release Commit
+    uses: ./.github/workflows/tests.yml
+
   build:
     name: Build Distribution
     runs-on: ubuntu-latest
+    needs: test
 
     steps:
       - name: Checkout

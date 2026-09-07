@@ -33,6 +33,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("text", nargs="?", default="", help="Natural language request")
     parser.add_argument("--version", action="store_true", help="Print version and exit")
     parser.add_argument("--target", default="graphql", help="Target query language")
+    parser.add_argument("--dialect", choices=["sqlite", "postgres", "mysql", "tsql"], default="sqlite")
+    parser.add_argument("--allow-llm-fallback", action="store_true",
+                        help="Explicitly allow deterministic generation after an LLM failure.")
     parser.add_argument(
         "--mode",
         default="deterministic",
@@ -530,6 +533,8 @@ def _generate_result_payloads(
                 "mode": args.mode,
                 "language": args.language,
                 "system_context": args.system_context,
+                "dialect": args.dialect,
+                "allow_llm_fallback": args.allow_llm_fallback,
             },
         )
         dynamic_meta = dynamic_synthetic_meta(
@@ -593,6 +598,8 @@ def _build_generation_payload(
         "rewrite": rewrite_meta,
         "query": result.query,
         "confidence": result.confidence,
+        "confidence_kind": result.metadata.get("confidence_kind", "unavailable"),
+        "status": result.status,
         "explanation": result.explanation,
         "synthetic": dynamic_meta,
         "metadata": dynamic_meta,
@@ -621,6 +628,10 @@ def _apply_execution_evaluation(
     expected_query: str,
     expected_execution: Any,
 ) -> None:
+    if not result.executable:
+        payload["execution_note"] = f"Execution skipped ({result.status}): {result.explanation}"
+        payload["execution_match"] = False
+        return
     if execution_data_payload is None:
         payload["execution_eval_warning"] = "execution evaluation requires --data-file JSON payload"
         return
@@ -630,6 +641,9 @@ def _apply_execution_evaluation(
         rows, note = execute_query_result_on_json(result, execution_data_payload, root_key="portfolio_data")
     payload["execution_rows"] = rows
     payload["execution_note"] = note
+    if note:
+        payload["execution_match"] = False
+        return
 
     expected_rows = expected_execution
     expected_note = None

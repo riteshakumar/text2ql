@@ -20,6 +20,7 @@ def validate_components(
     aggregations: list[dict[str, str]],
     nested: list[dict[str, Any]],
     config: "NormalizedSchemaConfig",
+    coerce_values: bool = True,
 ) -> tuple[str, list[str], dict[str, Any], list[dict[str, str]], list[dict[str, Any]], list[str]]:
     notes: list[str] = []
     validated_entity = engine._resolve_entity_for_schema(entity, config, notes)
@@ -39,6 +40,7 @@ def validate_components(
         entity=validated_entity,
         config=config,
         notes=notes,
+        coerce_values=coerce_values,
     )
 
     # Contradiction detection — same field with conflicting plain-equality values
@@ -67,6 +69,8 @@ def validate_components(
         config=config,
         notes=notes,
     )
+    if engine.strict_validation and notes:
+        raise ValidationError("GraphQL components failed validation", notes)
 
     return (
         validated_entity,

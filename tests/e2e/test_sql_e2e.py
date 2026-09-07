@@ -20,13 +20,14 @@ def test_sql_join_e2e() -> None:
         schema={
             "entities": ["orders", "customers"],
             "fields": {
-                "orders": ["id", "status", "total"],
+                "orders": ["id", "status", "total", "customerId"],
                 "customers": ["id", "name", "email"],
             },
             "relations": {
                 "orders": {
                     "customers": {
                         "target": "customers",
+                        "on": "orders.customerId = customers.id",
                         "fields": ["name", "email"],
                     }
                 }

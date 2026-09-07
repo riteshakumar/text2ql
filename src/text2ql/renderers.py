@@ -13,6 +13,7 @@ engine code needs to change.
 from __future__ import annotations
 
 import re
+import json
 from textwrap import dedent
 from typing import Any
 
@@ -27,7 +28,7 @@ AND_SEPARATOR = " AND "
 
 def _q(name: str) -> str:
     """Wrap *name* in double-quotes so it is safe to use as a SQL identifier."""
-    return f'"{name}"'
+    return '"' + str(name).replace('"', '""') + '"'
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +71,13 @@ class GraphQLIRRenderer(IRRenderer):
     def render(self, ir: QueryIR) -> str:
         """Produce a GraphQL query string from *ir*."""
         extra_group: dict[str, Any] = {}
+        if ir.limit is not None:
+            extra_group["limit"] = ir.limit
+        if ir.offset is not None:
+            extra_group["offset"] = ir.offset
+        if ir.order_by:
+            extra_group["orderBy"] = ir.order_by
+            extra_group["orderDirection"] = (ir.order_dir or "ASC").lower()
         if ir.distinct:
             extra_group["distinct"] = True
         if ir.having:
@@ -141,9 +149,8 @@ class GraphQLIRRenderer(IRRenderer):
     @staticmethod
     def _render_aggregation(agg: IRAggregation) -> str:
         fn = agg.function.lower()
-        if fn == "count":
-            return "count"
-        return f'{fn}(field: "{agg.field}")'
+        expression = "count" if fn == "count" else f'{fn}(field: {json.dumps(agg.field)})'
+        return f"{agg.alias}: {expression}" if agg.alias else expression
 
     def _render_nested(self, nested: IRNested | dict[str, Any], indent: int) -> str:
         """Recursively render a nested selection node.
@@ -158,13 +165,15 @@ class GraphQLIRRenderer(IRRenderer):
             raw_filters = nested.get("filters", {})
             if isinstance(raw_filters, dict):
                 from text2ql.ir import _split_filters  # local import avoids cycle
-                node_filters, _ = _split_filters(raw_filters)
-            node_args = self._build_args(node_filters, {})
+                node_filters, groups = _split_filters(raw_filters)
+            else:
+                groups = {}
+            node_args = self._build_args(node_filters, groups)
             field_lines: list[str] = list(nested.get("fields", ["id"]))
             child_nodes: list[dict[str, Any]] = nested.get("nested", [])
         else:
             relation = nested.relation
-            node_args = self._build_args(nested.filters, {})
+            node_args = self._build_args(nested.filters, nested.group_filters)
             field_lines = list(nested.fields) or ["id"]
             child_nodes = list(nested.children)
 
@@ -186,8 +195,7 @@ class GraphQLIRRenderer(IRRenderer):
         if isinstance(value, (int, float)):
             return str(value)
         if isinstance(value, str):
-            escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-            return f'"{escaped}"'
+            return json.dumps(value, ensure_ascii=True)
         if isinstance(value, list):
             return "[" + ", ".join(GraphQLIRRenderer._format_arg(item) for item in value) + "]"
         if isinstance(value, dict):
@@ -234,6 +242,10 @@ class SQLIRRenderer(IRRenderer):
         # GROUP BY orders.status;
     """
 
+    def __init__(self, dialect: str = "sqlite") -> None:
+        from text2ql.query_validation import sql_dialect
+        self.dialect = sql_dialect(dialect)
+
     def render(self, ir: QueryIR) -> str:
         """Produce a SQL SELECT statement from *ir*."""
         context = self._build_render_context(ir)
@@ -242,7 +254,31 @@ class SQLIRRenderer(IRRenderer):
         sql = self._append_group_by(sql, context["table"], ir, context["join_select_cols"])
         sql = self._append_having(sql, ir)
         sql = self._append_order_limit_offset(sql, context["table"], ir)
+        if self.dialect != "sqlite":
+            from sqlglot import exp, parse_one
+            from sqlglot.errors import ErrorLevel
+            tree = parse_one(sql, read="sqlite")
+            if ir.limit is None and ir.offset is not None:
+                # SQLite's unlimited sentinel is not portable.
+                tree.set("limit", exp.Limit(expression=exp.Literal.number(18446744073709551615))
+                         if self.dialect == "mysql" else None)
+            sql = tree.sql(dialect=self.dialect, unsupported_level=ErrorLevel.RAISE)
         return sql + ";"
+
+    def render_parameterized(self, ir: QueryIR) -> tuple[str, dict[str, Any]]:
+        """Render named SQLAlchemy binds without interpolating user values."""
+        from sqlglot import exp
+        from text2ql.query_validation import sqlalchemy_sql, validate_sql
+        tree = validate_sql(self.render(ir), dialect=self.dialect)
+        parameters: dict[str, Any] = {}
+        for literal in list(tree.find_all(exp.Literal)):
+            # Dialects generally require literal pagination values.
+            if isinstance(literal.parent, (exp.Limit, exp.Offset)):
+                continue
+            name = f"p{len(parameters)}"
+            parameters[name] = literal.to_py()
+            literal.replace(exp.Placeholder(this=name))
+        return sqlalchemy_sql(tree, self.dialect) + ";", parameters
 
     # ------------------------------------------------------------------
     # Helpers
@@ -261,24 +297,23 @@ class SQLIRRenderer(IRRenderer):
         else:
             field_expr = _q(raw_field)
         expr = f"{agg.function}({field_expr})"
-        return f"{expr} AS {agg.alias}" if agg.alias else expr
+        if agg.alias and re.fullmatch(r"[A-Za-z_]\w*", agg.alias):
+            return f"{expr} AS {agg.alias}"
+        return f"{expr} AS {_q(agg.alias)}" if agg.alias else expr
 
     @staticmethod
     def _render_agg_expression(expression: str) -> str:
-        pieces = re.split(r"(\+|\-|\*|/)", expression)
-        rendered: list[str] = []
-        for piece in pieces:
-            token = piece.strip()
-            if not token:
-                continue
-            if token in {"+", "-", "*", "/"}:
-                rendered.append(token)
-                continue
-            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", token):
-                rendered.append(_q(token))
-                continue
-            rendered.append(token)
-        return " ".join(rendered)
+        from sqlglot import exp, parse_one
+        from sqlglot.errors import ParseError
+        try:
+            tree = parse_one(expression, read="sqlite")
+        except ParseError as exc:
+            raise ValueError("Invalid aggregate arithmetic expression") from exc
+        allowed = (exp.Column, exp.Identifier, exp.Literal, exp.Paren, exp.Add, exp.Sub, exp.Mul, exp.Div, exp.Neg)
+        if any(not isinstance(node, allowed) or (isinstance(node, exp.Literal) and node.is_string)
+               for node in tree.walk()):
+            raise ValueError("Aggregate expressions support only columns and numeric arithmetic")
+        return tree.sql(dialect="sqlite", identify=True, comments=False)
 
     def _build_where_parts(
         self,
@@ -329,6 +364,8 @@ class SQLIRRenderer(IRRenderer):
                     return f"{col} = {_q(alias)}.{_q(other)}"
             return f"{col} = {SQLIRRenderer._sql_literal(f.value)}"
         if f.operator == "ne":
+            if f.value is None:
+                return f"{col} IS NOT NULL"
             return f"{col} != {SQLIRRenderer._sql_literal(f.value)}"
         if f.operator == "gt":
             return f"{col} > {SQLIRRenderer._sql_literal(f.value)}"
@@ -340,9 +377,13 @@ class SQLIRRenderer(IRRenderer):
             return f"{col} <= {SQLIRRenderer._sql_literal(f.value)}"
         if f.operator == "in":
             vals = f.value if isinstance(f.value, list) else [f.value]
+            if not vals:
+                return "1 = 0"
             return f"{col} IN ({', '.join(SQLIRRenderer._sql_literal(v) for v in vals)})"
         if f.operator == "nin":
             vals = f.value if isinstance(f.value, list) else [f.value]
+            if not vals:
+                return "1 = 1"
             return f"{col} NOT IN ({', '.join(SQLIRRenderer._sql_literal(v) for v in vals)})"
         if f.operator == "is_null":
             return f"{col} IS NULL"
@@ -383,11 +424,12 @@ class SQLIRRenderer(IRRenderer):
         join_where_parts: list[str] = []
         join_select_cols: list[str] = []
         for join in ir.joins:
+            alias = join.alias or join.target
             join_clauses.append(
-                f"{join.join_type} JOIN {_q(join.target)} {_q(join.target)} ON {join.on_left} = {join.on_right}"
+                f"{join.join_type} JOIN {_q(join.target)} {_q(alias)} ON {join.on_left} = {join.on_right}"
             )
-            join_select_cols.extend(f"{_q(join.target)}.{_q(f)} AS {join.target}_{f}" for f in join.fields)
-            join_where_parts.extend(self._build_where_parts(join.filters, {}, join.target, exact_keys))
+            join_select_cols.extend(f"{_q(alias)}.{_q(f)} AS {_q(alias + '_' + f)}" for f in join.fields)
+            join_where_parts.extend(self._build_where_parts(join.filters, join.group_filters, alias, exact_keys))
         return join_clauses, join_where_parts, join_select_cols
 
     def _build_render_context(self, ir: QueryIR) -> dict[str, Any]:
@@ -435,10 +477,11 @@ class SQLIRRenderer(IRRenderer):
 
     @staticmethod
     def _append_group_by(sql: str, table: str, ir: QueryIR, join_select_cols: list[str]) -> str:
-        if not ir.aggregations and not ir.having:
+        if not ir.aggregations and not ir.having and not ir.group_by:
             return sql
-        group_cols = [f"{_q(table)}.{_q(col)}" for col in ir.fields]
-        group_cols += [SQLIRRenderer._groupable_select_expression(col) for col in join_select_cols]
+        group_cols = [f"{_q(table)}.{_q(col)}" for col in (ir.fields if ir.group_by is None else ir.group_by)]
+        if ir.group_by is None:
+            group_cols += [SQLIRRenderer._groupable_select_expression(col) for col in join_select_cols]
         group_cols = [col for col in group_cols if col]
         if group_cols:
             group_cols = list(dict.fromkeys(group_cols))
@@ -468,11 +511,15 @@ class SQLIRRenderer(IRRenderer):
     @staticmethod
     def _append_order_limit_offset(sql: str, table: str, ir: QueryIR) -> str:
         out = sql
-        if ir.order_by and ir.order_dir:
+        if ir.sort_by:
+            out += " ORDER BY " + ", ".join(f"{_q(table)}.{_q(item.field)} {item.direction}" for item in ir.sort_by)
+        elif ir.order_by and ir.order_dir:
             out += f" ORDER BY {_q(table)}.{_q(ir.order_by)} {ir.order_dir}"
         if ir.limit is not None:
             out += f" LIMIT {ir.limit}"
         if ir.offset is not None:
+            if ir.limit is None:
+                out += " LIMIT -1"
             out += f" OFFSET {ir.offset}"
         return out
 
@@ -498,14 +545,20 @@ class SQLIRRenderer(IRRenderer):
         for suffix, op in mapping.items():
             if key.endswith(suffix):
                 col = key[: -len(suffix)]
+                if value is None and op == "!=":
+                    return f"{_q(alias)}.{_q(col)} IS NOT NULL"
                 return f"{_q(alias)}.{_q(col)} {op} {SQLIRRenderer._sql_literal(value)}"
         if key.endswith("_in"):
             col = key[:-3]
             vals = value if isinstance(value, list) else [value]
+            if not vals:
+                return "1 = 0"
             return f"{_q(alias)}.{_q(col)} IN ({', '.join(SQLIRRenderer._sql_literal(v) for v in vals)})"
         if key.endswith("_nin"):
             col = key[:-4]
             vals = value if isinstance(value, list) else [value]
+            if not vals:
+                return "1 = 1"
             return f"{_q(alias)}.{_q(col)} NOT IN ({', '.join(SQLIRRenderer._sql_literal(v) for v in vals)})"
         return None
 
@@ -517,12 +570,14 @@ class SQLIRRenderer(IRRenderer):
         ``operator`` (">", ">=", "<", "<=", "=", "!="), ``value`` (scalar).
         """
         fn = str(h.get("function", "COUNT")).upper()
+        if fn not in {"COUNT", "SUM", "AVG", "MIN", "MAX"}:
+            raise ValueError("Unsupported HAVING aggregation")
         field = str(h.get("field", "*"))
         field_expr = "*" if field == "*" else _q(field)
         agg_expr = f"{fn}({field_expr})"
         op = str(h.get("operator", "="))
         if op not in {">", ">=", "<", "<=", "=", "!="}:
-            op = "="
+            raise ValueError("Unsupported HAVING operator")
         value = h.get("value", 0)
         return f"{agg_expr} {op} {SQLIRRenderer._sql_literal(value)}"
 
@@ -535,18 +590,19 @@ class SQLIRRenderer(IRRenderer):
         (dict of equality conditions inside the subquery).
         """
         sub_type = str(sub.get("type", "not_in")).lower()
+        if sub_type not in {"in", "not_in"}:
+            raise ValueError("Unsupported subquery operator")
         col = str(sub.get("column", "id"))
         sub_table = str(sub.get("subquery_table", "")).strip()
         sub_col = str(sub.get("subquery_column", "id"))
         if not sub_table:
-            return ""
+            raise ValueError("Subquery table is required")
         inner_sql = f"SELECT {_q(sub_table)}.{_q(sub_col)} FROM {_q(sub_table)}"
         sub_filters: dict[str, Any] = sub.get("subquery_filters", {}) or {}
         if sub_filters:
-            parts = [
-                f"{_q(sub_table)}.{_q(k)} = {SQLIRRenderer._sql_literal(v)}"
-                for k, v in sub_filters.items()
-            ]
+            from text2ql.ir import _split_filters
+            flat, groups = _split_filters(sub_filters)
+            parts = SQLIRRenderer()._build_where_parts(flat, groups, sub_table, frozenset())
             inner_sql += " WHERE " + " AND ".join(parts)
         op_kw = "NOT IN" if sub_type == "not_in" else "IN"
         return f"{_q(table)}.{_q(col)} {op_kw} ({inner_sql})"

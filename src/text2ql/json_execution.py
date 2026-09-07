@@ -13,28 +13,46 @@ def execute_query_result_on_json(
     payload: dict[str, Any],
     root_key: str | None = None,
 ) -> tuple[list[Any], str]:
-    """Apply QueryResult metadata (entity/fields/filters) to a JSON payload."""
+    """Apply compiled metadata to JSON; this is not a GraphQL server."""
+    if result.status != "ok":
+        return [], f"Execution skipped ({result.status}): {result.explanation}"
+    if any(result.metadata.get(key) for key in ("joins", "nested", "having", "subqueries", "group_by")):
+        return [], "JSON execution does not support joins, nested selections or grouped queries."
     root: Any = payload
     if root_key and isinstance(payload, dict):
         root = payload.get(root_key, payload)
 
     entity, fields, filters, aggregations = _extract_query_components(result)
+    if not entity:
+        return [], "JSON execution requires compiled entity metadata; raw query execution is unsupported."
 
     nodes = _find_entity_nodes(root, entity)
     if not nodes:
         return [], f"Entity '{entity}' not found in payload."
 
-    rows = _collect_projected_rows(nodes, fields, filters)
+    rows = _collect_projected_rows(nodes, [], filters)
+    if aggregations:
+        rows = [_evaluate_aggregations(rows, aggregations)]
+    else:
+        order_by = filters.get("orderBy") or result.metadata.get("order_by")
+        direction = filters.get("orderDirection") or filters.get("orderDir") or result.metadata.get("order_dir", "ASC")
+        if order_by:
+            try:
+                rows.sort(key=lambda row: (_lookup_field_value(row, order_by) is not None,
+                                           _lookup_field_value(row, order_by)),
+                          reverse=str(direction).upper() == "DESC")
+            except TypeError:
+                return [], "Cannot sort mixed JSON value types."
+        rows = [_project_fields(row, fields) for row in rows]
+        if result.metadata.get("distinct"):
+            from text2ql._cli_utils import stable_json
+            rows = list({stable_json(row): row for row in rows}.values())
     rows = _apply_limit_offset(
         rows=rows,
         limit=_coerce_limit(filters, result.metadata),
         offset=_coerce_offset(filters, result.metadata),
     )
 
-    if not rows:
-        return [], f"Entity '{entity}' found but filtered out by {filters}."
-    if aggregations:
-        return [_evaluate_aggregations(rows, aggregations)], ""
     return rows, ""
 
 
@@ -90,7 +108,9 @@ def _evaluate_aggregations(rows: list[Any], aggregations: list[dict[str, Any]]) 
         function = str(agg.get("function", "")).lower()
         field = str(agg.get("field", ""))
         if function == "count":
-            output["count"] = len(rows)
+            output[agg.get("alias") or "count"] = sum(
+                1 for row in rows if field in {"", "*"} or _lookup_field_value(row, field) is not None
+            )
             continue
         if not field:
             continue
@@ -114,7 +134,7 @@ def _numeric_values(rows: list[Any], field: str) -> list[float]:
     for row in rows:
         if not isinstance(row, dict):
             continue
-        raw = row.get(field)
+        raw = _lookup_field_value(row, field)
         try:
             if raw is None:
                 continue
@@ -216,7 +236,7 @@ def _matches_group_filter(row: dict[str, Any], key: str, expected: list[Any]) ->
     if key == "or":
         return any(_matches_filters(row, clause) for clause in clauses)
     if key == "not":
-        return not any(_matches_filters(row, clause) for clause in clauses)
+        return not all(_matches_filters(row, clause) for clause in clauses)
     return True
 
 

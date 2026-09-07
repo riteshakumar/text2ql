@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from text2ql.ir import QueryIR
 
 
 @dataclass(slots=True)
@@ -24,6 +27,12 @@ class QueryResult:
     confidence: float
     explanation: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    ir: QueryIR | None = None
+    status: str = "ok"
+
+    @property
+    def executable(self) -> bool:
+        return self.status == "ok" and bool(self.query.strip())
 
 
 class ValidationError(ValueError):
@@ -38,9 +47,9 @@ class ValidationError(ValueError):
     - JOIN ON-clause columns that do not exist in the referenced tables.
     - Any other schema-level inconsistency that would produce an invalid query.
 
-    In non-strict mode (the default) these conditions are recorded in
-    ``QueryResult.metadata["validation_notes"]`` and the engine degrades
-    gracefully rather than raising.
+    In non-strict mode these conditions are recorded in
+    ``QueryResult.metadata["validation_notes"]`` and the result is marked
+    ``needs_review``. The Text2QL facade uses strict validation by default.
 
     Parameters
     ----------

@@ -25,7 +25,7 @@ def test_execute_sql_on_json_flattens_nested_dict_leaves_into_columns() -> None:
     rows, note = execute_sql_on_json(query, payload, root_key="portfolio_data")
 
     assert note is None
-    assert rows == [{"quantity": "10", "symbol": "QQQ"}]
+    assert rows == [{"quantity": 10, "symbol": "QQQ"}]
 
 
 def test_execute_sql_on_json_preserves_top_level_field_on_name_collision() -> None:

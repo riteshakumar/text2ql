@@ -30,7 +30,14 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import logging
-from typing import TYPE_CHECKING, Any
+import math
+import threading
+from contextlib import nullcontext
+from typing import TYPE_CHECKING, Any, Callable, Mapping
+
+from text2ql.query_validation import validate_sql, sql_dialect, sqlalchemy_sql
+from text2ql.sqlite_guard import sqlite_read_guard
+from text2ql.types import QueryResult, ValidationError
 
 if TYPE_CHECKING:
     from text2ql.dataset import DatasetExample
@@ -101,6 +108,8 @@ class SQLAlchemyExecutor:
         engine_or_url: Any,
         connect_args: dict[str, Any] | None = None,
         row_limit: int | None = 10_000,
+        timeout_seconds: float | None = 30.0,
+        before_execute: Callable[[str, Mapping[str, Any]], None] | None = None,
     ) -> None:
         sa = _sqlalchemy_module()
 
@@ -109,26 +118,33 @@ class SQLAlchemyExecutor:
             if connect_args:
                 kwargs["connect_args"] = connect_args
             self._engine = sa.create_engine(engine_or_url, **kwargs)
-            logger.debug("Created SQLAlchemy engine from URL: %s", engine_or_url)
+            logger.debug("Created SQLAlchemy engine")
         else:
             self._engine = engine_or_url
-            logger.debug("Using provided SQLAlchemy engine: %s", engine_or_url)
+            logger.debug("Using provided SQLAlchemy engine")
 
         self._row_limit = row_limit
+        if row_limit is not None and (isinstance(row_limit, bool) or not isinstance(row_limit, int) or row_limit < 0):
+            raise ValueError("row_limit must be a non-negative integer or None")
+        if timeout_seconds is not None and (not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
+            raise ValueError("timeout_seconds must be positive or None")
+        self._timeout_seconds = timeout_seconds
+        self._before_execute = before_execute
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def execute(self, sql: str) -> list[dict[str, Any]]:
+    def execute(self, sql: str | QueryResult, parameters: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
         """Run *sql* and return rows as a list of dicts.
 
         Parameters
         ----------
         sql:
-            A SQL statement string.  If ``row_limit`` is set, a
-            ``LIMIT`` clause is appended when the statement does not
-            already contain one.
+            A single read query or executable SQL QueryResult. Compiled results
+            use named parameters. Row limits are enforced during fetching as
+            well as by clamping the outer SQL limit.
 
         Returns
         -------
@@ -143,16 +159,42 @@ class SQLAlchemyExecutor:
         """
         sa = _sqlalchemy_module()
 
-        statement = _maybe_add_limit(sql, self._row_limit)
-        logger.debug("Executing SQL: %s", statement)
-        with self._engine.connect() as conn:
-            result = conn.execute(sa.text(statement))
-            keys = list(result.keys())
-            rows = [dict(zip(keys, row)) for row in result.fetchall()]
+        dialect = sql_dialect(self._engine.dialect.name)
+        if isinstance(sql, QueryResult):
+            if sql.target != "sql" or not sql.executable:
+                raise ValidationError("Query result is not executable", [sql.status, sql.explanation])
+            if sql.ir is not None and parameters is None:
+                from text2ql.renderers import SQLIRRenderer
+                sql, parameters = SQLIRRenderer(dialect).render_parameterized(sql.ir)
+            else:
+                sql = sql.query
+        validate_sql(sql, dialect=dialect)
+        statement = _maybe_add_limit(sql, self._row_limit, dialect=dialect)
+        parameters = dict(parameters or {})
+        if self._before_execute is not None:
+            self._before_execute(statement, parameters)
+        if self._timeout_seconds is not None and dialect not in {"sqlite", "postgres"}:
+            raise ValueError("Built-in execution deadlines support SQLite and PostgreSQL; configure driver/server limits and set timeout_seconds=None for other backends")
+        with self._lock, self._engine.connect() as conn:
+            if dialect == "postgres":
+                conn.exec_driver_sql("SET TRANSACTION READ ONLY")
+                if self._timeout_seconds is not None:
+                    conn.execute(sa.text("SELECT set_config('statement_timeout', :timeout, true)"),
+                                 {"timeout": str(max(1, int(self._timeout_seconds * 1000)))})
+            raw = conn.connection.driver_connection
+            guard = sqlite_read_guard(raw, self._timeout_seconds) if dialect == "sqlite" else nullcontext()
+            with guard:
+                result = conn.execution_options(stream_results=True).execute(sa.text(statement), parameters)
+                try:
+                    keys = list(result.keys())
+                    records = result.fetchall() if self._row_limit is None else (result.fetchmany(self._row_limit) if self._row_limit else [])
+                    rows = [dict(zip(keys, row)) for row in records]
+                finally:
+                    result.close()
         logger.debug("SQL returned %d row(s)", len(rows))
         return rows
 
-    async def aexecute(self, sql: str) -> list[dict[str, Any]]:
+    async def aexecute(self, sql: str | QueryResult, parameters: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
         """Async wrapper — offloads synchronous execution to a thread pool.
 
         For truly async execution use an async SQLAlchemy engine
@@ -160,7 +202,7 @@ class SQLAlchemyExecutor:
         """
         import asyncio
 
-        return await asyncio.to_thread(self.execute, sql)
+        return await asyncio.to_thread(self.execute, sql, parameters)
 
     def __call__(self, sql: str, example: "DatasetExample") -> list[dict[str, Any]]:
         """Callable interface matching ``execution_backend`` signature.
@@ -190,22 +232,15 @@ class SQLAlchemyExecutor:
             Data rows — each dict maps column name to value.  All rows
             must have identical keys.
         if_exists:
-            Passed to ``pandas.DataFrame.to_sql()`` if pandas is available;
-            otherwise tables are created via raw DDL.
+            One of ``replace``, ``append`` or ``fail``. Fixtures preserve numeric
+            types and use the same SQLAlchemy path on every installation.
         """
         if not rows:
             logger.warning("load_json_data: no rows provided for table '%s'", table_name)
             return
 
-        try:
-            import pandas as pd
-
-            df = pd.DataFrame(rows)
-            df.to_sql(table_name, con=self._engine, if_exists=if_exists, index=False)
-            logger.debug("Loaded %d rows into '%s' via pandas", len(rows), table_name)
-        except ImportError:
-            _load_json_data_raw(self._engine, table_name, rows)
-            logger.debug("Loaded %d rows into '%s' via raw DDL", len(rows), table_name)
+        with self._lock:
+            _load_json_data_raw(self._engine, table_name, rows, if_exists)
 
     def dispose(self) -> None:
         """Dispose the underlying SQLAlchemy engine (releases connection pool)."""
@@ -256,7 +291,7 @@ def create_sqlite_executor(
     sa = _sqlalchemy_module()
 
     engine = sa.create_engine(
-        "sqlite:///:memory:", connect_args={"check_same_thread": False}
+        "sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=sa.pool.StaticPool
     )
     executor = SQLAlchemyExecutor(engine, row_limit=row_limit)
 
@@ -272,27 +307,52 @@ def create_sqlite_executor(
 # ---------------------------------------------------------------------------
 
 
-def _maybe_add_limit(sql: str, row_limit: int | None) -> str:
-    """Append a LIMIT clause if the query lacks one and row_limit is set."""
+def _maybe_add_limit(sql: str, row_limit: int | None, *, dialect: str = "sqlite") -> str:
+    """Clamp the outer query's literal limit, independently of comments/strings."""
+    from sqlglot import exp
+    tree = validate_sql(sql, dialect=dialect)
     if row_limit is None:
         return sql
-    normalized = sql.strip().upper()
-    if "LIMIT" in normalized:
-        return sql
-    stripped = sql.rstrip().rstrip(";")
-    return f"{stripped} LIMIT {row_limit};"
+    existing = tree.args.get("limit")
+    if existing is not None:
+        expression = existing.expression
+        if isinstance(expression, exp.Literal) and expression.is_int:
+            if 0 <= int(expression.this) <= row_limit:
+                return sql
+        elif expression is not None:
+            # Preserve parameterized/dynamic limits; fetchmany still enforces
+            # the independent output cap and the deadline bounds execution.
+            return sql
+    return sqlalchemy_sql(tree.limit(row_limit), dialect) + ";"
 
 
-def _load_json_data_raw(engine: Any, table_name: str, rows: list[dict[str, Any]]) -> None:
-    """DDL-based bulk insert without pandas."""
+def _load_json_data_raw(engine: Any, table_name: str, rows: list[dict[str, Any]], if_exists: str = "replace") -> None:
+    """Load typed fixtures consistently, whether or not pandas is installed."""
     sa = _sqlalchemy_module()
-
+    if if_exists not in {"replace", "append", "fail"}:
+        raise ValueError("if_exists must be replace, append or fail")
     columns = list(rows[0].keys())
-    col_defs = ", ".join(f'"{col}" TEXT' for col in columns)
+    if any(set(row) != set(columns) for row in rows):
+        raise ValueError("All fixture rows must have identical keys")
+    def infer(column):
+        values = [row[column] for row in rows if row[column] is not None]
+        if values and all(isinstance(v, bool) for v in values):
+            return sa.Boolean()
+        if values and all(isinstance(v, int) and not isinstance(v, bool) for v in values):
+            return sa.BigInteger()
+        if values and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values):
+            return sa.Float()
+        return sa.Text()
     with engine.begin() as conn:
-        conn.execute(sa.text(f'DROP TABLE IF EXISTS "{table_name}"'))
-        conn.execute(sa.text(f'CREATE TABLE "{table_name}" ({col_defs})'))
-        placeholders = ", ".join(f":{col}" for col in columns)
-        insert_sql = f'INSERT INTO "{table_name}" VALUES ({placeholders})'
-        for row in rows:
-            conn.execute(sa.text(insert_sql), row)
+        exists = sa.inspect(conn).has_table(table_name)
+        if exists and if_exists == "fail":
+            raise ValueError(f"Table '{table_name}' already exists")
+        if exists:
+            table = sa.Table(table_name, sa.MetaData(), autoload_with=conn)
+            if if_exists == "replace":
+                table.drop(conn)
+                exists = False
+        if not exists:
+            table = sa.Table(table_name, sa.MetaData(), *(sa.Column(col, infer(col), quote=True) for col in columns), quote=True)
+            table.create(conn)
+        conn.execute(table.insert(), rows)

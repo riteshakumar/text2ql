@@ -5,6 +5,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+- `Text2QL` now uses strict validation by default. Invalid intent raises `ValidationError`; lenient repairs are marked `needs_review`, and unrelated requests can return `needs_clarification`.
+- LLM failure no longer silently switches generation modes. Deterministic and plain structured-output fallback each require explicit opt-in and preserve provenance.
+- Scores are labeled as heuristics. Direct LLM output reports unavailable confidence instead of a fixed success estimate.
+- SQLGlot and graphql-core are core dependencies for parsed validation.
+- Benchmark execution accuracy includes failed cases, preserves requested order, and uses typed fixtures. Previous synthetic accuracy claims have been withdrawn.
+
+### Fixed
+
+- Lists, nulls, scalar types, and recursive boolean filters survive structured intent parsing. Malformed aggregates, joins, and sort directions fail instead of being discarded.
+- Pure aggregates retain an empty non-aggregate projection. QueryResult retains the original IR, including DISTINCT, HAVING, joins, and grouped filters.
+- Direct SQL/GraphQL is parsed and checked before returning; SQL execution rejects writes and multiple statements, binds IR values, caps rows independently of SQL text, and applies query deadlines.
+- Async provider HTTP calls pass timeout correctly and open/read/close responses outside the event loop. Transient server errors are retried.
+- In-memory SQLite fixtures work across async calls. JSON fixture loading preserves numeric types and append/fail semantics.
+- CLI and playground execution use the same read safeguards. The playground no longer populates its API-key input with server secrets.
+- CI installs the SQL extra, tests built distributions, and gates publication on tests at the release commit.
+
+### Added
+
+- Closed recursive JSON schemas for native structured output.
+- SQLite, PostgreSQL, MySQL, and SQL Server IR rendering; explicit IR grouping and multiple sort keys.
+- Standard GraphQL SDL/introspection import with document validation, named operations, variables, and fragments.
+- Relevant-table prompt selection that retains whole column lists and relationship paths.
+- Execution policy callback and [reliability/migration documentation](docs/reliability.md).
+
 ## [0.2.0] — 2026-04-11
 
 ### Added

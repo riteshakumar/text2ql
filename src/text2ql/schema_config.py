@@ -16,6 +16,7 @@ class NormalizedRelation:
 
 @dataclass(slots=True)
 class NormalizedSchemaConfig:
+    graphql_schema: Any = field(default=None, repr=False)
     entities: list[str] = field(default_factory=list)
     entity_aliases: dict[str, str] = field(default_factory=dict)
     fields: list[str] = field(default_factory=list)
@@ -46,6 +47,8 @@ def normalize_schema_config(
 ) -> NormalizedSchemaConfig:
     config = NormalizedSchemaConfig()
     schema = schema or {}
+    from text2ql.graphql_schema import import_graphql_schema
+    schema, config.graphql_schema = import_graphql_schema(schema)
     mapping = mapping or {}
 
     entities, entity_aliases = _parse_entities(schema.get("entities"))

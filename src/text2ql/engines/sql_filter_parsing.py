@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
+import re
 
 if TYPE_CHECKING:
     from text2ql.engines.sql import SQLEngine
@@ -8,6 +9,9 @@ if TYPE_CHECKING:
 
 def detect_filters(engine: "SQLEngine", lowered: str, config: Any, table: str) -> dict[str, Any]:
     filters: dict[str, Any] = {}
+    # FROM names describe the source, not categorical filter values.
+    for entity in config.entities:
+        lowered = re.sub(rf"\bfrom\s+{re.escape(entity.lower())}\b", "", lowered)
     where_clause = engine._extract_where_clause(lowered) or lowered
     engine._apply_alias_filters(filters, where_clause, lowered, config, table)
     engine._apply_advanced_filters(filters, lowered)

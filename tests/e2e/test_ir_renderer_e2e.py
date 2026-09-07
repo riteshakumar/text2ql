@@ -108,8 +108,8 @@ def test_sql_ir_renderer_join_e2e() -> None:
     sql = SQLIRRenderer().render(ir)
 
     assert 'LEFT JOIN "customers"' in sql
-    assert '"customers"."name" AS customers_name' in sql
-    assert '"customers"."email" AS customers_email' in sql
+    assert '"customers"."name" AS "customers_name"' in sql
+    assert '"customers"."email" AS "customers_email"' in sql
 
 
 # ---------------------------------------------------------------------------

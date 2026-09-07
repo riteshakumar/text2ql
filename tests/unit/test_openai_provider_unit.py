@@ -1,3 +1,4 @@
+import asyncio
 import urllib.error
 import urllib.request
 
@@ -37,7 +38,7 @@ def test_complete_structured_falls_back_to_plain_complete_when_disabled() -> Non
 
 
 def test_complete_structured_falls_back_to_plain_complete_on_structured_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    provider = OpenAICompatibleProvider(api_key="sk-test", use_structured_output=True)
+    provider = OpenAICompatibleProvider(api_key="sk-test", use_structured_output=True, allow_structured_fallback=True)
 
     def _raise_runtime_error(*_: object) -> str:
         raise RuntimeError("boom")
@@ -55,7 +56,9 @@ def test_complete_structured_falls_back_to_plain_complete_on_structured_error(mo
     assert result == '{"ok": true}'
 
 
-def test_request_with_retries_recovers_after_single_429(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_request_with_retries_recovers_from_transient_http_error(monkeypatch: pytest.MonkeyPatch, status: int, asynchronous: bool) -> None:
     provider = OpenAICompatibleProvider(
         api_key="sk-test",
         max_retries=1,
@@ -69,7 +72,7 @@ def test_request_with_retries_recovers_after_single_429(monkeypatch: pytest.Monk
             calls["count"] += 1
             raise urllib.error.HTTPError(
                 url="https://example.test",
-                code=429,
+                code=status,
                 msg="Too Many Requests",
                 hdrs={"Retry-After": "0"},
                 fp=None,
@@ -79,7 +82,7 @@ def test_request_with_retries_recovers_after_single_429(monkeypatch: pytest.Monk
     monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
     monkeypatch.setattr("time.sleep", lambda *_: None)
 
-    result = provider.complete(system_prompt="system", user_prompt="user")
+    result = asyncio.run(provider.acomplete("system", "user")) if asynchronous else provider.complete("system", "user")
 
     assert result == "ok"
     assert calls["count"] == 1

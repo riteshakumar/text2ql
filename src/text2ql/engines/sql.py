@@ -106,8 +106,14 @@ class SQLEngine(QueryEngine):
         if mode in {"llm", "function_calling"} and self.provider is not None:
             llm_result, llm_error = self._generate_with_llm(prompt, config, request.context, mode=mode)
             if llm_result is not None:
-                return llm_result
+                return self._finish_result(llm_result, request, config)
             llm_error = llm_error or "LLM mode fallback to deterministic mode."
+            if not request.context.get("allow_llm_fallback", False):
+                return self._failed_llm(llm_error, request.target)
+        clarification = self._clarification(prompt, config, request.target)
+        if clarification is not None:
+            return clarification
+
         lowered = prompt.lower()
 
         table = self._detect_table(lowered, config)
@@ -188,7 +194,7 @@ class SQLEngine(QueryEngine):
             columns = []
         exact_filter_keys = self._allowed_filter_keys(config, table, set(columns))
 
-        query = self._build_sql(
+        ir = self._make_ir(
             table=table,
             columns=columns,
             filters=filters,
@@ -202,6 +208,7 @@ class SQLEngine(QueryEngine):
             distinct=distinct,
             having=having,
         )
+        query = SQLIRRenderer(request.context.get("dialect", "sqlite")).render(ir)
         confidence = compute_deterministic_confidence(
             entity=table,
             fields=columns,
@@ -210,7 +217,7 @@ class SQLEngine(QueryEngine):
             config=config,
             extra_signals={"joins": joins, "order_by": order_by, "aggregations": aggregations},
         )
-        return QueryResult(
+        result = QueryResult(
             query=query,
             target="sql",
             confidence=confidence,
@@ -233,6 +240,9 @@ class SQLEngine(QueryEngine):
                     for join in joins
                 ],
                 "aggregations": aggregations,
+                "distinct": distinct,
+                "having": having,
+                "exact_filter_keys": sorted(exact_filter_keys),
                 "order_by": order_by,
                 "order_dir": order_dir,
                 "limit": limit,
@@ -242,6 +252,9 @@ class SQLEngine(QueryEngine):
                 "validation_notes": notes,
             },
         )
+
+        result.ir = ir
+        return self._finish_result(result, request, config)
 
     def _prepare_llm_prompts(
         self,
@@ -311,10 +324,12 @@ class SQLEngine(QueryEngine):
 
         table, columns, filters, joins, order_by, order_dir, notes = self._validate_components(
             table=table, columns=columns, filters=filters, joins=joins,
-            order_by=order_by, order_dir=order_dir, config=config,
+            order_by=order_by, order_dir=order_dir, config=config, coerce_values=False,
         )
+        if llm_columns_empty and aggregations:
+            columns = []
         exact_filter_keys = self._allowed_filter_keys(config, table, set(columns))
-        query = self._build_sql(
+        ir = self._make_ir(
             table=table, columns=columns, filters=filters, joins=joins,
             order_by=order_by, order_dir=order_dir, limit=limit, offset=offset,
             exact_filter_keys=exact_filter_keys,
@@ -323,7 +338,8 @@ class SQLEngine(QueryEngine):
             having=intent.having,
             subqueries=intent.subqueries,
         )
-        # Use calibrated schema-aware confidence instead of the LLM's self-report.
+        query = SQLIRRenderer().render(ir)
+        # This is a heuristic score, not a calibrated probability.
         confidence = compute_deterministic_confidence(
             entity=table,
             fields=columns,
@@ -334,6 +350,7 @@ class SQLEngine(QueryEngine):
         )
         return QueryResult(
             query=query,
+            ir=ir,
             target="sql",
             confidence=confidence,
             explanation=intent.explanation,
@@ -364,7 +381,9 @@ class SQLEngine(QueryEngine):
                 "subqueries": intent.subqueries,
                 "mode": "llm",
                 "language": resolved_language,
-                "raw_completion": raw,
+                "raw_completion": str(raw),
+                "structured_output": bool(getattr(raw, "structured", False)),
+                "structured_fallback_reason": getattr(raw, "fallback_reason", None),
                 "llm_confidence": intent.confidence,
                 "validation_notes": notes,
             },
@@ -385,7 +404,7 @@ class SQLEngine(QueryEngine):
         evidence = context.get("evidence") or None
         try:
             system_prompt, user_prompt = build_sql_direct_prompts(
-                prompt, config, language=resolved_language, evidence=evidence
+                prompt, config, language=resolved_language, evidence=evidence, dialect=context.get("dialect", "sqlite")
             )
             system_prompt = self._apply_system_context(system_prompt, context)
         except Exception as exc:
@@ -401,12 +420,14 @@ class SQLEngine(QueryEngine):
         return QueryResult(
             query=query,
             target="sql",
-            confidence=0.8,
+            confidence=0.0,
             explanation=f"Direct SQL generated by LLM for: {prompt[:80]}",
             metadata={
                 "mode": "llm_direct",
                 "language": resolved_language,
-                "raw_completion": raw,
+                "raw_completion": str(raw),
+                "structured_output": bool(getattr(raw, "structured", False)),
+                "structured_fallback_reason": getattr(raw, "fallback_reason", None),
             },
         ), None
 
@@ -425,7 +446,7 @@ class SQLEngine(QueryEngine):
         evidence = context.get("evidence") or None
         try:
             system_prompt, user_prompt = build_sql_direct_prompts(
-                prompt, config, language=resolved_language, evidence=evidence
+                prompt, config, language=resolved_language, evidence=evidence, dialect=context.get("dialect", "sqlite")
             )
             system_prompt = self._apply_system_context(system_prompt, context)
         except Exception as exc:
@@ -441,12 +462,14 @@ class SQLEngine(QueryEngine):
         return QueryResult(
             query=query,
             target="sql",
-            confidence=0.8,
+            confidence=0.0,
             explanation=f"Direct SQL generated by LLM for: {prompt[:80]}",
             metadata={
                 "mode": "llm_direct",
                 "language": resolved_language,
-                "raw_completion": raw,
+                "raw_completion": str(raw),
+                "structured_output": bool(getattr(raw, "structured", False)),
+                "structured_fallback_reason": getattr(raw, "fallback_reason", None),
             },
         ), None
 
@@ -512,8 +535,10 @@ class SQLEngine(QueryEngine):
         if mode in {"llm", "function_calling"} and self.provider is not None:
             llm_result, llm_error = await self._agenerate_with_llm(prompt, config, request.context, mode=mode)
             if llm_result is not None:
-                return llm_result
+                return self._finish_result(llm_result, request, config)
             llm_error = llm_error or "LLM mode fallback to deterministic mode."
+            if not request.context.get("allow_llm_fallback", False):
+                return self._failed_llm(llm_error, request.target)
 
         # Deterministic path is pure CPU — safe to run inline in async context
         det_request = QueryRequest(
@@ -577,12 +602,7 @@ class SQLEngine(QueryEngine):
                 continue
             relation = self._resolve_relation_for_join(config, table, relation_name)
             if relation is None:
-                logger.warning(
-                    "SQLEngine: LLM requested unknown relation %r for table %r; skipping join.",
-                    relation_name,
-                    table,
-                )
-                continue
+                raise ValidationError("Unknown relation in structured intent", [f"{table}.{relation_name}"])
             joins.append(self._build_relation_join_from_payload(item, relation, table))
         return joins
 
@@ -2058,6 +2078,7 @@ class SQLEngine(QueryEngine):
         order_by: str | None,
         order_dir: str | None,
         config: Any,
+        coerce_values: bool = True,
     ) -> tuple[str, list[str], dict[str, Any], list[_RelationJoin], str | None, str | None, list[str]]:
         return _validate_components_stage(
             self,
@@ -2068,6 +2089,7 @@ class SQLEngine(QueryEngine):
             order_by,
             order_dir,
             config,
+            coerce_values,
         )
 
     def _resolve_table(self, table: str, config: Any, notes: list[str]) -> str:
@@ -2089,7 +2111,10 @@ class SQLEngine(QueryEngine):
         out: dict[str, Any] = {}
         for key, value in filters.items():
             if key in {"and", "or", "not"} and isinstance(value, list):
-                nested = self._validate_group_nodes(value, allowed_filter_keys)
+                nested = [self._validate_filters(node, allowed_filter_keys, notes) for node in value if isinstance(node, dict)]
+                if len(nested) != len(value) or any(not node for node in nested):
+                    notes.append(f"dropped invalid predicate in {key} group")
+                nested = [node for node in nested if node]
                 if nested:
                     out[key] = nested
                 continue
@@ -2473,6 +2498,27 @@ class SQLEngine(QueryEngine):
         having: list[dict] | None = None,
         subqueries: list[dict] | None = None,
     ) -> str:
+        return _SQL_RENDERER.render(self._make_ir(
+            table, columns, filters, joins, order_by, order_dir, limit, offset,
+            exact_filter_keys, aggregations, distinct, having, subqueries,
+        ))
+
+    def _make_ir(
+        self,
+        table: str,
+        columns: list[str],
+        filters: dict[str, Any],
+        joins: list[_RelationJoin],
+        order_by: str | None,
+        order_dir: str | None,
+        limit: int | None,
+        offset: int | None,
+        exact_filter_keys: set[str] | None = None,
+        aggregations: list[dict[str, str]] | None = None,
+        distinct: bool = False,
+        having: list[dict] | None = None,
+        subqueries: list[dict] | None = None,
+    ):
         """Build a SQL SELECT statement via :class:`~text2ql.renderers.SQLIRRenderer`.
 
         The engine detects all components; the renderer assembles the final
@@ -2484,6 +2530,7 @@ class SQLEngine(QueryEngine):
         join_dicts = [
             {
                 "relation": j.relation,
+                "alias": j.alias,
                 "target": j.target,
                 "on_clause": j.on_clause,
                 "fields": j.fields,
@@ -2510,7 +2557,7 @@ class SQLEngine(QueryEngine):
             having=having or [],
             subqueries=subqueries or [],
         )
-        return _SQL_RENDERER.render(ir)
+        return ir
 
     def _build_where_parts(
         self,

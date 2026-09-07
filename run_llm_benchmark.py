@@ -380,11 +380,20 @@ BIRD_EXAMPLES = [
 # Dataset builder
 # ---------------------------------------------------------------------------
 
+def _column_type(db_def: dict, table: str, index: int) -> str:
+    values = [row[index] for row in db_def["data"].get(table, []) if row[index] is not None]
+    if values and all(isinstance(value, (int, bool)) for value in values):
+        return "INTEGER"
+    if values and all(isinstance(value, (int, float)) for value in values):
+        return "REAL"
+    return "TEXT"
+
+
 def _create_sqlite(db_path: Path, db_def: dict) -> None:
     conn = sqlite3.connect(str(db_path))
     cur = conn.cursor()
     for table, cols in db_def["columns"].items():
-        col_defs = ", ".join(f'"{c}" TEXT' for c in cols)
+        col_defs = ", ".join(f'"{c}" {_column_type(db_def, table, i)}' for i, c in enumerate(cols))
         cur.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ({col_defs})')
         rows = db_def["data"].get(table, [])
         if rows:
@@ -404,9 +413,9 @@ def build_spider_dataset(root: Path) -> None:
         col_types = ["text"]
         col_to_table = [-1]
         for ti, (tbl, cols) in enumerate(db_def["columns"].items()):
-            for col in cols:
+            for ci, col in enumerate(cols):
                 col_names.append([ti, col])
-                col_types.append("text")
+                col_types.append("number" if _column_type(db_def, tbl, ci) in {"INTEGER", "REAL"} else "text")
                 col_to_table.append(ti)
         fks = []
         for (ft, fc, pt, pc) in db_def.get("foreign_keys", []):

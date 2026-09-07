@@ -18,6 +18,7 @@ Typical flow
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from copy import deepcopy
 from typing import Any
 
 
@@ -87,6 +88,12 @@ class IRJoin:
     fields: list[str] = field(default_factory=list)
     filters: list[IRFilter] = field(default_factory=list)
     join_type: str = "LEFT"
+    alias: str | None = None
+    group_filters: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.join_type not in {"LEFT", "RIGHT", "INNER", "FULL", "CROSS"}:
+            raise ValueError("Unsupported join type")
 
 
 @dataclass(slots=True)
@@ -114,6 +121,7 @@ class IRNested:
     fields: list[str] = field(default_factory=list)
     filters: list[IRFilter] = field(default_factory=list)
     children: list["IRNested"] = field(default_factory=list)
+    group_filters: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -134,6 +142,22 @@ class IRAggregation:
     function: str
     field: str
     alias: str | None = None
+
+    def __post_init__(self) -> None:
+        self.function = self.function.upper()
+        if self.function not in {"COUNT", "SUM", "AVG", "MIN", "MAX"}:
+            raise ValueError(f"Unsupported aggregation '{self.function}'")
+
+
+@dataclass(slots=True)
+class IRSort:
+    field: str
+    direction: str = "ASC"
+
+    def __post_init__(self) -> None:
+        self.direction = self.direction.upper()
+        if self.direction not in {"ASC", "DESC"}:
+            raise ValueError("Sort direction must be ASC or DESC")
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +228,15 @@ class QueryIR:
     distinct: bool = False
     having: list[dict[str, Any]] = field(default_factory=list)
     subqueries: list[dict[str, Any]] = field(default_factory=list)
+    group_by: list[str] | None = None
+    sort_by: list[IRSort] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        for value in (self.limit, self.offset):
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+                raise ValueError("Pagination must be a non-negative integer")
+        if self.order_dir not in {None, "ASC", "DESC"}:
+            raise ValueError("Sort direction must be ASC or DESC")
 
     # ------------------------------------------------------------------
     # Factory helpers
@@ -216,11 +249,16 @@ class QueryIR:
         This is lossy for complex queries — grouped filters and nested
         selections are preserved as raw metadata rather than re-parsed.
         """
+        if isinstance(getattr(result, "ir", None), cls):
+            ir = deepcopy(result.ir)
+            if source_text:
+                ir.source_text = source_text
+            return ir
         meta = result.metadata if isinstance(result.metadata, dict) else {}
         entity = meta.get("entity") or meta.get("table") or ""
 
         raw_filters = meta.get("filters", {})
-        flat_filters, group_filters = _split_filters(raw_filters)
+        flat_filters, group_filters = _split_filters(raw_filters, frozenset(meta.get("exact_filter_keys", [])))
 
         raw_joins: list[dict[str, Any]] = meta.get("joins", [])
         joins = [_join_from_dict(j) for j in raw_joins if isinstance(j, dict)]
@@ -249,6 +287,8 @@ class QueryIR:
             distinct=bool(meta.get("distinct", False)),
             having=list(meta.get("having") or []),
             subqueries=list(meta.get("subqueries") or []),
+            group_by=deepcopy(meta.get("group_by")),
+            sort_by=[IRSort(**item) for item in meta.get("sort_by", [])],
         )
 
     @classmethod
@@ -294,6 +334,8 @@ class QueryIR:
             distinct=bool(kwargs.get("distinct", False)),
             having=list(kwargs.get("having") or []),
             subqueries=list(kwargs.get("subqueries") or []),
+            group_by=deepcopy(kwargs.get("group_by")),
+            sort_by=[item if isinstance(item, IRSort) else IRSort(**item) for item in kwargs.get("sort_by", [])],
         )
 
 
@@ -399,9 +441,9 @@ def _build_ir_filter(
     exact_keys: frozenset[str],
     suffix_op: dict[str, str],
 ) -> IRFilter:
-    if value is None:
-        return IRFilter(key=key, value=None, operator="is_null")
     canonical_key, operator = _resolve_filter_operator(key, exact_keys, suffix_op)
+    if value is None and operator == "eq":
+        operator = "is_null"
     return IRFilter(key=canonical_key, value=value, operator=operator)
 
 
@@ -421,8 +463,9 @@ def _resolve_filter_operator(
 def _join_from_dict(d: dict[str, Any]) -> IRJoin:
     on_clause = d.get("on_clause", "")
     on_left, on_right = _parse_on_clause(on_clause)
+    on_left, on_right = d.get("on_left", on_left), d.get("on_right", on_right)
     raw_filters = d.get("filters", {})
-    flat_filters, _ = _split_filters(raw_filters if isinstance(raw_filters, dict) else {})
+    flat_filters, groups = _split_filters(raw_filters if isinstance(raw_filters, dict) else {}, frozenset(d.get("fields", [])))
     return IRJoin(
         relation=str(d.get("relation", "")),
         target=str(d.get("target", "")),
@@ -431,12 +474,14 @@ def _join_from_dict(d: dict[str, Any]) -> IRJoin:
         fields=list(d.get("fields") or []),
         filters=flat_filters,
         join_type=str(d.get("join_type", "LEFT")).upper(),
+        alias=d.get("alias"),
+        group_filters=groups,
     )
 
 
 def _nested_from_dict(d: dict[str, Any]) -> IRNested:
     raw_filters = d.get("filters", d.get("args", {}))
-    flat_filters, _ = _split_filters(raw_filters if isinstance(raw_filters, dict) else {})
+    flat_filters, groups = _split_filters(raw_filters if isinstance(raw_filters, dict) else {}, frozenset(d.get("fields", [])))
     children = [_nested_from_dict(child) for child in d.get("nested", []) if isinstance(child, dict)]
     return IRNested(
         relation=str(d.get("relation", d.get("name", ""))),
@@ -444,6 +489,7 @@ def _nested_from_dict(d: dict[str, Any]) -> IRNested:
         fields=list(d.get("fields") or []),
         filters=flat_filters,
         children=children,
+        group_filters=groups,
     )
 
 

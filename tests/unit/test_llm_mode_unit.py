@@ -4,6 +4,7 @@ import json
 import pytest
 
 from text2ql import Text2QL
+from text2ql.types import ValidationError
 from text2ql.providers.base import LLMProvider
 
 pytestmark = pytest.mark.unit
@@ -63,16 +64,16 @@ def test_llm_mode_uses_provider_with_constrained_output() -> None:
     assert "customers(limit: 3, status: \"active\")" in result.query
     assert result.metadata["mode"] == "llm"
     assert result.metadata["language"] == "english"
-    # confidence is now calibrated from schema signals; raw LLM value is preserved in metadata
+    # confidence is a heuristic from schema signals; raw LLM value is preserved in metadata
     assert result.metadata["llm_confidence"] == pytest.approx(0.93)
     assert 0.0 <= result.confidence <= 1.0
 
 
 def test_llm_mode_falls_back_to_deterministic_on_invalid_output() -> None:
-    # mode="function_calling" still parses JSON intent; invalid output causes fallback
+    # Deterministic fallback is an explicit caller choice.
     service = Text2QL(provider=InvalidProvider())
 
-    result = service.generate("list users", context={"mode": "function_calling"})
+    result = service.generate("list users", context={"allow_llm_fallback": True, "mode": "function_calling"})
 
     assert result.metadata["mode"] == "deterministic"
     assert "user" in result.query
@@ -81,7 +82,7 @@ def test_llm_mode_falls_back_to_deterministic_on_invalid_output() -> None:
 def test_llm_mode_falls_back_to_deterministic_on_provider_error() -> None:
     service = Text2QL(provider=ErrorProvider())
 
-    result = service.generate("list users", context={"mode": "llm"})
+    result = service.generate("list users", context={"allow_llm_fallback": True, "mode": "llm"})
 
     assert result.metadata["mode"] == "deterministic"
     assert result.metadata["llm_error"] is not None
@@ -101,7 +102,7 @@ def test_llm_mode_falls_back_to_deterministic_on_unsupported_language() -> None:
         )
     )
 
-    result = service.generate("list users", context={"mode": "llm", "language": "spanish"})
+    result = service.generate("list users", context={"allow_llm_fallback": True, "mode": "llm", "language": "spanish"})
 
     assert result.metadata["mode"] == "deterministic"
     assert "user" in result.query
@@ -138,7 +139,7 @@ def test_sql_llm_mode_uses_provider_with_constrained_output() -> None:
     assert 'ORDER BY "orders"."createdAt" DESC' in result.query
     assert "LIMIT 5" in result.query
     assert result.metadata["mode"] == "llm"
-    # confidence is now calibrated from schema signals; raw LLM value is preserved in metadata
+    # confidence is a heuristic from schema signals; raw LLM value is preserved in metadata
     assert result.metadata["llm_confidence"] == pytest.approx(0.91)
     assert 0.0 <= result.confidence <= 1.0
 
@@ -177,7 +178,7 @@ def test_async_llm_mode_preserves_error_on_fallback() -> None:
     service = Text2QL(provider=ErrorProvider())
 
     result = asyncio.run(
-        service.agenerate("list users", context={"mode": "llm"})
+        service.agenerate("list users", context={"allow_llm_fallback": True, "mode": "llm"})
     )
 
     assert result.metadata["mode"] == "deterministic"
@@ -189,7 +190,7 @@ def test_async_sql_llm_mode_preserves_error_on_fallback() -> None:
     service = Text2QL(provider=ErrorProvider())
 
     result = asyncio.run(
-        service.agenerate("list orders", target="sql", context={"mode": "llm"})
+        service.agenerate("list orders", target="sql", context={"allow_llm_fallback": True, "mode": "llm"})
     )
 
     assert result.metadata["mode"] == "deterministic"
@@ -197,10 +198,10 @@ def test_async_sql_llm_mode_preserves_error_on_fallback() -> None:
 
 
 # ---------------------------------------------------------------------------
-# function_calling mode falls back to plain complete() when structured raises
+# Explicit fallback after a structured provider failure
 # ---------------------------------------------------------------------------
 
-def test_function_calling_falls_back_to_plain_complete_on_error() -> None:
+def test_function_calling_allows_explicit_deterministic_fallback() -> None:
     service = Text2QL(
         provider=StructuredFallbackProvider(
             {
@@ -216,11 +217,12 @@ def test_function_calling_falls_back_to_plain_complete_on_error() -> None:
     result = service.generate(
         "list products",
         schema={"entities": ["products"], "fields": ["id", "name"]},
-        context={"mode": "function_calling"},
+        context={"allow_llm_fallback": True, "mode": "function_calling"},
     )
 
-    # Engine catches the structured error and falls through to deterministic;
-    # the important thing is we get a valid result, not an unhandled exception.
+    # Explicit fallback preserves the error and the actual generation mode.
+    assert result.metadata["mode"] == "deterministic"
+    assert result.metadata["llm_error"]
     assert "product" in result.query.lower()
 
 
@@ -265,15 +267,7 @@ def test_llm_mode_system_context_is_injected() -> None:
     class CapturingProvider(LLMProvider):
         def complete(self, system_prompt: str, user_prompt: str) -> str:
             received_system_prompts.append(system_prompt)
-            return json.dumps(
-                {
-                    "entity": "users",
-                    "fields": ["id"],
-                    "filters": {},
-                    "explanation": "ok",
-                    "confidence": 0.9,
-                }
-            )
+            return "{ users { id } }"
 
     service = Text2QL(provider=CapturingProvider())
     service.generate(
@@ -286,11 +280,11 @@ def test_llm_mode_system_context_is_injected() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Unknown join relation skipped (SQL LLM mode)
+# Unknown join relation rejected (SQL LLM mode)
 # ---------------------------------------------------------------------------
 
-def test_sql_llm_mode_skips_unknown_join_relation() -> None:
-    # mode="function_calling" runs the intent compiler which validates/drops bad joins
+def test_sql_llm_mode_rejects_unknown_join_relation() -> None:
+    # An invalid join must not silently change the meaning of the request.
     service = Text2QL(
         provider=StubProvider(
             {
@@ -308,14 +302,17 @@ def test_sql_llm_mode_skips_unknown_join_relation() -> None:
         )
     )
 
-    result = service.generate(
-        "show orders",
-        target="sql",
-        schema={"entities": ["orders"], "fields": {"orders": ["id", "status"]}},
-        context={"mode": "function_calling"},
-    )
+    with pytest.raises(ValidationError, match="Unknown relation"):
+        service.generate(
+            "show orders",
+            target="sql",
+            schema={"entities": ["orders"], "fields": {"orders": ["id", "status"]}},
+            context={"mode": "function_calling"},
+        )
 
-    # Invalid join must be silently dropped — query must still be valid SQL
-    assert result.metadata["mode"] == "llm"
-    assert "JOIN" not in result.query
-    assert 'FROM "orders"' in result.query
+
+@pytest.mark.parametrize("target", ["sql", "graphql"])
+@pytest.mark.parametrize("mode", ["llm", "function_calling"])
+def test_failed_generation_requires_explicit_fallback(target: str, mode: str) -> None:
+    with pytest.raises(ValidationError, match="LLM generation failed"):
+        Text2QL(provider=ErrorProvider()).generate("list users", target=target, context={"mode": mode})

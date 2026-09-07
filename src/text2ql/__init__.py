@@ -3,7 +3,7 @@
 from .core import Text2QL
 from .dataset import DatasetExample, generate_synthetic_examples, ingest_dataset
 from .evaluate import EvaluationReport, aevaluate_examples, evaluate_examples
-from .ir import IRAggregation, IRFilter, IRJoin, IRNested, IRRenderer, QueryIR
+from .ir import IRAggregation, IRFilter, IRJoin, IRNested, IRRenderer, IRSort, QueryIR
 from .json_execution import execute_query_result_on_json
 from .mapping import generate_hybrid_mapping
 from .renderers import GraphQLIRRenderer, SQLIRRenderer
@@ -24,6 +24,7 @@ __all__ = [
     "IRJoin",
     "IRNested",
     "IRRenderer",
+    "IRSort",
     "QueryIR",
     "QueryRequest",
     "QueryResult",

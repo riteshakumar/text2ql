@@ -7,10 +7,11 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 from text2ql.schema_config import NormalizedSchemaConfig
+from text2ql.schema_selection import select_prompt_schema
 
 ENGLISH_GRAPHQL_SYSTEM_PROMPT = (
     "You are a GraphQL intent extractor. Return only valid JSON with keys: "
-    "entity (string), fields (array of strings), filters (object), "
+    "entity (string), fields (array of strings), filters (array of predicate objects), "
     "aggregations (array of objects with function and field), "
     "nested (array of objects with relation and fields), "
     "distinct (bool, true when query asks for unique values), "
@@ -18,16 +19,16 @@ ENGLISH_GRAPHQL_SYSTEM_PROMPT = (
     "explanation (string), confidence (number in [0,1]). "
     "For aggregations use: {\"function\": \"COUNT\", \"field\": \"*\"} or "
     "{\"function\": \"SUM\", \"field\": \"amount\"}. "
-    "For filters with comparisons use suffix keys: age_gt (>), age_gte (>=), price_lt (<), price_lte (<=), field_ne (!=). "
+    "Preserve filter value types and boolean grouping. "
     "For nested relations use the exact relation name from the schema. "
     "Set distinct=true when the question asks for unique/distinct values. "
     "Use having for post-aggregation conditions like 'more than 5 orders'. "
-    "Example filter: {\"age_gt\": 20, \"status\": \"active\"}."
+    'Example filter: [{"field":"age","operator":">","value":20,"children":[]}].'
 )
 
 ENGLISH_SQL_SYSTEM_PROMPT = (
     "You are a SQL intent extractor. Return only valid JSON with keys: "
-    "table (string), columns (array of strings), filters (object), joins (array), "
+    "table (string), columns (array of strings), filters (array of predicate objects), joins (array), "
     "aggregations (array of objects with function and field), "
     "distinct (bool, true when question asks for unique values), "
     "having (array of post-aggregation conditions: [{\"function\":\"COUNT\",\"field\":\"*\",\"operator\":\">\",\"value\":5}]), "
@@ -36,12 +37,12 @@ ENGLISH_SQL_SYSTEM_PROMPT = (
     "offset (number|null), explanation (string), confidence (number in [0,1]). "
     "For aggregations use: {\"function\": \"COUNT\", \"field\": \"*\"} or "
     "{\"function\": \"SUM\", \"field\": \"amount\"}. "
-    "For filters with comparisons use suffix keys: age_gt, salary_gte, price_lt, credits_lte. "
+    "Preserve filter value types and boolean grouping. "
     "For joins, use the relation name exactly as it appears in the schema relations. "
     "Use HAVING for post-aggregation filters (e.g. count > 5). "
     "Use subqueries NOT IN when the question excludes rows based on another table. "
     "Set distinct=true when the question asks for unique/distinct values. "
-    "Example filter: {\"age_gt\": 20, \"status\": \"active\"}."
+    'Example filter: [{"field":"age","operator":">","value":20,"children":[]}].'
 )
 
 ENGLISH_GRAPHQL_USER_TEMPLATE = """Convert this request into GraphQL intent JSON.
@@ -65,7 +66,7 @@ Filter mapping aliases:
 {filter_aliases}
 
 Rules:
-- For filter comparisons use suffix keys: age_gt (>), age_gte (>=), price_lt (<), price_lte (<=), field_ne (!=)
+- Use filter objects with field, operator, value, children; use groups for and/or/not
 - For aggregations like COUNT, SUM, AVG, MIN, MAX — add them to the "aggregations" array
 - For nested relation fetches use the exact relation name from "Available relations"
 - fields should only list non-aggregated scalar fields
@@ -92,18 +93,17 @@ Filter mapping aliases:
 {filter_aliases}
 
 Rules:
-- For WHERE comparisons use suffix keys in filters: age_gt (>), age_gte (>=), age_lt (<), age_lte (<=), field_ne (!=)
+- Use filter objects with field, operator, value, children; use groups for and/or/not
 - For aggregations like COUNT, SUM, AVG, MIN, MAX — add them to the "aggregations" array
 - For JOINs use the exact relation name from "Available relations"
 - columns should only list non-aggregated SELECT columns
 """
 
-# Maximum number of entities/fields/aliases to include per prompt.  Large
-# schemas would otherwise exceed the model's context window and cause silent
-# truncation or an API error that falls through to deterministic mode.
+# Select complete relevant entities and relationship paths within this budget.
 _MAX_PROMPT_ENTITIES = 50
-_MAX_PROMPT_FIELDS = 100
-_MAX_PROMPT_ALIASES = 100
+
+ENGLISH_GRAPHQL_SYSTEM_PROMPT += ' Filters use an array of predicate objects with field, operator, value, children. For scalar predicates children=[]; for and/or/not groups field=null, value=null and children contains predicates. Use operator is_null with value=null for null checks.'
+ENGLISH_SQL_SYSTEM_PROMPT += ' Filters use an array of predicate objects with field, operator, value, children. For scalar predicates children=[]; for and/or/not groups field=null, value=null and children contains predicates. Use operator is_null with value=null for null checks.'
 
 SUPPORTED_PROMPT_LANGUAGES = {"english"}
 _LANGUAGE_ALIASES = {
@@ -327,6 +327,12 @@ SQL_INTENT_JSON_SCHEMA: dict = {
 }
 
 
+from text2ql.structured_schema import strict_intent_schema
+
+GRAPHQL_INTENT_JSON_SCHEMA = strict_intent_schema(GRAPHQL_INTENT_JSON_SCHEMA)
+SQL_INTENT_JSON_SCHEMA = strict_intent_schema(SQL_INTENT_JSON_SCHEMA)
+
+
 def build_graphql_prompts(
     text: str,
     config: NormalizedSchemaConfig,
@@ -334,31 +340,15 @@ def build_graphql_prompts(
     language: str = "english",
 ) -> tuple[str, str]:
     resolved_language = resolve_language(language)
+    config = select_prompt_schema(text, config, _MAX_PROMPT_ENTITIES)
     entities = config.entities or ["user", "customer", "order", "product", "items"]
     fields = config.fields or ["id", "name", "title", "email", "status", "price"]
     field_aliases = config.field_aliases
     filter_aliases = config.filter_key_aliases
-    if len(entities) > _MAX_PROMPT_ENTITIES:
-        logger.warning(
-            "build_graphql_prompts: truncating entities from %d to %d",
-            len(entities), _MAX_PROMPT_ENTITIES,
-        )
-        entities = entities[:_MAX_PROMPT_ENTITIES]
-    if len(fields) > _MAX_PROMPT_FIELDS:
-        logger.warning(
-            "build_graphql_prompts: truncating fields from %d to %d",
-            len(fields), _MAX_PROMPT_FIELDS,
-        )
-        fields = fields[:_MAX_PROMPT_FIELDS]
-    if len(field_aliases) > _MAX_PROMPT_ALIASES:
-        field_aliases = dict(list(field_aliases.items())[:_MAX_PROMPT_ALIASES])
-    if len(filter_aliases) > _MAX_PROMPT_ALIASES:
-        filter_aliases = dict(list(filter_aliases.items())[:_MAX_PROMPT_ALIASES])
-
-    # Build relations dict: {entity: [relation_name, ...]}
+    # Include relation targets and join keys with their names.
     relations_by_entity = getattr(config, "relations_by_entity", {})
-    relations: dict[str, list[str]] = {
-        ent: list(rel_map.keys())
+    relations: dict[str, dict[str, dict[str, str]]] = {
+        ent: {name: {"target": rel.target, "on": rel.on} for name, rel in rel_map.items()}
         for ent, rel_map in relations_by_entity.items()
         if rel_map
     }
@@ -367,7 +357,7 @@ def build_graphql_prompts(
     user_prompt = user_template.format(
         text=text.strip(),
         entities=json.dumps(entities),
-        fields=json.dumps(fields),
+        fields=json.dumps(config.fields_by_entity or fields),
         relations=json.dumps(relations),
         field_aliases=json.dumps(field_aliases),
         filter_aliases=json.dumps(filter_aliases),
@@ -385,31 +375,15 @@ def build_sql_prompts(
     language: str = "english",
 ) -> tuple[str, str]:
     resolved_language = resolve_language(language)
+    config = select_prompt_schema(text, config, _MAX_PROMPT_ENTITIES)
     entities = config.entities or ["users", "customers", "orders", "products", "items"]
     fields = config.fields or ["id", "name", "createdAt", "status", "price", "amount"]
     field_aliases = config.field_aliases
     filter_aliases = config.filter_key_aliases
-    if len(entities) > _MAX_PROMPT_ENTITIES:
-        logger.warning(
-            "build_sql_prompts: truncating entities from %d to %d",
-            len(entities), _MAX_PROMPT_ENTITIES,
-        )
-        entities = entities[:_MAX_PROMPT_ENTITIES]
-    if len(fields) > _MAX_PROMPT_FIELDS:
-        logger.warning(
-            "build_sql_prompts: truncating fields from %d to %d",
-            len(fields), _MAX_PROMPT_FIELDS,
-        )
-        fields = fields[:_MAX_PROMPT_FIELDS]
-    if len(field_aliases) > _MAX_PROMPT_ALIASES:
-        field_aliases = dict(list(field_aliases.items())[:_MAX_PROMPT_ALIASES])
-    if len(filter_aliases) > _MAX_PROMPT_ALIASES:
-        filter_aliases = dict(list(filter_aliases.items())[:_MAX_PROMPT_ALIASES])
-
-    # Build relations dict: {table: [relation_name, ...]}
+    # Include relation targets and join keys with their names.
     relations_by_entity = getattr(config, "relations_by_entity", {})
-    relations: dict[str, list[str]] = {
-        tbl: list(rel_map.keys())
+    relations: dict[str, dict[str, dict[str, str]]] = {
+        tbl: {name: {"target": rel.target, "on": rel.on} for name, rel in rel_map.items()}
         for tbl, rel_map in relations_by_entity.items()
         if rel_map
     }
@@ -418,7 +392,7 @@ def build_sql_prompts(
     user_prompt = user_template.format(
         text=text.strip(),
         entities=json.dumps(entities),
-        fields=json.dumps(fields),
+        fields=json.dumps(config.fields_by_entity or fields),
         relations=json.dumps(relations),
         field_aliases=json.dumps(field_aliases),
         filter_aliases=json.dumps(filter_aliases),
@@ -443,7 +417,7 @@ ENGLISH_SQL_DIRECT_SYSTEM_PROMPT = (
     "Rules:\n"
     "- Output ONLY the SQL query — no explanation, no markdown fences, no comments.\n"
     "- Use standard SQL syntax compatible with SQLite.\n"
-    "- Quote table and column names with double-quotes only when they are reserved words; "
+    "- Use identifier quoting appropriate for the SQL dialect when names require it; "
     "prefer bare identifiers (e.g. SELECT id FROM orders) for simple names.\n"
     "- SELECT ONLY the columns explicitly requested.  Do NOT add extra columns or AS aliases "
     "unless the question asks for a renamed output.\n"
@@ -519,6 +493,7 @@ def build_sql_direct_prompts(
     config: NormalizedSchemaConfig,
     language: str = "english",
     evidence: str | None = None,
+    dialect: str = "sqlite",
 ) -> tuple[str, str]:
     """Build prompts for direct SQL generation (mode='llm').
 
@@ -534,11 +509,12 @@ def build_sql_direct_prompts(
         "carcinogenic means label = '+'").
     """
     resolve_language(language)  # validate
+    config = select_prompt_schema(text, config, _MAX_PROMPT_ENTITIES)
 
     tables = config.entities or []
     columns_by_table: dict[str, list[str]] = {}
     for entity in tables:
-        cols = config.fields_by_entity.get(entity, []) if hasattr(config, "fields_by_entity") else []
+        cols = config.fields_by_entity.get(entity, config.fields)
         if not cols and hasattr(config, "args_by_entity"):
             cols = config.args_by_entity.get(entity, [])
         columns_by_table[entity] = cols
@@ -566,7 +542,10 @@ def build_sql_direct_prompts(
         relations=relations_text,
         evidence_block=evidence_block,
     )
-    return ENGLISH_SQL_DIRECT_SYSTEM_PROMPT, user_prompt
+    from text2ql.query_validation import sql_dialect
+    dialect = sql_dialect(dialect)
+    system_prompt = ENGLISH_SQL_DIRECT_SYSTEM_PROMPT.replace("compatible with SQLite", f"for the {dialect} dialect")
+    return system_prompt, user_prompt
 
 
 def build_graphql_direct_prompts(
@@ -586,6 +565,7 @@ def build_graphql_direct_prompts(
         Optional domain hint string injected into the user prompt.
     """
     resolve_language(language)  # validate
+    config = select_prompt_schema(text, config, _MAX_PROMPT_ENTITIES)
 
     entities = config.entities or []
     fields_text_parts = [_graphql_entity_fields_line(config, entity) for entity in entities]
@@ -602,13 +582,14 @@ def build_graphql_direct_prompts(
         relations=relations_text,
         evidence_block=evidence_block,
     )
+    user_prompt += "\nArguments per root field:\n" + json.dumps(config.introspection_query_args or config.args_by_entity)
     return ENGLISH_GRAPHQL_DIRECT_SYSTEM_PROMPT, user_prompt
 
 
 def _graphql_entity_fields_line(config: NormalizedSchemaConfig, entity: str) -> str:
     cols: list[str] = []
     if hasattr(config, "fields_by_entity"):
-        cols = config.fields_by_entity.get(entity, [])
+        cols = config.fields_by_entity.get(entity, config.fields)
     if not cols and hasattr(config, "args_by_entity"):
         cols = config.args_by_entity.get(entity, [])
     return f"  {entity}: {', '.join(cols) if cols else '(none)'}"

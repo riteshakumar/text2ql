@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 import sqlite3
 import time
@@ -30,6 +31,8 @@ from typing import Any
 from text2ql.core import Text2QL
 from text2ql.dataset import DatasetExample
 from text2ql.evaluate import structural_execution_match
+from text2ql.query_validation import validate_sql
+from text2ql.sqlite_guard import sqlite_read_guard
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +45,7 @@ class BenchmarkConfig:
     ----------
     mode:
         Evaluation mode: ``"exact"`` (literal SQL string match), ``"structural"``
-        (parsed-signature match), or ``"execution"`` (run against SQLite
+        (conservative AST comparison), or ``"execution"`` (run against SQLite
         and compare result sets).
     service:
         Pre-configured :class:`~text2ql.core.Text2QL` instance.
@@ -52,14 +55,21 @@ class BenchmarkConfig:
     timeout_per_query:
         Seconds before a single SQL execution is killed.
     ignore_order:
-        When ``True``, sort result rows before comparing (execution mode).
+        When ``True``, sort rows before comparison. The default, ``None``,
+        preserves order whenever the gold query has an outer ORDER BY.
     """
 
     mode: str = "execution"
     service: Text2QL | None = None
     concurrency: int = 10
     timeout_per_query: float = 30.0
-    ignore_order: bool = True
+    ignore_order: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"execution", "structural", "exact"}:
+            raise ValueError("Unknown benchmark mode")
+        if self.concurrency < 1 or not math.isfinite(self.timeout_per_query) or self.timeout_per_query <= 0:
+            raise ValueError("Concurrency and timeout must be positive")
 
 
 @dataclass(slots=True)
@@ -72,7 +82,7 @@ class BenchmarkRow:
     predicted_sql: str
     exact_match: bool
     structural_match: bool
-    execution_match: bool | None  # None if execution was not attempted / errored
+    execution_match: bool | None  # None outside execution mode; errors count as False
     difficulty: str
     error: str | None = None
     latency_ms: float = 0.0
@@ -240,7 +250,7 @@ def _evaluate_one(
     predicted_sql = ""
     exact_match = False
     structural_match = False
-    execution_match: bool | None = None
+    execution_match: bool | None = False if cfg.mode == "execution" else None
 
     t0 = time.monotonic()
     try:
@@ -252,6 +262,8 @@ def _evaluate_one(
             context=example.context,
         )
         predicted_sql = result.query.strip()
+        if not result.executable:
+            raise ValueError(f"{result.status}: {result.explanation}")
     except Exception as exc:
         error = f"Generation error: {type(exc).__name__}: {exc}"
         predicted_sql = ""
@@ -261,7 +273,7 @@ def _evaluate_one(
     gold_sql = example.expected_query.strip()
 
     # Exact match (literal SQL string match)
-    exact_match = predicted_sql == gold_sql
+    exact_match = bool(predicted_sql) and predicted_sql == gold_sql
 
     # Structural match
     if predicted_sql:
@@ -280,6 +292,8 @@ def _evaluate_one(
         except Exception as exc:
             error = f"Execution error: {type(exc).__name__}: {exc}"
             execution_match = False
+    elif cfg.mode == "execution" and not db_path:
+        error = error or "Execution error: database path is missing"
 
     return BenchmarkRow(
         question=example.text,
@@ -300,22 +314,23 @@ def _execution_match(
     gold_sql: str,
     predicted_sql: str,
     timeout: float = 30.0,
-    ignore_order: bool = True,
+    ignore_order: bool | None = None,
 ) -> bool:
     """Execute both queries against the SQLite database and compare results.
 
-    This follows the standard Spider/BIRD evaluation protocol: two queries
-    are considered equivalent if they produce the same result set (optionally
-    ignoring row order).
+    Compare results on this fixture only. This is not the official Spider/BIRD
+    evaluator or a proof of equivalence on other database contents.
     """
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA busy_timeout = 5000")
+    from pathlib import Path
+    conn = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
     try:
         gold_rows = _execute_sql(conn, gold_sql, timeout)
         pred_rows = _execute_sql(conn, predicted_sql, timeout)
     finally:
         conn.close()
 
+    if ignore_order is None:
+        ignore_order = validate_sql(gold_sql).args.get("order") is None
     if ignore_order:
         gold_rows = sorted(gold_rows, key=_row_sort_key)
         pred_rows = sorted(pred_rows, key=_row_sort_key)
@@ -329,11 +344,12 @@ def _execute_sql(
     timeout: float,
 ) -> list[tuple[Any, ...]]:
     """Run a SQL statement with a timeout."""
-    conn.execute(f"PRAGMA busy_timeout = {int(timeout * 1000)}")
+    validate_sql(sql)
     cursor = conn.cursor()
     try:
-        cursor.execute(sql)
-        return cursor.fetchall()
+        with sqlite_read_guard(conn, timeout):
+            cursor.execute(sql)
+            return cursor.fetchall()
     except sqlite3.Error as exc:
         compact_sql = re.sub(r"\s+", " ", sql).strip()[:240]
         raise RuntimeError(f"SQLite execution failed for query: {compact_sql}") from exc
@@ -379,7 +395,7 @@ def _build_report(
 
     exec_rows = [r for r in rows if r.execution_match is not None]
     exec_hits = sum(1 for r in exec_rows if r.execution_match)
-    execution_accuracy = (exec_hits / len(exec_rows)) if exec_rows else None
+    execution_accuracy = (exec_hits / total) if exec_rows else None
 
     # By difficulty
     by_diff: dict[str, list[BenchmarkRow]] = defaultdict(list)
@@ -397,7 +413,7 @@ def _build_report(
             "structural_accuracy": s_hits / n if n else 0,
         }
         if e_rows:
-            entry["execution_accuracy"] = e_hits / len(e_rows)
+            entry["execution_accuracy"] = e_hits / n
         accuracy_by_difficulty[diff] = entry
 
     # By database
@@ -416,7 +432,7 @@ def _build_report(
             "structural_accuracy": s_hits / n if n else 0,
         }
         if e_rows:
-            entry["execution_accuracy"] = e_hits / len(e_rows)
+            entry["execution_accuracy"] = e_hits / n
         accuracy_by_db[db_id] = entry
 
     return BenchmarkReport(
